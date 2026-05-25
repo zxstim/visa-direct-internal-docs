@@ -1,0 +1,200 @@
+---
+title: PVCB Tourist App
+description: PVCB Tourist App
+---
+
+Welcome to the PVCB Tourist App Docs!
+
+## Overview
+
+PVCB Tourist App. Visa Direct AFT Project Plan. Launch the PVCOMBANK Tourist App on the Vietpay / Tiger Financial Secured Payment Platform, leveraging deep digital payments and banking expertise.
+
+### Scheme, BIN & Visa Direct setup
+
+- Build the Visa business case using Vietnam inbound tourism
+and target corridors
+- File or update the PIF and confirm approved use cases
+- Decide whether launch sits under existing acquiring license or
+requires sponsorship
+- Request dedicated funds-transfer BIN and confirm processor
+support
+
+### Plan, design and develop the system
+
+- Support both AFT and OCT transaction flows where permitted
+- Contract international-passport KYC provider and design AML/sanctions controls
+- Update authorization, clearing, settlement and reconciliation
+processes
+- Build app and front-end journey; share brand-sensitive UX
+with Visa for review
+
+### Controlled launch model
+- Start in Visa sandbox, then certification, then production pilot
+- Activate production BIN only after readiness, monitoring and
+marketing checks
+- Pilot first to identify issues, then full production launch
+- Scale corridor by corridor based on approval, KYC, fraud and
+CX metrics
+
+## The VISA Direct transaction model
+
+Visa Direct enables anyone with a Visa card to send funds to anyone with a Visa card or a bank account.
+
+### Visa Direct / Standard transaction overview
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Mobile App  │ ──▶ │   Acquirer   │ ──▶ │     Visa     │ ──▶ │    Issuer    │ ──▶ │   Recipient  │
+│              │     │              │     │              │     │              │     │              │
+│Sender        │     │Captures &    │     │Authorize &   │     │Recipient     │     │Receives      │
+│initiates     │     │routes        │     │settle        │     │bank          │     │funds         │
+└──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+```
+
+### PVCOMBANK / Tourist App use case
+
+```
+┌──────────────┐     ┌──────────────┐     ╔══════════════╗     ┌──────────────┐     ┌──────────────┐
+│   Tourist    │ ──▶ │   PVCB App   │ ──▶ ║     Visa     ║ ──▶ │ Tourist VND  │ ──▶ │  Vietnamese  │
+│              │     │              │     ║              ║     │   Account    │     │   Merchant   │
+│Foreign Visa  │     │AFT request   │     ║Cross-border  ║     │Funded at     │     │Paid via QR   │
+│card          │     │              │     ║auth          ║     │PVCB          │     │              │
+└──────────────┘     └──────────────┘     ╚══════════════╝     └──────────────┘     └──────────────┘
+
+Legend:  ┌──┐ PVCOMBANK + Vietpay / Tiger Financial controlled    ╔══╗ Visa scheme / external
+```
+
+> **AFT (Account Funding Transaction):** pulls funds from the sender's foreign card.
+> **OCT (Original Credit Transaction):** pushes funds to the recipient account.
+
+## End-to-end Visa Direct operating chain
+
+Designed as one continuous operating chain, not isolated API calls.
+
+### Transaction steps
+
+1. **Capture sender intent** — App collects sender, recipient, amount and required KYC / purpose fields.
+2. **Authorize AFT** — Submit AFT with sender, receiver and use-case data; receive issuer response, get transaction approval/decline.
+3. **Pre-Fund transaction** — If AFT is approved then pre-fund the customer account, then wait for VISA settlement to repay the pre-fund.
+4. **Receive Settlement from Issuer** — Receive T+n settlement from Issuer, reconcile and clear the transaction, then refund the pre-funded transaction.
+5. **Notifications, logs, history** — Manage user notifications, list transaction history, store audit trail, prepare exceptions and support views.
+
+### Operational foundations / cross-cutting requirements
+
+- **Clearing file** — Adjust clearing file logic so Visa Direct transactions map correctly into finance, fees and recon.
+- **Settlement & treasury** — Confirm settlement timetable, prefunding and liquidity controls, and BIN-level monitoring.
+- **Exceptions & reversals** — If a push fails, reverse or return funds using the correct mechanism and preserve response data.
+- **Support & MI** — Operational dashboards, issuer-decline analysis, customer support workflows and regulatory reporting.
+
+> **Liquidity prerequisite:** all transactions operate on advanced funding. Acquirer must allocate enough funds for 2-3 days of expected transaction volumes.
+
+## Project Objectives
+
+Prerequisites that convert the idea into an approved Visa program.
+
+1. **Business case & PIF inputs** — Size volumes by corridor, define use cases, name program parties, describe customer journey and risk controls.
+2. **PIF / program approval** — Submit or update the Program Information Form. Visa due diligence covers AML, sanctions, credit, settlement risk and brand review.
+3. **BIN strategy** — Request or enable a dedicated BIN for Visa Direct activity; confirm processor / switch support and routing tables.
+4. **Contract stack** — Lock contracts with KYC / passport processing provider, processor, fraud tools and any service providers needed for launch.
+5. **Production onboarding** — Move from sandbox credentials to certification / production credentials, including certificates and encryption setup.
+6. **Brand & marketing approvals** — Share the marketing plan, claims and any Visa brand usage for approval before public launch.
+
+> **Change control:** if the program later changes sending countries, processor or business relationships, or marketing / branding, Visa may require a new PIF approval cycle.
+
+## Workstreams, owners and exit criteria
+
+Explicit ownership across scheme, compliance, engineering, finance and go-to-market.
+
+| Workstream | Primary owner | Core deliverables |
+| --- | --- | --- |
+| Visa Direct program setup | PVCOMBANK, Visa, Tiger / Vietpay | Business case, PIF submission, BIN request, pricing, corridor plan |
+| Consumer app UI / UX, KYC and compliance | PVCOMBANK | User journey, app screens, language packs, service terms, KYC integration |
+| Core banking, bank wallet, QR transaction spending | PVCOMBANK | Core banking system integration, account issuance, QR acceptance |
+| APIs with Visa, authorization, APIs with core banking and app, FX logic | Tiger / Vietpay | API integration, orchestration, limits, logging, mobile / web app build |
+| Back-end settlement, reconciliation and clearing | Tiger / Vietpay | Clearing file changes, settlement, reconciliation, MIS and support tools |
+| Admin portal, ops, settlement support, fraud and risk | Tiger / Vietpay | Administration portal, system admin, operations interface |
+| Testing, pilot and launch | QA Teams, PVCOMBANK, Visa, Tiger / Vietpay | Certification plan, UAT, pilot runbook, KPI dashboard, incident process |
+
+## Visa Direct Program Implementation Plan
+
+Timeline suggested by Visa.
+
+| Workstream | Milestone | Owner | Start | End |
+| --- | --- | --- | --- | --- |
+| 1. Visa Direct Onboarding | Visa Direct License | PVComBank | Existing | Existing |
+| 1. Visa Direct Onboarding | PIF Submission to Visa for approval | PVComBank | 13 May 26 | 27 May 26 |
+| 1. Visa Direct Onboarding | BIN Application – For SMS/API Implementation only | PVComBank | 05 May 26 | 12 May 26 |
+| 2. Project Planning & Solutioning | Solutioning Workshop with Visa | PVComBank & Visa | 17 Apr 26 | 06 May 26 |
+| 2. Project Planning & Solutioning | SRF submission (required for starting project for testing and certification) | PVComBank & Visa | 20 May 26 | 22 May 26 |
+| 2. Project Planning & Solutioning | CS Implementation Manager Assignment and Project start | Visa | 05 Jun 26 | 10 Jun 26 |
+| 2. Project Planning & Solutioning | UI/UX Wireframes submission by Client and Review by Visa | PVComBank & Visa | 20 May 26 | +2 weeks |
+| 3. System Development | ISO Connection (DMS) | PVComBank | 18 May 26 | 15 Jun 26 |
+| 3. System Development | Capture and process mandatory cross border fields | PVComBank | 18 May 26 | 15 Jun 26 |
+| 3. System Development | Back-office Settlement & Recon | PVComBank | 18 May 26 | 15 Jun 26 |
+| 3. System Development | Card Validation using ACNL file / Attribute Enquiry API | PVComBank | 18 May 26 | 15 Jun 26 |
+| 3. System Development | Exceptions Management [Reversals, Adjustments] | PVComBank | 18 May 26 | 15 Jun 26 |
+| 4. Visa Implementation | BIN Set-up (For SMS/API and XB BIN enablement) | Visa | 15 Jun 26 | 15 Jul 26 |
+| 4. Visa Implementation | ACNL file / ISO 0100 Account Lookup / Attribute Enquiry API setup for card validation | Visa | 15 Jun 26 | 15 Jul 26 |
+| 4. Visa Implementation | API and VFES setup if applicable | Visa | 15 Jun 26 | 15 Jul 26 |
+| 4. Visa Implementation | Settlement Reports (VCMS) | Visa | 15 Jun 26 | 15 Jul 26 |
+| 4. Visa Implementation | End to end testing (Including Merchant, Acquirer and Visa) | PVComBank & Visa | 15 Jun 26 | 15 Jul 26 |
+| 5. Go to Pilot | Production configuration | Visa | 15 Jul 26 | 31 Jul 26 |
+| 5. Go to Pilot | Production Pilot | PVComBank & Visa | 01 Aug 26 | 15 Aug 26 |
+| 5. Go to Pilot | Test transactions, FX conversions, T+X settlement timelines, fees, costs, risks | PVComBank & Visa | 16 Aug 26 | 31 Aug 26 |
+| 5. Go to Pilot | Tweak the system and get ready to go live in production | PVComBank & Visa | 01 Sep 26 | 15 Sep 26 |
+| 6. Go To Market / Live Production | Full Production Live, monitor, assess, update | PVComBank & Visa | 01 Oct 26 | 15 Oct 26 |
+
+## Testing, certification and production readiness gates
+
+Disciplined stage-gate approach reduces launch risk and prevents avoidable issuer declines or finance breaks.
+
+### Stage gates
+
+1. **Gate 1 — Design review** — Use cases, PIF assumptions, BIN design, data fields, ledger mapping.
+2. **Gate 2 — Sandbox connectivity** — Mutual SSL, certificates, encryption, test credentials, API connectivity.
+3. **Gate 3 — Functional certification** — AFT, OCT, error handling, reversals, issuer responses, KYC edge cases.
+4. **Gate 4 — UAT + ops sign-off** — Clearing, settlement, monitoring, support, reconciliations, reporting.
+5. **Gate 5 — Production pilot** — Low-volume launch with daily KPI review, issue triage, go / no-go control.
+
+### Entry criteria for certification
+
+- Approved program scope and environment access
+- Test data and issuer / processor support aligned
+- Clearing, settlement and MI design documented
+- KYC / AML controls connected into the flow
+
+### Exit criteria for production pilot
+
+- End-to-end pass rate at agreed threshold
+- Finance reconciles each transaction leg and fees
+- Support runbooks, incident process and dashboards live
+- Visa and internal go-live approvals complete
+
+### Pilot discipline
+
+- Limit pilot merchants, channels and corridors at start
+- Daily review of issuer declines and funds availability
+- Monitor KYC fails, fraud alerts and customer complaints
+- Scale only when metrics stabilize and gates pass
+
+## Go-to-market, issuer readiness and pilot KPIs
+
+First launch is a measured production pilot supported by Visa-aligned marketing and daily performance management.
+
+### Launch checklist
+
+- Share the marketing plan and any Visa brand claims and creative for approval
+- Confirm the production BIN is active, routed, monitored and not being declined because of issuer readiness gaps
+- Train operations and customer support on funding failures, OCT declines, reversals and KYC exceptions
+- Publish incident-management and escalation paths with Visa, processor and key internal teams
+- Start with limited corridors, channels and partners before broad public activation
+
+### Pilot KPIs
+
+1. **Authorization & OCT success rate** — By corridor and issuer.
+2. **Time to funds available** — And percentage requiring reversal or manual handling.
+3. **KYC pass rate** — Manual review rate and onboarding conversion.
+4. **Fraud, suspicious activity** — Cases and complaint rate.
+
+> **Go / no-go scaling rule:** scale only when the pilot meets agreed thresholds for approval, KYC conversion, finance reconciliation, fraud and CX. If unstable, fix first; do not expand marketing spend.
+
