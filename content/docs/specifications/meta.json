@@ -7,7 +7,8 @@
     "tc-card-network-service",
     "tc-ledger-service",
     "tc-settlement-reconciliation-service",
-    "tc-admin-service"
+    "tc-admin-service",
+    "tc-admin-portal"
   ],
   "defaultOpen": false
 }

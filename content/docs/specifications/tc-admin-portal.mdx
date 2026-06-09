@@ -1,0 +1,273 @@
+---
+title: tc-admin-portal
+description: Flutter front-end for tc-admin-service — login (password, TOTP, passkeys), sign-up + approval, RBAC/tag-aware UI, authorization-limit maker-checker, operational dashboards, and the activity telemetry that feeds the backend audit trail.
+permission: admin
+---
+
+## Purpose & scope
+
+`tc-admin-portal` is the **operator-facing front-end** for
+[`tc-admin-service`](/docs/specifications/tc-admin-service). It is a **Flutter** application
+(web-primary, multi-platform capable) that presents every backend capability — auth,
+account approval, RBAC/tags, authorization-limit management, dashboards, and the audit
+trail — and is itself the **source of the user-activity telemetry** the backend records.
+
+It is a **presentation layer only**: all authentication, authorization, limits, and audit
+logic live in `tc-admin-service`. The portal's role-based rendering is UX, **never** a
+security boundary — every action is re-checked server-side.
+
+> Using Flutter here reuses the skills/components from the PVCB tourist app. Note the
+> trade-off: Flutter Web has a heavier initial load than an HTML SPA and data-grid-heavy
+> admin UIs need a good grid package — both manageable for an internal tool (see
+> [Deployment](#deployment)).
+
+## Technical stack
+
+| Concern | Choice |
+| --- | --- |
+| Framework | **Flutter stable — 3.44 / Dart 3.12** (latest as of mid-2026); pin with **FVM** for reproducible builds and track the stable channel |
+| Target | **Flutter Web** primary (browser, behind Kong); same codebase can ship desktop/mobile with the native adaptations noted below |
+| State management | **Riverpod** (testable, compile-safe) — Bloc is an acceptable alternative |
+| Routing | **GoRouter** (declarative; redirect-based auth/RBAC guards; route observer for telemetry) |
+| HTTP | **Dio** with interceptors (CSRF, cookies, 401/step-up, telemetry, errors) |
+| Models | `freezed` + `json_serializable` |
+| Charts / grids | `fl_chart`, `DataTable2`/`PlutoGrid` for the dashboards |
+| Secure storage | `flutter_secure_storage` (native targets) |
+| Error tracking | Sentry (Flutter) |
+
+> Flutter ships on a ~quarterly stable cadence — pin via FVM and budget periodic upgrades,
+> the same discipline applied to the backend stack in
+> [Architecture](/docs/specifications/architecture).
+
+## Position in the system
+
+```
+operator ──▶ Kong (admin route: internal listener + IP allowlist + mTLS)
+                 ├── static Flutter Web build (same origin as /api)   ← tc-admin-portal
+                 └── /api/** ──▶ tc-admin-service (Spring Security session API)
+```
+
+Serve the Flutter Web build as **static assets behind the gateway's admin route, on the
+same origin as `/api`**. Same-origin is the key decision: the session cookie is then
+first-party, and CSRF/WebAuthn work without cross-origin complications.
+
+## Functionality ↔ backend mapping
+
+Every screen maps to a `tc-admin-service` endpoint (1:1 with its
+[Service API](/docs/specifications/tc-admin-service#service-api-surface)):
+
+| Portal screen / capability | Backend endpoint(s) |
+| --- | --- |
+| Login (email + password) | `POST /api/auth/login` |
+| Second factor (TOTP) | `POST /api/auth/mfa/verify` |
+| Passkey register / login | `/webauthn/**` |
+| TOTP enrolment (QR) | `POST /api/auth/totp/enrol` |
+| Logout | `POST /api/auth/logout` |
+| Current user (authorities + tags) | `GET /api/auth/me` *(see [open questions](#assumptions--open-questions))* |
+| Sign-up form | `POST /api/signup` |
+| Pending-approval state | login returns "disabled" until approved |
+| Account admin — pending list | `GET /api/admin/pending` |
+| Account admin — approve / suspend / roles / tags | `POST /api/admin/users/{id}/approve`, `/suspend`, `/roles`, `/tags` |
+| Authorization limits — view | `GET /api/limits` |
+| Limits — propose change (maker) | `POST /api/limits/proposals` |
+| Limits — approve change (checker) | `POST /api/limits/proposals/{id}/approve` |
+| Audit trail viewer | `GET /api/audit` |
+| Dashboard — live authorizations | `GET /api/ops/authorizations` |
+| Dashboard — settlement reports / breaks | `GET /api/ops/settlement` |
+| Dashboard — exposure | `GET /api/ops/exposure` |
+| **Activity telemetry (emit)** | `POST /api/activity` |
+
+## Authentication & session in Flutter
+
+The backend is **session-cookie + CSRF** (not JWT), so the portal must cooperate with that
+model — this is the part most teams get wrong in a Flutter client.
+
+### Cookies & CSRF
+
+- **Web:** the browser holds the `HttpOnly` session cookie automatically. Enable credentials
+  on Dio's web adapter, and echo Spring's CSRF token (the readable `XSRF-TOKEN` cookie) in
+  the `X-XSRF-TOKEN` header on every mutating request.
+- **Native (if shipped):** there is no browser cookie jar — add `dio_cookie_manager` +
+  `cookie_jar`, persist the session cookie in `flutter_secure_storage`.
+
+```dart
+// Dio bootstrap (web)
+final dio = Dio(BaseOptions(baseUrl: '/api'))
+  ..httpClientAdapter = (BrowserHttpClientAdapter()..withCredentials = true)
+  ..interceptors.addAll([CsrfInterceptor(), AuthInterceptor(), ActivityInterceptor()]);
+
+// CsrfInterceptor: copy XSRF-TOKEN cookie → X-XSRF-TOKEN header on POST/PUT/DELETE
+// AuthInterceptor: 401 → router.go('/login'); 403 STEP_UP → prompt re-auth then retry
+```
+
+### Login & MFA flow
+
+`password → (TOTP if enrolled) → full session`, **or** `passkey → full session`. The portal
+mirrors the backend's [Spring Security 7 multi-factor model](/docs/specifications/tc-admin-service#1-authentication--authorization-spring-security):
+after `POST /api/auth/login` the session may be in an **MFA-pending** state (only
+`/api/auth/mfa/verify` is permitted) — the router forces the user to the TOTP screen until
+the second factor is satisfied.
+
+- **TOTP enrolment:** call `POST /api/auth/totp/enrol`, render the returned `otpauth://` URI
+  as a QR with `qr_flutter` for the user's authenticator app; then verify a code.
+- **Passkeys (WebAuthn):**
+  - **Web:** drive the browser ceremony via JS interop (`package:web` + `dart:js_interop`
+    calling `navigator.credentials.create/get`) against Spring Security's
+    `/webauthn/register` + login endpoints. *(There is no fully turnkey Flutter-Web passkey
+    package — budget this interop as real work; see [open questions](#assumptions--open-questions).)*
+  - **Native:** use platform passkeys (Android Credential Manager / iOS AuthenticationServices)
+    via a package such as `passkeys`.
+
+### Sign-up & approval UX
+
+- Public **sign-up form** (`POST /api/signup`) collecting email, password, requested role/tags.
+- After sign-up the account is `PENDING_APPROVAL`; the portal shows a **"awaiting approval"**
+  screen and login is rejected until a super admin approves it. **No email verification.**
+
+### Strict-refresh handling (mirror the backend policy)
+
+The backend enforces a [strict refresh policy](/docs/specifications/tc-admin-service#session-token--strict-refresh-policy);
+the portal renders it:
+
+- **Idle + absolute timeout:** a client-side inactivity timer warns then auto-logs-out;
+  on a `401` from any call, route to `/login` (the server is the source of truth).
+- **Single session:** if the user is invalidated elsewhere, the next `401` ends the session
+  gracefully with an explanation.
+- **Step-up re-auth:** for sensitive actions (approve account, change a limit) the backend
+  may demand a recent factor; the portal catches the step-up challenge and shows a re-auth
+  modal, then retries.
+
+### RBAC & tag-aware UI
+
+- Fetch the user's **authorities + tags** (`GET /api/auth/me`) into a `SessionProvider`.
+- **GoRouter guards** redirect on missing permission; widgets conditionally render actions
+  (e.g. hide "Approve" without `LIMITS_WRITE`). Tag scoping filters lists (e.g. a
+  `corridor:VN` user only sees VN data).
+
+```dart
+GoRoute(
+  path: '/limits',
+  redirect: (ctx, st) {
+    final s = ref.read(sessionProvider);
+    if (!s.authenticated) return '/login';
+    if (s.mfaPending)     return '/login/mfa';
+    if (!s.can('LIMITS_READ')) return '/forbidden';
+    return null;
+  },
+  builder: (ctx, st) => const LimitsScreen(),
+);
+```
+
+> **Never** treat client-side guards as security. They improve UX; `tc-admin-service`
+> re-authorizes every request.
+
+## Activity telemetry (feeds the backend audit trail)
+
+The backend's audit trail records "what screen the user navigates, what button they click"
+— **the portal generates those events.** It captures, batches, and ships them to
+`POST /api/activity` using the backend's
+[event schema](/docs/specifications/tc-admin-service#2-activity-tracking--audit-trail).
+
+- **Navigation:** a GoRouter **route observer** emits a `NAVIGATE` event per route change
+  (the route name is the `screen`).
+- **Clicks / actions:** wrap interactive widgets in a `Tracked…` helper (or call an
+  `ActivityTracker` from `onPressed`) that emits `CLICK` / `ACTION` with a **stable element
+  id** — Flutter has no DOM, so instrument call sites rather than auto-capturing.
+- **Batching:** buffer events and flush periodically / on logout via an `ActivityInterceptor`.
+- **Privacy (mirror the backend rule):** capture **element identity, not content** — never
+  field values, PAN, or secrets.
+
+```dart
+class ActivityObserver extends NavigatorObserver {
+  @override void didPush(Route r, Route? p) =>
+      tracker.record(type: 'NAVIGATE', screen: r.settings.name);
+}
+
+// in a screen:
+TrackedButton(id: 'approve-break-button',
+  onPressed: () => ref.read(breaksProvider.notifier).approve(breakId));
+```
+
+## Feature areas
+
+### Account administration (super admin)
+
+Pending-users list → review → **approve / suspend**, assign **roles** and **tags**. Approving
+and limit changes trigger the backend's **step-up re-auth**; the portal handles the prompt.
+
+### Authorization limits (maker-checker)
+
+- **View** current limits and their version history (`GET /api/limits`).
+- **Propose** a change (maker) with client-side validation mirroring the backend guardrails
+  (per-txn ≤ per-card-daily ≤ ceiling; currency ISO 4217).
+- **Approve** a pending proposal (checker) — a *different* user with `LIMITS_WRITE`. The
+  portal shows a clear before/after diff and **propagation status** to the enforcement
+  services.
+
+### Audit trail viewer
+
+Searchable/filterable view of `GET /api/audit` (actor, action, target, time, correlationId),
+gated to `AUDIT_READ`. Read-only; the underlying log is append-only and hash-chained
+server-side.
+
+### Operational dashboards
+
+- **Live authorizations** — recent AFTs, status, decline reasons, velocity; auto-refresh by
+  polling `GET /api/ops/authorizations` (or a server stream if added — see open questions).
+- **Settlement** — reconciliation summary, breaks by outcome, aging, unsettled receivables.
+- **Exposure** — prefunding exposure vs ceiling, balances, with `fl_chart` visuals.
+- All views are **permission- and tag-scoped**, matching the backend.
+
+## Architecture
+
+- **Feature-first**, layered: `presentation` (widgets/screens) → `application` (Riverpod
+  controllers) → `data` (repositories + Dio) → `domain` (freezed models).
+- Cross-cutting concerns live in **Dio interceptors** (CSRF, auth/step-up, telemetry, error
+  normalization), so screens stay declarative.
+- One repository per backend area (auth, accounts, limits, audit, ops) mapping to the
+  endpoints above.
+
+## Deployment
+
+- `flutter build web` → **static assets** served behind the **Kong admin route**, same
+  origin as `/api` (first-party cookies). The gateway already restricts this surface
+  (internal listener + IP allowlist + mTLS).
+- Use the **CanvasKit/skwasm** renderer for consistent rendering; mind the initial bundle
+  size (lazy-load heavy screens; enable compression/caching at Kong/CDN).
+- Apply a strict **Content-Security-Policy**; pin the API origin; no third-party origins.
+
+## Security
+
+- **Client holds no secrets and is not a trust boundary** — every authz decision is
+  server-side; the portal only reflects it.
+- Session cookie is `HttpOnly`; CSRF token echoed per mutating request; same-origin
+  deployment.
+- The portal **must only ever receive masked/fingerprint data** from the backend (no PAN/PII
+  in dashboards or audit views), keeping it out of strict PCI data-handling scope.
+- Ship CSP, disable mixed content, and report client errors (without sensitive payloads) to
+  Sentry.
+
+## Observability & testing
+
+- Client error tracking (Sentry); the activity telemetry doubles as product analytics.
+- **Tests:** `flutter_test` widget tests, `integration_test` for the login/MFA/limit flows,
+  golden tests for key screens, and repository tests against a mocked Dio.
+
+## Assumptions & open questions
+
+1. **Target.** Web-primary assumed (admin in a browser behind Kong). Confirm whether a
+   desktop/mobile build is also wanted — it changes cookie/passkey handling (cookie jar +
+   native Credential Manager).
+2. **`GET /api/auth/me`.** The portal needs a session/identity endpoint returning authorities
+   + tags to drive RBAC. Confirm it exists on `tc-admin-service` (add if not).
+3. **Passkeys on Flutter Web** require custom WebAuthn JS interop — confirm appetite, or make
+   passkeys native-only and TOTP the web second factor initially.
+4. **Live-data transport.** Dashboards assume polling of `GET /api/ops/*`. If true real-time
+   is needed, confirm the backend will expose SSE/WebSocket; otherwise tune poll intervals.
+
+## References
+
+- [Flutter](https://docs.flutter.dev/) · [Flutter Web](https://docs.flutter.dev/platform-integration/web)
+- [Riverpod](https://riverpod.dev/) · [GoRouter](https://pub.dev/packages/go_router) · [Dio](https://pub.dev/packages/dio)
+- [Spring Security — Passkeys](https://docs.spring.io/spring-security/reference/servlet/authentication/passkeys.html)
+- [`tc-admin-service`](/docs/specifications/tc-admin-service) (backend)
