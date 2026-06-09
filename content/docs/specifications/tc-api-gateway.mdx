@@ -1,0 +1,701 @@
+---
+title: tc-api-gateway
+description: Kong API Gateway specification for the Visa Direct top-up platform — partner authentication, replay-safe authorization limits, public surface minimization, fail-closed degradation, and admin forwarding.
+permission: admin
+---
+
+## Purpose & scope
+
+`tc-api-gateway` is the single, hardened ingress for the Visa Direct tourist top-up
+platform. In the end-to-end sequence it sits between **PVCB Top up service** (the
+partner bank backend) / the **tourist client** on one side, and the internal `tc-*`
+services on the other. It is the trust boundary: nothing reaches `tc-cardload-service`,
+`tc-admin-service`, or any other internal service without first passing the gateway's
+controls.
+
+This document specifies how to build that gateway on **Kong Gateway 3.x** to satisfy
+four requirements:
+
+1. **Partner authenticity** — verify every inbound request from PVCB Top up service
+   using asymmetric signatures (exchanged public keys), with replay and idempotency
+   protection.
+2. **Authorization limits** — hard, gateway-enforced amount/velocity caps so a breach
+   of PVCB Top up service cannot cascade into a fraudulent high-value auth (the "$10M
+   auth" scenario).
+3. **Minimal public surface** — exactly one publicly reachable endpoint (the client 3DS
+   callback); every other route requires verification.
+4. **Admin pass-through** — for internal admin traffic the gateway does forwarding only,
+   straight to `tc-admin-service`.
+
+A traceability map from the design review to the sections that satisfy each point is in
+[Design review & traceability](#design-review--traceability).
+
+> **Conventions.** **MUST/MUST NOT/SHOULD** are used in the RFC 2119 sense.
+> "Money-movement paths" means any route that can initiate or change a top-up
+> (`POST /v1/topups`, the 3DS callback). Those paths default to **fail-closed**.
+
+> **Permission note:** this page is marked `permission: admin` because it contains key
+> management and security-control detail. Move it to `member` if your team needs wider
+> read access.
+
+## Technical stack & event model
+
+`tc-api-gateway` is **Kong** (Lua/declarative config) at the **synchronous HTTP edge** — it
+is the one component that is *not* a Spring Boot service. Everything behind it is a
+**JDK 25 / Spring Boot 4.0+ microservice**, and those services talk to each other
+**asynchronously over a message broker (Spring Cloud Stream)**, not through the gateway. See
+[Architecture & service interaction](/docs/specifications/architecture).
+
+Two consequences for this spec:
+
+- **Limits propagation.** The gateway consumes config, not events — Kong is not a
+  message-broker consumer. When `tc-admin-service` emits `limits.updated`, a small **decK relay** applies
+  the new edge limits to Kong (the Spring Boot services consume `limits.updated` directly).
+- **Webhook egress.** The signed PVCB webhook is best driven by the
+  `partner.notification.requested` event: a webhook-dispatcher consumes it and calls the
+  gateway egress, giving at-least-once delivery + DLQ (see [Outbound webhooks](#outbound-webhooks-to-pvcb)).
+
+## Where the gateway sits in the flow
+
+The gateway has exactly four interaction points in the sequence diagram. Everything else
+(`tc-card-network-service`, `tc-ledger-service`, `PVCB Core Banking`, settlement) is
+**downstream of `tc-cardload-service`** and never traverses the gateway directly.
+
+| # | Counterparty | Direction | What crosses the gateway | Trust model |
+| --- | --- | --- | --- | --- |
+| 1 | PVCB Top up service | inbound | Top-up initiation (after PVCB's AML check), status queries | mTLS **+** signed payload **+** limits |
+| 2 | Tourist client | inbound | "3DS challenge completed" notification | one-time signed callback token only |
+| 3 | tc-cardload-service | outbound (proxy) | Forwarded top-up / 3DS-completed requests | internal network |
+| 4 | PVCB Top up service | outbound (egress) | Webhook callbacks (responses, redirect URL, final status) | tc-signed payload + mTLS to PVCB |
+| 5 | tc-admin-service | outbound (proxy) | Internal admin traffic | forward-only, internal listener |
+
+```
+                 INTERNET (untrusted)                 PARTNER LINK (mTLS/VPN)          INTERNAL (trusted)
+                 ───────────────────                  ──────────────────────          ──────────────────
+   tourist  ──3DS callback──┐                  PVCB Top up service ──┐                   ┌─ tc-cardload-service
+   (browser/app)            │                  (after AML check)     │                   │
+                            ▼                                        ▼                   │
+                    ┌───────────────────────── tc-api-gateway (Kong) ───────────────────┤
+                    │  public listener :8443   partner listener :9443  admin listener   │
+                    │  (1 route only)          (mTLS + JWS + limits)   :10443 (internal) ├─ tc-admin-service
+                    └───────────────────────────────────────────────────────────────────┤
+                                            │ signed webhook egress                       │
+                                            ▼                                             │
+                                     PVCB webhook endpoint                                └─ (forward only)
+```
+
+> The gateway is **stateless for business logic**. It authenticates, screens against
+> limits, and routes. It must hold no transaction state beyond the short-lived counters
+> and nonce/idempotency caches described below.
+
+## Trust model & assumptions
+
+The gateway's controls only make sense against an explicit threat model. Three trust
+zones, and one rule that governs all of them: **a valid signature proves *origin*, not
+*legitimacy of the underlying transaction*.**
+
+| Zone | Parties | Posture |
+| --- | --- | --- |
+| Untrusted | internet, tourist client, the 3DS callback | authenticate per-request; never trust client assertions |
+| Semi-trusted | PVCB Top up service | authenticated, but **assume it can be breached**; bound its blast radius |
+| Trusted | internal `tc-*` services on the private network | mutual TLS / network segmentation |
+
+Normative principles:
+
+- **PVCB's AML/approval decision is untrusted input.** PVCB runs AML before the gateway;
+  if PVCB is breached, that AML is bypassed while requests still carry valid signatures.
+  The gateway and `tc-cardload-service` **MUST NOT** treat "PVCB approved" as a reason to
+  relax screening. tc-side checks (the Cybersource fraud check already in the flow; add
+  sanctions screening if not covered upstream) **MUST** run on every transaction.
+- **The 3DS callback is an untrusted trigger, not a result.** The authoritative 3DS
+  outcome **MUST** come from `tc-cardload-service` re-querying Cybersource (as the diagram
+  already does). The gateway **MUST NOT** let "3DS passed" be asserted by the client.
+- **Defense-in-depth.** Limits are enforced at the gateway **and** at downstream layers
+  (see [Layered enforcement](#layered-enforcement)). The gateway is the first gate, not
+  the only one.
+- **Fail-closed by default** on money-movement paths (see [Failure & degradation
+  behavior](#failure--degradation-behavior)).
+
+| Threat actor | Assumed capability | Primary gateway control |
+| --- | --- | --- |
+| Compromised PVCB backend | mints validly-signed top-ups | per-tx / velocity / cumulative / global limits + idempotency + tc-side screening |
+| Network MITM | intercept / alter in transit | mTLS (channel) + JWS (message integrity) |
+| Replay attacker | resend a captured signed request | timestamp skew window + nonce store + idempotency key |
+| Abusive client on the public endpoint | spam / enumerate the callback | one-time signed token + rate-limit + bot detection |
+| Lateral movement to admin | reach the admin surface internally | dedicated internal listener + IP allowlist + mTLS/OIDC + audit log |
+
+## Listener / network topology
+
+Run three logically separate entry surfaces so "public" cannot accidentally include a
+partner or admin route. In Kong these are distinct `proxy_listen` ports bound to
+different network interfaces/security groups.
+
+| Listener | Bind | Reachable from | Routes allowed |
+| --- | --- | --- | --- |
+| Public | `0.0.0.0:8443` (behind WAF/CDN) | Internet | `3ds-callback-public` only |
+| Partner | private interface `:9443` | PVCB over VPN / VPC peering / private link | partner routes (`/v1/topups…`) |
+| Admin | private interface `:10443` | internal admin network only | `admin-proxy` only |
+
+- The Kong **Admin API** (`:8001`/`:8444`) must never be internet-exposed. Bind to
+  loopback or a management subnet, protect with mTLS + RBAC, and manage config through
+  CI/CD (decK), not ad-hoc calls.
+- Put a WAF / DDoS layer (Cloudflare, AWS WAF, etc.) in front of the **public** listener.
+- Terminate TLS 1.2+ (prefer 1.3). Because payloads are independently signed (JWS),
+  message integrity survives TLS termination at an upstream load balancer.
+
+## Requirement 1 — Verify all PVCB requests via asymmetric signatures
+
+### What "asymmetric encryption" means here
+
+The requirement is **authentication + integrity**, i.e. asymmetric **signatures (JWS)**,
+not encryption. The terminology matters (see the [Design review](#design-review--traceability)):
+
+- **Signing (what you need):** PVCB signs each request with **PVCB's private key**; the
+  gateway verifies with **PVCB's public key**. This proves the request came from PVCB and
+  was not altered, and gives non-repudiation. The body stays readable.
+- **Encryption (optional add-on):** if you also need field-level confidentiality beyond
+  TLS (e.g. for a PAN), encrypt those fields with the **recipient's public key** (JWE).
+  Use this only for the sensitive fields, on top of signing.
+
+So the control is: **mutual TLS for the channel + detached JWS over the message for
+integrity/non-repudiation.** Use both — they defend different layers.
+
+### Key lifecycle management
+
+Asymmetric auth is only as strong as the key process around it. Treat keys as a managed
+lifecycle, not a one-time setup.
+
+| Stage | Requirement |
+| --- | --- |
+| Generate | Each party generates its keypair **inside an HSM/KMS**; the private key **MUST NOT** leave it. Algorithm **ES256** (EC P-256) preferred; **RS256/PS256** (RSA-3072) fallback. No symmetric `HS*`. |
+| Exchange | Public keys are exchanged **out-of-band** over a secure channel; the recipient verifies the **fingerprint via a second channel** before trusting; record both keys (with `kid`) in a key registry. |
+| Store | PVCB's **public** key is stored as a Kong consumer JWT credential (tagged with its `kid`). tc's **private** key (used for webhook + callback-token signing) lives in KMS/Vault and is referenced via Kong's vault backend — **never** inlined in declarative config. |
+| Rotate | Every JWS/JWT carries a `kid`. Publish the **new** key and accept both **before** retiring the old one (overlapping validity → zero-downtime). Rotate every **6–12 months**. |
+| Revoke | On suspected compromise, remove the `kid` from the accepted set immediately (config push), notify the partner out-of-band, and rotate. |
+
+### Signature envelope (what PVCB must send)
+
+Each partner request carries a **detached JWS** in a header. The signature **MUST** cover
+the HTTP method, the request path, a SHA-256 hash of the body, and the anti-replay claims
+— so none of them can be stripped or altered:
+
+| Header | Contents |
+| --- | --- |
+| `X-JWS-Signature` | Detached JWS (`alg`=ES256, `kid`) over the canonical signing string |
+| `X-Request-Timestamp` | RFC 3339 timestamp; rejected if skew > 60s |
+| `X-Request-Nonce` | Unique value; rejected if seen before (Redis set, TTL = 2× skew window) |
+| `Idempotency-Key` | Client-generated UUID for safe retries of money-movement calls |
+
+Signing string (canonical): `METHOD \n PATH \n SHA256(body) \n X-Request-Timestamp \n X-Request-Nonce`.
+
+### Replay protection & idempotency
+
+A valid signature replayed twice is **two top-ups**. Signing alone is not sufficient for
+money movement — two distinct, both-required mechanisms close this:
+
+- **Nonce + timestamp (stops *malicious* replay).** The gateway **MUST** reject a request
+  whose `X-Request-Timestamp` is outside ±60s (configurable) with `401 STALE_REQUEST`,
+  and **MUST** reject a reused `X-Request-Nonce` with `409 REPLAY_DETECTED`. Nonces are
+  held in Redis with a TTL of **2× the skew window** (enough to cover the acceptance
+  window). Because both values are inside the signed string, an attacker cannot edit them
+  to dodge the check.
+- **Idempotency key (enables *safe* retry).** `POST /v1/topups` **MUST** carry an
+  `Idempotency-Key`. The gateway caches `key → response` for **24h** and returns the
+  cached response on a retry **without re-forwarding**; `tc-cardload-service` **MUST** also
+  dedupe authoritatively on the same key, persisted with the transaction record. Same key
+  ⇒ same outcome, even across gateway nodes.
+
+> The two are complementary: the **nonce** says "I have never seen this exact request";
+> the **idempotency key** says "if you retry the *same logical operation*, you get the
+> *same result*, not a second charge." Money movement needs both.
+
+### Implementing verification in Kong
+
+Two viable paths — pick based on your edition:
+
+| Approach | Plugin | Edition | Notes |
+| --- | --- | --- | --- |
+| **JWT wrapper** | `jwt` (RS256/ES256, public key as credential) | OSS | Simplest. PVCB sends a signed JWT whose claims include `bodyHash`, `iat`, `jti`. Kong verifies signature + `exp`; a `pre-function` checks `bodyHash == SHA256(body)`. |
+| **Detached JWS over body** (recommended) | custom Lua plugin `tc-jws-verify` (or Enterprise `jwt-signer`) | OSS (custom) / EE | Verifies `X-JWS-Signature` against the consumer's public key, recomputes body hash, enforces timestamp/nonce. Most robust message integrity. |
+| **Channel auth** | `mtls-auth` | Enterprise | Mutual TLS client-cert auth, layered under either of the above. |
+
+mTLS in OSS can be done at the TLS layer (Kong `proxy_listen … ssl client_certificate`)
+with a `pre-function` asserting the verified client DN; `mtls-auth` (Enterprise) makes it
+first-class with consumer mapping.
+
+## Requirement 2 — Authorization limits (the "$10M auth" guard)
+
+The gateway enforces **hard caps as defense-in-depth**: even if PVCB Top up service is
+fully compromised and submits perfectly-signed requests, the blast radius is bounded. A
+single per-transaction cap defeats one giant auth; you also need velocity and cumulative
+caps to defeat *many* medium auths, plus a global circuit breaker.
+
+| Control | Example value (tune per Visa program / corridor) | State needed |
+| --- | --- | --- |
+| Per-transaction max | ≤ 5,000 USD | none |
+| Currency allowlist | `USD` only (the flow is USD top-ups) | none |
+| Amount sanity | > 0, ≤ 2 decimal places, numeric | none |
+| Per-card daily sum | ≤ 10,000 USD / 24h | Redis counter (card fingerprint) |
+| Per-card velocity | ≤ 5 / hour, ≤ 20 / day | Redis counter |
+| Per-user daily sum | ≤ 10,000 USD / 24h | Redis counter |
+| **Global daily ceiling** (circuit breaker) | platform-wide cap; trip + page on breach | Redis counter |
+
+### Implementation
+
+- **Velocity (count) caps:** `rate-limiting-advanced` (Enterprise, Redis-backed) or
+  `rate-limiting` (OSS) keyed by a custom identifier (card fingerprint / user id) rather
+  than IP.
+- **Amount caps (per-tx, currency, cumulative sums, global ceiling):** there is no
+  built-in amount plugin. Use a **custom Lua plugin `tc-auth-limit`** in the `access`
+  phase that parses the JSON body, reads `amount`/`currency`/card fingerprint, checks the
+  per-transaction and currency rules, then atomically increments and checks Redis counters
+  for the cumulative sums and global ceiling. Reject with a structured `403` and emit a
+  metric/alert on every breach. (An OPA policy via the `opa` plugin is a clean alternative
+  for the rule logic, still backed by Redis for counters.)
+- **Fail closed.** For money movement, if Redis/OPA is unavailable the limit cannot be
+  evaluated → **reject**, do not fail open.
+
+```lua
+-- tc-auth-limit (handler.lua) — illustrative access-phase sketch, not production code
+function TcAuthLimit:access(conf)
+  local body = kong.request.get_body()           -- after request-size-limiting
+  local amount = tonumber(body and body.amount)
+  local currency = body and body.currency
+
+  if not amount or amount <= 0 then
+    return kong.response.exit(400, { code = "INVALID_AMOUNT" })
+  end
+  if currency ~= conf.allowed_currency then       -- e.g. "USD"
+    return kong.response.exit(403, { code = "CURRENCY_NOT_ALLOWED" })
+  end
+  if amount > conf.max_per_txn then               -- e.g. 5000 — defeats the single big auth
+    return kong.response.exit(403, { code = "AMOUNT_OVER_LIMIT" })
+  end
+
+  local card = body.cardFingerprint               -- never the raw PAN
+  local ok, daily = redis_incr_with_ttl("sum:card:"..card, amount, 86400)
+  if not ok then return kong.response.exit(503, { code = "LIMIT_BACKEND_DOWN" }) end -- fail closed
+  if daily > conf.max_card_daily then
+    return kong.response.exit(403, { code = "DAILY_CARD_LIMIT" })
+  end
+
+  local _, global = redis_incr_with_ttl("sum:global", amount, 86400)
+  if global > conf.global_daily_ceiling then
+    kong.log.alert("global ceiling tripped")      -- page on-call
+    return kong.response.exit(503, { code = "GLOBAL_CEILING_TRIPPED" })
+  end
+end
+```
+
+### Layered enforcement
+
+The edge is the **coarse first gate**, not the only one. If a future code path reaches a
+service without traversing the gateway (internal call, misconfig, new integration),
+edge-only limits evaporate. Enforce caps at every layer that can move money:
+
+| Layer | Enforces | Why it's needed even with the edge |
+| --- | --- | --- |
+| `tc-api-gateway` (edge) | per-tx cap, currency, velocity, daily sums, global ceiling | bounds the blast radius of a PVCB breach at the boundary |
+| `tc-cardload-service` | re-validate per-tx + business rules | path-independent; not every internal caller goes through the edge |
+| `tc-card-network-service` | per-tx / currency / BAI / MCC / velocity / per-BIN / global ceiling | the authoritative gate — it submits the auth to Visa, so a cap here can't be bypassed |
+| `tc-ledger-service` | balance / exposure / prefunding limits | the system of record for funds — last app-level guard |
+| Visa Direct program config | scheme-level transaction & velocity limits | enforced by Visa itself; survives any tc-side bug |
+
+## Requirement 3 — Exactly one public endpoint
+
+Only the **client 3DS-completed callback** is reachable from the internet. Everything else
+lives on the partner or admin listener and requires mTLS + signature.
+
+### The single public route: `POST /v1/public/3ds/callback`
+
+This is called by the tourist's browser/app, so it **cannot** use mTLS or PVCB's
+signature. "Public" does **not** mean "unauthenticated":
+
+- When `tc-cardload-service` issues the 3DS redirect, it mints a **one-time, short-lived,
+  tc-signed callback token** (a JWT signed with tc's private key, `exp` a few minutes,
+  bound to the specific transaction id, single-use via `jti`).
+- The gateway verifies that token with **tc's public key** (`jwt` plugin), enforces
+  one-time use (Redis `jti` set), and only then forwards to `tc-cardload-service`.
+- The callback is a **trigger, not a source of truth.** The authoritative 3DS result comes
+  from `tc-cardload-service` re-querying Cybersource (as the diagram already shows). The
+  gateway/services must never trust "3DS passed" because the client said so.
+
+Public route plugins: `jwt` (callback token) · `rate-limiting` (per-IP + per-token) ·
+`bot-detection` · `request-size-limiting` · `cors` (only the app origin) · `correlation-id`.
+**No** `mtls-auth`, **no** partner `acl`.
+
+> Enforce the "one public route" rule structurally: bind the public listener to a route
+> matcher that only accepts `/v1/public/3ds/callback`, and add a default
+> `request-termination` (404) catch-all so no other path is ever served on `:8443`.
+
+## Requirement 4 — Admin pass-through to tc-admin-service
+
+For internal admin the gateway is a **thin reverse proxy** — no business transformation,
+no limit logic, just authenticated forwarding.
+
+- Dedicated route `admin-proxy` (`/admin/*` → `tc-admin-service`) on the **admin listener
+  only**.
+- Lock down with `ip-restriction` (internal admin CIDRs) and either `mtls-auth` (internal
+  client certs) or, if admins are humans, `openid-connect`/`oidc` (Enterprise) for SSO.
+- Keep the plugin set minimal: auth + `correlation-id` + audit logging. No request
+  rewriting beyond path stripping.
+- Emit an immutable **audit log** (who, what, when) for every admin call to your SIEM.
+
+## Consolidated plugin map
+
+| Requirement | Route(s) | Plugin(s) | Edition |
+| --- | --- | --- | --- |
+| Partner channel auth | partner | `mtls-auth` | Enterprise (OSS via TLS listener + `pre-function`) |
+| Partner message auth | partner | `jwt` or custom `tc-jws-verify` | OSS / custom |
+| Replay + idempotency | partner | `tc-jws-verify` (nonce/ts) + Redis | custom |
+| Amount limits | partner | custom `tc-auth-limit` (+ optional `opa`) | custom / EE |
+| Velocity limits | partner | `rate-limiting-advanced` / `rate-limiting` | EE / OSS |
+| Payload schema | partner | `request-validator` / `pre-function` | EE / OSS |
+| Payload size | all | `request-size-limiting` | OSS |
+| Consumer scoping | partner | `acl` | OSS |
+| Public callback token | public | `jwt` (tc key) + Redis `jti` | OSS |
+| Public abuse control | public | `rate-limiting`, `bot-detection`, `cors` | OSS |
+| Admin network lock | admin | `ip-restriction` | OSS |
+| Admin identity | admin | `mtls-auth` / `openid-connect` | EE |
+| Outbound webhook signing | egress | custom `post-function` (JWS) + mTLS | OSS / custom |
+| Tracing & metrics | global | `correlation-id`, `prometheus`, `http-log` (SIEM) | OSS |
+
+## Configuring Kong
+
+This section is the concrete build: how to stand the gateway up so the controls above are
+actually enforced. It covers deployment mode and listeners, the two custom plugins,
+plugin execution order, secrets/certs, Redis, the declarative config, and how to ship and
+verify it.
+
+### Deployment mode & listeners (`kong.conf`)
+
+Run **DB-less** (declarative) so config is GitOps-managed. The strongest way to guarantee
+"one public endpoint" is **physical separation: a separate Kong data plane per zone**
+(public / partner / admin), each loading only its own routes. If you instead run a single
+node with three listeners, you **MUST** enforce isolation with host-based routing **and**
+network ACLs so only callback traffic can reach the public interface — HTTP routes do not
+match on listener port, so the port split alone is not a security boundary.
+
+```ini
+# kong.conf  (DB-less)
+database           = off
+declarative_config = /etc/kong/kong.yaml
+
+# Three entry surfaces — bind each to its own interface / security group.
+# (For strict isolation, run one Kong data plane per surface instead.)
+proxy_listen = 10.0.1.10:8443 ssl http2, \
+               10.0.2.10:9443 ssl http2, \
+               10.0.3.10:10443 ssl http2
+
+# Admin API: never public — loopback + mTLS only, managed via decK.
+admin_listen = 127.0.0.1:8444 ssl
+
+# Register the custom plugins (plus the bundled ones).
+plugins          = bundled,tc-jws-verify,tc-auth-limit
+lua_package_path = /opt/kong/plugins/?.lua;;
+
+# Modern TLS only.
+ssl_cipher_suite = modern
+
+# Secrets backend (HashiCorp Vault shown; env / AWS-SM / GCP-SM also supported).
+vault_hcv_protocol = https
+vault_hcv_host     = vault.internal
+vault_hcv_mount    = kv
+```
+
+### Custom plugins
+
+Two controls have no built-in plugin and ship as small Lua plugins under
+`/opt/kong/plugins/kong/plugins/<name>/` (each needs `handler.lua` + `schema.lua`):
+
+- **`tc-jws-verify`** — verifies `X-JWS-Signature` against the consumer's public key,
+  recomputes the body hash, and enforces the timestamp window + nonce + idempotency key
+  (Requirement 1 / [Replay protection & idempotency](#replay-protection--idempotency)).
+- **`tc-auth-limit`** — amount / currency / cumulative-sum / global-ceiling checks
+  (Requirement 2; access-phase handler sketch in [Implementation](#implementation)).
+
+`schema.lua` for `tc-auth-limit`:
+
+```lua
+-- schema.lua
+return {
+  name = "tc-auth-limit",
+  fields = { { config = { type = "record", fields = {
+    { allowed_currency     = { type = "string", default = "USD" } },
+    { max_per_txn          = { type = "number", required = true } },
+    { max_card_daily       = { type = "number", required = true } },
+    { global_daily_ceiling = { type = "number", required = true } },
+    { redis_host           = { type = "string", required = true } },
+    { redis_port           = { type = "number", default = 6379 } },
+  } } } },
+}
+```
+
+`handler.lua` header (the `:access` body is the sketch shown under Requirement 2):
+
+```lua
+-- handler.lua
+local TcAuthLimit = { PRIORITY = 905, VERSION = "1.0.0" }  -- runs in the limit stage
+-- function TcAuthLimit:access(conf) ... end               -- see Requirement 2
+return TcAuthLimit
+```
+
+`tc-jws-verify` should set `PRIORITY = 1005` so it runs **after** channel auth
+(`mtls-auth`) and **before** `acl`/limits. Confirm the exact numbers against your Kong
+version's documented plugin priorities.
+
+### Plugin execution order (partner route)
+
+Higher `PRIORITY` runs first. Intended order on `topup-create`:
+
+```
+correlation-id → mtls-auth → tc-jws-verify → request-size-limiting
+   (tag)         (channel)   (message+replay)   (size guard)
+              → acl → tc-auth-limit / rate-limiting-advanced → [proxy → tc-cardload-service]
+                (scope)     (amount + velocity)
+```
+
+### Secrets & certificates
+
+- **PVCB public key** — store in the vault and reference it from the consumer credential:
+  `rsa_public_key: "{vault://hcv/pvcb/public-key}"`. Only the **public** key lives here.
+- **tc private key** (webhook + callback-token signing) — KMS/Vault only, referenced the
+  same way; never inlined.
+- **mTLS** — create a `ca_certificates` entity holding PVCB's client-cert CA and point the
+  `mtls-auth` plugin at it (`config.ca_certificates`). On OSS, set the TLS-layer client
+  certificate + verification on the partner listener instead.
+
+### Redis
+
+`tc-auth-limit`, `tc-jws-verify` (nonce + idempotency cache), and `rate-limiting-advanced`
+share one Redis. It is **critical-path**: run it HA (Sentinel or Cluster), and on outage
+the plugins **fail closed** for money movement (see [Failure & degradation
+behavior](#failure--degradation-behavior)).
+
+### Declarative config (`kong.yaml`)
+
+Manage the gateway as code with **decK**; never hand-edit production via the Admin API.
+Below is the config (abbreviated). Secrets are vault references, not inlined.
+
+```yaml
+_format_version: "3.0"
+
+services:
+  - name: tc-cardload-service
+    url: http://tc-cardload-service.internal:8080
+    routes:
+      # --- Partner: initiate top-up (signed + mTLS + limits) ---
+      - name: topup-create
+        paths: ["/v1/topups"]
+        methods: ["POST"]
+        plugins:
+          - name: mtls-auth                 # Enterprise; OSS: TLS listener + pre-function
+          - name: jwt                       # verifies PVCB signature (public key as credential)
+          - name: acl
+            config: { allow: ["partner"] }
+          - name: request-size-limiting
+            config: { allowed_payload_size: 64 }
+          - name: tc-auth-limit             # custom: amount + currency + cumulative + ceiling
+            config:
+              allowed_currency: "USD"
+              max_per_txn: 5000
+              max_card_daily: 10000
+              global_daily_ceiling: 2000000
+          - name: rate-limiting-advanced    # velocity by card fingerprint
+            config: { limit: [5], window_size: [3600], identifier: header, header_name: X-Card-Fingerprint }
+      # --- Partner: status query ---
+      - name: topup-status
+        paths: ["/v1/topups/(?<id>[^/]+)$"]
+        methods: ["GET"]
+        plugins:
+          - name: mtls-auth
+          - name: jwt
+          - name: acl
+            config: { allow: ["partner"] }
+      # --- Public: the ONLY internet-reachable route ---
+      - name: 3ds-callback-public
+        paths: ["/v1/public/3ds/callback"]
+        methods: ["POST"]
+        plugins:
+          - name: jwt                       # one-time tc-signed callback token
+          - name: rate-limiting
+            config: { minute: 60, policy: redis }
+          - name: bot-detection
+          - name: request-size-limiting
+            config: { allowed_payload_size: 16 }
+          - name: cors
+            config: { origins: ["https://app.pvcb.example"] }
+
+  - name: tc-admin-service                  # forward-only
+    url: http://tc-admin-service.internal:8080
+    routes:
+      - name: admin-proxy
+        paths: ["/admin"]
+        plugins:
+          - name: ip-restriction
+            config: { allow: ["10.20.0.0/16"] }   # internal admin CIDR
+          - name: mtls-auth                        # or openid-connect for human SSO
+
+consumers:
+  - username: pvcb-topup
+    acls:
+      - group: partner
+    jwt_secrets:
+      - algorithm: ES256
+        key: "pvcb-topup-kid-2026"          # kid PVCB puts in the JWS header
+        rsa_public_key: "{vault://hcv/pvcb/public-key}"  # PVCB's PUBLIC key only
+  - username: tc-callback-signer            # verifies the one-time 3DS callback token
+    jwt_secrets:
+      - algorithm: ES256
+        key: "tc-callback-kid-2026"          # kid tc-cardload-service stamps in the token
+        rsa_public_key: "{vault://hcv/tc/callback-public-key}"  # tc's PUBLIC key
+
+ca_certificates:                             # PVCB client-cert CA, referenced by mtls-auth
+  - cert: "{vault://hcv/pvcb/client-ca-pem}"
+    tags: ["pvcb-mtls"]
+
+plugins:                                     # global
+  - name: correlation-id
+  - name: prometheus
+  - name: http-log
+    config: { http_endpoint: "https://siem.internal/ingest" }
+```
+
+### Ship it with decK (CI)
+
+Keep `kong.yaml` in the repo as the single source of truth and apply it through CI — never
+hand-edit production:
+
+```bash
+deck file lint        kong.yaml   # static checks on the file
+deck gateway validate kong.yaml   # validate against the running Kong's schemas
+deck gateway diff     kong.yaml   # review the change set in the PR
+deck gateway sync     kong.yaml   # apply — only after approval
+```
+
+### Verify the controls
+
+Smoke-test each requirement after a sync (commands illustrative):
+
+```bash
+# 1. Unsigned partner request → rejected
+curl -sk https://partner:9443/v1/topups \
+  -d '{"amount":100,"currency":"USD"}' -o /dev/null -w '%{http_code}\n'          # → 401
+
+# 2. Over-limit amount → rejected even when correctly signed
+curl -sk https://partner:9443/v1/topups --cert pvcb.pem \
+  -H "X-JWS-Signature: $JWS" -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"amount":10000000,"currency":"USD"}' -w '%{http_code}\n'                  # → 403 AMOUNT_OVER_LIMIT
+
+# 3. Replay of a used nonce → rejected (resend step 2 with the same nonce)        # → 409 REPLAY_DETECTED
+
+# 4. Public callback needs a valid one-time token
+curl -sk https://public:8443/v1/public/3ds/callback -d '{}' -w '%{http_code}\n'  # → 401
+curl -sk https://public:8443/v1/public/3ds/callback \
+  -H "Authorization: Bearer $CALLBACK_JWT" -d '{}' -w '%{http_code}\n'           # → 200
+
+# 5. Admin from a non-allowlisted IP → rejected
+curl -sk https://admin:10443/admin/health -w '%{http_code}\n'                    # → 403 (allow: admin CIDR + mTLS)
+```
+
+Keep the repo as the single source of truth so config changes are reviewed like code.
+
+## Outbound webhooks to PVCB
+
+The diagram shows the gateway forwarding responses, the redirect URL, and the final
+status to PVCB "via webhook." That is **egress**, and it is the other half of the key
+exchange — it deserves the same rigor as the inbound leg.
+
+- **Sign every webhook body** with **tc's private key** (detached JWS, with `kid`); PVCB
+  verifies with **tc's public key**. This is the outbound counterpart to Requirement 1.
+- **mTLS to PVCB's endpoint** and **pin/verify their server certificate**; allowlist
+  PVCB's host/IP and do **not** follow redirects.
+- **Idempotent, at-least-once delivery.** Each webhook carries a unique `Delivery-Id` and
+  the originating transaction's `Idempotency-Key`; PVCB dedupes on these. Retry with
+  exponential backoff (e.g. 1s, 5s, 30s, 2m, …) up to a max attempt count, then route to a
+  **dead-letter queue and page on-call** — never drop a financial event silently.
+- **Ordering.** Include a monotonic `Sequence`/event timestamp so PVCB can apply a state
+  machine (or last-writer-wins) if events arrive out of order.
+- **Acknowledgement.** Treat only a `2xx` as delivered; optionally require a signed
+  receipt from PVCB. Any non-`2xx` triggers the retry path.
+- Implement via a Kong egress `service`/`route` that internal callers hit, with a
+  `post-function` that adds the JWS header before proxying out.
+
+## Failure & degradation behavior
+
+Money-movement paths **MUST** fail closed: when a security dependency cannot be evaluated,
+reject rather than let traffic through. Read-only/status paths **MAY** degrade more
+gracefully.
+
+| Dependency unavailable | Affected check | Behavior |
+| --- | --- | --- |
+| Redis (limits / nonce / idempotency) | amount caps, replay, idempotency | **Reject** money-movement with `503 LIMIT_BACKEND_DOWN`; do not approve unscreened |
+| Signature verification (key fetch / JWS) | partner & callback auth | **Reject** with `401`; never bypass |
+| OPA (if used for policy) | limit policy | **Reject** with `503` |
+| `tc-cardload-service` upstream down | request processing | **Reject** with `503` + `Retry-After`; **never** auto-approve a top-up |
+| Webhook egress to PVCB down | outbound notification | Retry with backoff → **DLQ + alert**; never silently drop |
+| Cybersource (downstream of cardload) | fraud / 3DS result | Handled by `tc-cardload-service`; the transaction **MUST NOT** proceed on an unknown 3DS/fraud result |
+
+- **Status/read endpoints** (`GET /v1/topups/{id}`) **MAY** return a degraded/cached read
+  if a non-critical dependency is down, as long as they never imply a money movement.
+- Every fail-closed rejection emits a metric and, for global-ceiling/limit-backend
+  failures, pages on-call.
+
+## Cross-cutting concerns
+
+- **PCI DSS scope.** The gateway is on the path of card data and is almost certainly in
+  CDE scope. Tokenize/replace the PAN as early as possible, pass only a **card
+  fingerprint** to limit logic, never log PAN/CVV/track data, and mask sensitive fields in
+  all logs.
+- **Observability.** `correlation-id` end-to-end, Prometheus metrics (auth failures, limit
+  rejections, replay rejections, callback abuse, fail-closed counts), structured logs to
+  SIEM, OpenTelemetry traces. Alert on: signature-verification failure spikes, limit-breach
+  spikes, replay spikes, and global-ceiling trips.
+- **Consistent error contract.** Return structured JSON errors (`{ code, message,
+  correlationId }`) with stable codes; never leak stack traces, upstream identities, or
+  whether a card/user exists.
+- **Resilience.** Active/passive **upstream health checks**, circuit breaking, and the
+  fail-closed posture above.
+- **High availability.** Deploy ≥2 Kong nodes behind an L4 LB; Redis in HA (the limit and
+  nonce/idempotency stores are critical-path).
+
+## Design review & traceability
+
+Overall the design is **sound and shows good security instincts** — defense-in-depth
+limits at the edge, partner request signing, attack-surface minimization, and a thin admin
+proxy.
+
+### What's good — kept and reinforced
+
+1. **Edge amount limits as defense-in-depth.** Capping at the gateway so a PVCB breach
+   can't trigger a $10M auth is exactly right; the threat model (trust PVCB, bound the
+   blast radius) is mature.
+2. **Asymmetric signing for the partner.** Far better than shared secrets — integrity and
+   non-repudiation per message.
+3. **Minimizing the public surface to one route.** Good attack-surface reduction.
+4. **Not trusting the client's 3DS callback** (re-querying Cybersource for the
+   authoritative result). The single most important correctness property here.
+5. **Admin as forward-only.** Clean separation; keeps the gateway thin where it should be.
+
+### Gaps from the review → where they are now specified
+
+| # | Review finding | Resolved in |
+| --- | --- | --- |
+| 1 | "Asymmetric encryption" → asymmetric **signatures** (JWS), not encryption | [What "asymmetric encryption" means here](#what-asymmetric-encryption-means-here) |
+| 2 | Signing alone isn't enough — add replay + idempotency | [Replay protection & idempotency](#replay-protection--idempotency) |
+| 3 | "One public endpoint" must still be authenticated (one-time token + rate-limit + bot) | [The single public route](#the-single-public-route-post-v1public3dscallback) |
+| 4 | Don't rely on the edge as the only limit enforcement | [Layered enforcement](#layered-enforcement) |
+| 5 | One big cap isn't enough — velocity + cumulative + global ceiling | [Authorization limits](#requirement-2--authorization-limits-the-10m-auth-guard) |
+| 6 | Outbound webhooks need the same rigor (sign, mTLS, idempotent, DLQ) | [Outbound webhooks to PVCB](#outbound-webhooks-to-pvcb) |
+| 7 | Fail closed on money movement | [Failure & degradation behavior](#failure--degradation-behavior) |
+| 8 | AML at PVCB is bypassable — keep independent tc-side screening | [Trust model & assumptions](#trust-model--assumptions) |
+| 9 | Currency must be on an explicit allowlist | [Authorization limits](#requirement-2--authorization-limits-the-10m-auth-guard) (`allowed_currency`) |
+| 10 | Plan PCI scope and `kid`-based key rotation up front | [Key lifecycle management](#key-lifecycle-management), [Cross-cutting concerns](#cross-cutting-concerns) |
+
+### Edition / cost note
+
+Several plugins above (`mtls-auth`, `rate-limiting-advanced`, `request-validator`,
+`opa`, `openid-connect`, `jwt-signer`) are **Kong Enterprise**. Everything can be built on
+**Kong OSS** using the `jwt` plugin plus custom Lua plugins (`tc-jws-verify`,
+`tc-auth-limit`) and `pre-/post-function`, at the cost of more in-house plugin code.
+Decide on edition early — it changes the build effort for Requirements 1 and 2.

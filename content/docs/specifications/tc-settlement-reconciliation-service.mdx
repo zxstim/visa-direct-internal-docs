@@ -1,0 +1,244 @@
+---
+title: tc-settlement-reconciliation-service
+description: Ingests the Visa settlement file via SFTP, normalizes it, and reconciles it transaction-by-transaction against the original authorization and the prefunding callback details — producing ledger clearing instructions, exception breaks, and reconciliation reports.
+permission: admin
+---
+
+## Purpose & scope
+
+`tc-settlement-reconciliation-service` closes the money loop. Visa pays the acquirer T+n
+after the AFT is authorized; this service takes Visa's **settlement file**, normalizes it,
+and **matches it transaction-by-transaction** against what the platform already recorded —
+the original **authorization** (the AFT) and the **prefunding callback details** — so every
+settled transaction is proven to tie out to a real, authorized, funded top-up.
+
+In the sequence diagram: Visa sends the settlement file to **PVCB Acquiring host**, which
+"retrieves and stores the settlement file into secure storage"; this service then
+"fetches the settlement file via SFTP, processes the settlement file, and displays reports
+for reconciliation" in `tc-admin-service`.
+
+Three things it does, per the requirement:
+
+1. **Handle the Visa settlement file** — fetch via SFTP, validate, and **format/normalize**
+   it into a canonical internal model.
+2. **Match transaction-by-transaction** — a three-way reconciliation of
+   **authorization ↔ prefunding ↔ settlement**.
+3. **Produce outcomes** — instruct [`tc-ledger-service`](/docs/specifications/tc-ledger-service)
+   to post settlement-clearing entries, raise exception breaks for anything that doesn't
+   tie out, and generate reconciliation reports.
+
+> The ledger is the system of record; this service is the **matcher**. It does not hold
+> balances — it reconciles and instructs the ledger to post.
+
+## Technical stack
+
+JDK 25, Spring Boot 4.0+ (Maven), Spring Data JPA on MySQL 8.4 LTS; messaging via **Spring Cloud Stream** (broker-abstracted); SFTP client for
+file retrieval. It builds a **local read model (CQRS)** of the authorization and prefunding
+legs by consuming events, then matches the settlement file against it and **publishes
+results as events** (see [Architecture & service interaction](/docs/specifications/architecture)).
+
+## Position in the flow
+
+```
+VISA ──settlement file──▶ PVCB Acquiring host ──store──▶ secure storage (SFTP)
+                                                              │  fetch
+                                                              ▼
+                              tc-settlement-reconciliation-service
+   inputs to match against:        │  1. fetch + validate + normalize file
+   • authorization (AFT) ──────────┤  2. three-way match per transaction
+       (tc-card-network-service)   │  3. outcomes:
+   • prefunding callback details ──┤      ├─ post clearing entries ─▶ tc-ledger-service
+       (tc-ledger-service)         │      ├─ exceptions/breaks ─▶ ops
+                                   │      └─ reconciliation reports ─▶ tc-admin-service
+```
+
+## The three legs being reconciled
+
+| Leg | Key fields | Source |
+| --- | --- | --- |
+| **Authorization (AFT)** | Visa `transactionIdentifier`, RRN, STAN, `acquiringBin`, authorized amount + currency, `approvalCode`, auth date | `aft.completed` events from `tc-card-network-service` → local read model |
+| **Prefunding callback** | business `transactionId`, funded amount (VND), FX rate, status (completed/failed), prefund timestamp | `prefunding.completed` / `prefunding.failed` events → local read model |
+| **Settlement** | settlement `transactionIdentifier`, settled amount + currency, interchange/fees, settlement date | the Visa settlement file |
+
+The platform already holds the first two legs by the time settlement arrives; this service
+adds the third and proves all three agree.
+
+## Settlement file handling
+
+### Acquisition
+
+- Visa delivers the settlement file to the **PVCB Acquiring host**, which lands it in
+  **secure storage**. This service runs an **SFTP poller** that fetches new files on a
+  schedule, over key-based SFTP (no passwords).
+- Each file is recorded by name + hash; an already-ingested file is skipped
+  ([idempotent](#idempotency--reprocessing)).
+
+### Format & validation
+
+Visa settlement reporting is the **VisaNet Settlement Service (VSS)**: **TC46**
+(machine-readable) reports, with **TC47** as the human-readable equivalent, plus raw
+Base II / SMS clearing data depending on configuration. These are fixed-width **TCR**
+(Transaction Component Record) layouts with header/trailer **control records** carrying
+counts and amount totals.
+
+- **Validate before trusting:** verify header/trailer control totals (record count and
+  settlement amount), file sequence/continuity (no gaps, no duplicates), and currency.
+- A file that fails control-total validation is **rejected as a whole** and alerted — never
+  partially applied.
+
+> The exact report set (e.g. VSS-110/120/130/300 and the raw TC formats) and delivery
+> layout must be **confirmed with your Visa representative** during onboarding; they vary by
+> program and region. This service is built to a **pluggable parser** so the concrete VSS
+> layout is config, not code.
+
+### Normalization
+
+Each settlement detail record is parsed into a **canonical settlement record**:
+
+```json
+{
+  "settlementId": "<file>:<seq>",
+  "transactionIdentifier": 41234567890123456,   // primary join key to the AFT
+  "retrievalReferenceNumber": "330000550000",
+  "settledAmount": "100.00",
+  "settlementCurrency": "USD",
+  "interchangeFee": "0.15",
+  "schemeFees": "0.05",
+  "transactionType": "AFT",                       // AFT | AFTR(reversal) | OCT(refund) | ADJUSTMENT
+  "settlementDate": "2026-06-11",
+  "fundsType": "..."
+}
+```
+
+## Reconciliation / matching engine
+
+### Match keys
+
+- **Primary:** Visa `transactionIdentifier` (returned on the AFT and present on the
+  settlement line) joins **settlement ↔ authorization**.
+- **Authorization ↔ prefunding** joins on the business `transactionId`.
+- **Fallbacks** when the identifier is absent/garbled: `RRN`, or `STAN + acquiringBin +
+  localTransactionDate`, plus amount — used only to propose a match for review, never to
+  auto-clear.
+
+### Algorithm
+
+1. For each normalized settlement record, find its authorization by `transactionIdentifier`.
+2. From the authorization, find the prefunding callback by `transactionId`.
+3. **Reconcile amounts** within tolerance: the settled amount should equal the authorized
+   amount net of expected scheme fees/interchange; the prefunded VND should equal the
+   expected funded amount at the booked FX. Tolerances are configurable (fees, FX rounding).
+4. Assign a **match outcome** and act on it.
+
+### Outcome taxonomy
+
+| Outcome | Condition | Action |
+| --- | --- | --- |
+| `MATCHED` | all three legs present and reconcile within tolerance | instruct ledger to post settlement-clearing entry; recognize fees/FX |
+| `AMOUNT_MISMATCH` | settled ≠ expected beyond tolerance | break → `suspense`, raise exception for ops |
+| `UNSETTLED` | auth + prefund present, no settlement line | carry as outstanding receivable; escalate if past expected T+n |
+| `ORPHAN_SETTLEMENT` | settlement line, no matching authorization | break → exception (possible mis-delivery / wrong BIN) |
+| `MISSING_PREFUND` | auth + settlement, no prefunding | **high-priority break** — money pulled and settled but customer never funded |
+| `REVERSAL` / `ADJUSTMENT` | settlement line is an AFTR/adjustment | match against the reversal/adjustment record from `tc-card-network-service`; net in the ledger |
+| `DUPLICATE_SETTLEMENT` | second settlement line for the same transaction | ignore the duplicate; alert |
+
+- **Breaks are never auto-cleared.** They go to an exception queue surfaced in
+  `tc-admin-service` for manual resolution; only a `MATCHED` (or an ops-approved
+  resolution) results in clearing.
+
+## Outputs
+
+- **Ledger clearing:** for each `MATCHED` line, **publish a `settlement.matched` event**
+  (consumed by `tc-ledger-service`) with the matched amounts so it posts the
+  settlement-received entry (Dr `nostro_settlement` / Cr `visa_receivable`), recognizes FX
+  gain/loss, and replenishes the prefunding pool.
+- **Fee & interchange recognition:** pass interchange/scheme fees so the ledger books them.
+- **Exceptions:** every non-`MATCHED` outcome becomes an exception record with enough
+  context (the three legs + the discrepancy) to resolve it.
+- **Reports:** daily reconciliation summary (counts and amounts by outcome), break aging,
+  unsettled receivables, and per-transaction detail — rendered in `tc-admin-service`.
+
+## Idempotency & reprocessing
+
+- A file is ingested **once** (dedupe by name + content hash); re-fetching the same file is
+  a no-op.
+- Matching is **deterministic and replayable**: re-running reconciliation for a period
+  reproduces the same outcomes and never double-posts to the ledger (ledger postings are
+  idempotent on `transactionId` + event type).
+- Late/partial files and corrections (a transaction settling in a later file, or a
+  re-issued file) are handled by re-matching; an `UNSETTLED` becomes `MATCHED` when its
+  settlement finally arrives.
+
+## Scheduling & orchestration
+
+- Run on a **daily settlement cycle** aligned to Visa's delivery window, with a poller that
+  also catches late files.
+- Per run: fetch → validate → normalize → match → emit outputs → publish report. Each stage
+  is restartable; a failure mid-run does not leave partial ledger postings.
+- Alert if an expected file does not arrive within its window.
+
+## Data model
+
+- `settlement_files` — name, hash, sequence, received/processed timestamps, control totals,
+  status. (Dedupe key.)
+- `settlement_records` — canonical normalized lines (above), linked to their file.
+- `reconciliation_results` — per transaction: matched legs, outcome, discrepancy, status
+  (open/resolved), resolver.
+- `exceptions` — open breaks for ops, with aging.
+
+## Security & PCI
+
+- SFTP over **key-based auth**; keys in KMS/Vault; host-key pinning on the secure-storage
+  endpoint.
+- Settlement files can contain PAN or truncated PAN → **PCI scope**: encrypt at rest,
+  restrict access, mask PAN in any report/UI, and never log full PAN.
+- Treat raw files as immutable evidence; retain per the data-retention/audit policy.
+
+## Error handling & fail-closed
+
+- Control-total or sequence validation failure → **reject the whole file**, alert, do not
+  process.
+- A matching outcome that is not `MATCHED` **never** auto-clears — it becomes a break.
+- Ledger-posting failure for a matched line is retried; the line stays "matched, posting
+  pending" until confirmed (no silent loss).
+
+## Observability
+
+- Metrics: files received vs expected, records processed, **match rate**, break counts by
+  outcome, break aging, unsettled-receivable amount/age, ledger-posting success.
+- Alert on: missing/late file, control-total failure, `MISSING_PREFUND` breaks (highest
+  priority), match-rate drop, and growing break backlog.
+- Structured audit log correlated on business `transactionId` and Visa
+  `transactionIdentifier`.
+
+## Events
+
+See [Architecture](/docs/specifications/architecture). This service consumes the auth and
+prefunding legs into its read model and publishes match outcomes; consumers are idempotent
+on `eventId`.
+
+| Direction | Event | Counterpart |
+| --- | --- | --- |
+| consumes | `aft.completed` / `aft.reversed` / `aft.adjusted` / `aft.refunded` | card-network |
+| consumes | `prefunding.completed` / `prefunding.failed` | core-banking adapter |
+| produces | `settlement.matched` | ledger, admin |
+| produces | `settlement.break` | admin (ops queue) |
+
+## Assumptions & open questions
+
+1. **File format/report set.** Assumed VSS **TC46/TC47** (and raw Base II/SMS as
+   configured); confirm the exact reports, layout, and delivery cadence with Visa. Parser is
+   pluggable by design.
+2. **Leg sourcing.** Authorization and prefunding legs are consumed from `aft.*` /
+   `prefunding.*` events into this service's own read model (CQRS), per the event-driven
+   architecture — not queried live from the owners.
+3. **Tolerances.** Fee/FX/rounding tolerances for amount matching must be set with finance.
+4. **Break resolution workflow & SLAs** are owned by ops; this service surfaces breaks and
+   records resolutions but does not auto-resolve.
+
+## References
+
+- VisaNet Settlement Service (VSS) User's Guide, Volumes 1 & 2 (TC46/TC47 report formats) —
+  obtain via your Visa representative / Visa Online.
+- [Visa Settlement Reports and Reconciliation (Visa Business School)](https://www.visabusinessschool.com/en/course/6bb8872b-3de8-4879-8d6d-aea6fef1934b)
+- [Visa Direct API Reference](https://developer.visa.com/capabilities/visa_direct/reference)

@@ -1,0 +1,13 @@
+{
+  "pages": [
+    "index",
+    "architecture",
+    "tc-api-gateway",
+    "tc-cardload-service",
+    "tc-card-network-service",
+    "tc-ledger-service",
+    "tc-settlement-reconciliation-service",
+    "tc-admin-service"
+  ],
+  "defaultOpen": false
+}

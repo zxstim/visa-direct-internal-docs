@@ -1,0 +1,326 @@
+---
+title: tc-card-network-service
+description: Visa Direct integration service — the single money-movement gate. Performs AFT pulls with configurable authorization limits, and manages reversals and adjustments.
+permission: admin
+---
+
+## Purpose & scope
+
+`tc-card-network-service` is the **single integration point to Visa Direct** and the
+**last application gate before money actually moves**. When
+[`tc-cardload-service`](/docs/specifications/tc-cardload-service) has a fraud-screened,
+3DS-authenticated transaction, it calls this service to execute the **Account Funding
+Transaction (AFT)** — the pull of funds from the tourist's foreign Visa card. This service
+also owns the corrective flows: **reversals** (undo an AFT) and **adjustments** (correct
+the amount of a completed AFT), plus the OCT refund path.
+
+Three responsibilities are explicit in this spec:
+
+1. **Configurable authorization limits** — hard, network-level amount/velocity caps,
+   enforced here as the authoritative last gate (defense-in-depth on top of the gateway's
+   edge limits).
+2. **Call the Visa Direct API** — AFT pull, with the 3DS results carried into the
+   authorization for SCA/liability.
+3. **Manage adjustment and reversal** — the corrective lifecycle when downstream steps
+   (e.g. prefunding) fail, on cancellation, on timeout, or on amount correction.
+
+> This service handles PAN and is in **PCI DSS scope**. It uses mutual TLS + Message Level
+> Encryption to Visa and minimizes cardholder-data handling — see
+> [Connectivity](#visa-developer-platform-connectivity) and [Security](#security--pci).
+
+## Technical stack
+
+JDK 25, Spring Boot 4.0+ (Maven), Spring Data JPA on MySQL 8.4 LTS; messaging via **Spring Cloud Stream** (broker-abstracted). Calls to
+**Visa Direct / PAAI are synchronous HTTPS over mTLS**; the AFT/reversal lifecycle is driven
+by **events** (see [Architecture & service interaction](/docs/specifications/architecture)).
+
+## Position in the flow
+
+```
+tc-cardload-service ──AFT pull──▶ tc-card-network-service ──▶ Visa Direct (VDP)
+        ▲   3DS results (cavv/eci)        │  1. authorization limits (last gate)
+        │                                 │  2. AFT pull  POST .../pullfundstransactions
+        │  AFT result (approved/declined) │  3. on downstream failure / cancel / timeout:
+        └─────────────────────────────────┤        reversal  POST .../reversefundstransactions
+                                           │  4. amount correction: AFT adjustment
+                                           │  5. refund to sender: OCT  POST .../pushfundstransactions
+                                           └──▶ emits records to tc-settlement-reconciliation-service
+```
+
+In the sequence diagram the AFT pull is `tc-card-network-service` → "VISA Direct AFT/PULL
+API" → "VISA Direct returns response AFT transaction", followed by the AFT pass/fail
+decision. Reversal/adjustment are not drawn but are required to make the money movement
+safe and correct.
+
+> **Consolidate Visa calls here.** The diagram shows `tc-cardload-service` doing the
+> "AFT-enabled check" directly with Visa. Recommend routing **all** Visa Direct calls —
+> including card eligibility (Payment Account Attributes Inquiry) — through this service so
+> the Visa certificates, BIN/BAI config, STAN allocation, and limits live in one place.
+> `tc-cardload-service` then calls this service for eligibility instead of Visa directly.
+
+## Configurable authorization limits
+
+This service is the **authoritative limit gate** — it is the component that actually
+submits the auth to Visa, so a cap enforced here cannot be bypassed by any internal path.
+It complements (does not replace) the gateway's edge limits; see the gateway's
+[layered enforcement](/docs/specifications/tc-api-gateway).
+
+| Control | Example (tune per Visa program / corridor) | State |
+| --- | --- | --- |
+| Per-transaction max | ≤ 5,000 USD | none |
+| Currency allowlist | `USD` | none |
+| Business Application Id (BAI) allowlist | only approved BAIs for this use case | none |
+| MCC allowlist | only approved merchant category codes | none |
+| Per-card / sender daily sum | ≤ 10,000 USD / 24h | Redis/DB counter |
+| Per-card velocity | ≤ 5 / hour, ≤ 20 / day | counter |
+| Per-BIN daily ceiling | per acquiring-BIN program cap | counter |
+| **Global daily ceiling** (circuit breaker) | platform-wide; trip + page | counter |
+
+```yaml
+cardNetwork:
+  limits:
+    perTxnMax:        { USD: 5000 }
+    allowedCurrencies: ["USD"]
+    allowedBai:        ["AA"]          # Business Application Id(s) approved with Visa
+    allowedMcc:        ["6051"]        # merchant category code(s)
+    perCardDailyMax:   { USD: 10000 }
+    perCardVelocity:   { perHour: 5, perDay: 20 }
+    perBinDailyMax:    { USD: 2000000 }
+    globalDailyCeiling:{ USD: 5000000 }
+    failClosed:        true            # if the counter store is unavailable → reject
+```
+
+Rules:
+
+- Every limit is **configurable** (per environment / corridor / BIN) and reloadable without
+  a deploy.
+- These are **defense-in-depth**, on top of (a) the gateway edge limits and (b) the limits
+  Visa enforces at the program/BIN level. Enforce all three.
+- **Fail closed:** if limits can't be evaluated (counter store down), reject — never submit
+  an unscreened auth to Visa.
+
+## Visa Direct API surface
+
+Verified operations (Visa Direct **Funds Transfer API**, v1). Exact resource-path
+spelling — especially `reversefundstransactions` — and the AFT Adjustment path should be
+**confirmed against the live [Visa Direct API Reference](https://developer.visa.com/capabilities/visa_direct/reference)**
+during onboarding (the reference is JS-rendered and could not be quoted verbatim here).
+
+| Operation | Method & path |
+| --- | --- |
+| AFT — pull funds (single) | `POST /visadirect/fundstransfer/v1/pullfundstransactions` |
+| AFT — status query | `GET /visadirect/fundstransfer/v1/pullfundstransactions/{statusIdentifier}` |
+| AFT reversal (AFTR) | `POST /visadirect/fundstransfer/v1/reversefundstransactions` |
+| Reversal — status query | `GET /visadirect/fundstransfer/v1/reversefundstransactions/{statusIdentifier}` |
+| OCT — push funds (refund to sender) | `POST /visadirect/fundstransfer/v1/pushfundstransactions` |
+| Multi (batch variants) | `POST /visadirect/fundstransfer/v1/multifundstransactions` |
+| Card eligibility | Payment Account Attributes Inquiry — see [PAAI reference](https://developer.visa.com/capabilities/paai/reference) |
+
+> **AFT Adjustment** (correct the amount of a completed AFT) is a distinct Visa capability
+> from reversal; confirm its exact endpoint and enablement with Visa during onboarding (it
+> is available for Visa Direct for Card and may require separate program approval).
+
+### AFT pull — key fields
+
+The pull carries the 3DS results from `tc-cardload-service` so the authorization gets SCA
+treatment and liability handling.
+
+```json
+// POST /visadirect/fundstransfer/v1/pullfundstransactions  (abbreviated)
+{
+  "systemsTraceAuditNumber": 451001,          // STAN — unique per transaction
+  "retrievalReferenceNumber": "330000550000",
+  "localTransactionDateTime": "2026-06-09T10:00:00",
+  "acquiringBin": 408999,
+  "acquirerCountryCode": "704",
+  "businessApplicationId": "AA",              // from limits.allowedBai
+  "merchantCategoryCode": "6051",
+  "amount": "100.00",
+  "transactionCurrencyCode": "USD",
+  "senderPrimaryAccountNumber": "<from-flex-token / TMS>",
+  "senderCardExpiryDate": { "month": "12", "year": "2031" },
+  "cardAcceptor": { "name": "...", "terminalId": "...", "idCode": "...",
+                    "address": { "country": "VN", "city": "..." } },
+  "cavv": "<from payer-auth>",                 // 3DS CAVV
+  "pointOfServiceData": { "panEntryMode": "...", "posConditionCode": "..." }
+}
+```
+
+```json
+// response (abbreviated)
+{
+  "actionCode": "00",                          // 00 = approved; else decline reason
+  "approvalCode": "CB1234",
+  "transactionIdentifier": 41234567890123456,  // Visa transaction id — keep it
+  "responseCode": "5",
+  "statusIdentifier": "11342480001"            // used by the GET status query
+}
+```
+
+`actionCode == "00"` → AFT approved (→ prefunding). Anything else → declined (→ failed AFT
+result back to `tc-cardload-service`). Persist `transactionIdentifier`, STAN,
+`transmissionDateTime`, `acquiringBin`, `approvalCode`, `statusIdentifier` — they are the
+keys needed for reversal, adjustment, status query, and reconciliation.
+
+## Reversal management
+
+A reversal **undoes a previously approved AFT in full**, returning the pulled funds to the
+sender's card.
+
+**Triggers (when this service initiates a reversal):**
+
+- Downstream **prefunding fails** after the AFT was approved (the AFT must not stand).
+- **Cancellation** of the top-up before completion.
+- **Uncertain response / timeout** on the original AFT (see
+  [Exactly-once](#idempotency--exactly-once-money-movement)) — reverse rather than risk a
+  stuck pull.
+
+**Mechanics:**
+
+- `POST /visadirect/fundstransfer/v1/reversefundstransactions`, referencing the original
+  via `originalDataElements` (`systemsTraceAuditNumber`, `transmissionDateTime`,
+  `acquiringBin`, `approvalCode`) plus the original `transactionIdentifier`, with the
+  reversal `amount`.
+- **Time window:** an AFT can be reversed within **~24 hours of the original and before it
+  settles**. Past that window, use the refund path (OCT) instead — see below.
+- Reversals are retried until acknowledged; persist reversal STAN + status and reconcile
+  via the GET status query.
+
+## Adjustment management
+
+An **adjustment corrects the amount** of an AFT that has already completed (increase or
+decrease) — for sender errors, disputes, or post-settlement corrections. It is **not** a
+full reverse.
+
+- Use Visa's **AFT Adjustment** capability (confirm endpoint/enablement with Visa).
+- Choose the right tool by timing:
+  - **Within the reversal window, full undo** → reversal (above).
+  - **Amount correction of a completed AFT** → AFT adjustment.
+  - **Return funds after the reversal window (up to ~30 days)** → **OCT refund**
+    (`pushfundstransactions`) back to the sender's card.
+- Every adjustment/refund references the original `transactionIdentifier`, is limit-checked
+  (a refund is money movement too), persisted, and fed to reconciliation.
+
+> **Timing summary:** reverse ≤ ~24h pre-settlement; adjust the amount of a completed AFT
+> via AFT Adjustment; refund ≤ ~30 days via OCT. Confirm exact windows for your region with
+> Visa — AFT support and windows vary by geography.
+
+## Idempotency & exactly-once money movement
+
+This is the most safety-critical part: a duplicate AFT is a **double charge**.
+
+- **Unique STAN per logical transaction.** Allocate STAN/RRN deterministically from the
+  `Idempotency-Key` so a retry reuses the same trace and Visa de-dupes.
+- **Never blind-resend on timeout.** If an AFT call times out or returns an uncertain
+  result, **do not** submit a fresh AFT. Instead:
+  1. **GET status** by `statusIdentifier` to learn the real outcome; or
+  2. if still indeterminate, send a **reversal** to guarantee no funds are left pulled.
+- **Idempotent service API:** a repeated `POST /v1/aft` with the same `Idempotency-Key`
+  returns the existing result, never a second pull.
+- Persist state transitions durably so reconciliation and reversal can act on the true
+  outcome.
+
+## Transaction lifecycle
+
+```
+RECEIVED
+  └▶ LIMIT_CHECK ── over-limit / fail-closed ──▶ REJECTED_LIMIT
+        └▶ AFT_SUBMITTED
+              ├─ approved (00) ─▶ AFT_APPROVED ─▶ (prefunding by caller)
+              │        └─ prefunding failed / cancel ─▶ REVERSAL_SUBMITTED ─▶ REVERSED
+              ├─ declined ──────▶ AFT_DECLINED
+              └─ timeout/uncertain ─▶ STATUS_QUERY ─┬─ approved ─▶ AFT_APPROVED
+                                                    ├─ not found ─▶ AFT_DECLINED
+                                                    └─ indeterminate ─▶ REVERSAL_SUBMITTED
+   (post-completion corrections)
+   AFT_APPROVED ─ amount correction ─▶ ADJUSTMENT_SUBMITTED ─▶ ADJUSTED
+   AFT_APPROVED ─ refund (>24h)      ─▶ OCT_SUBMITTED        ─▶ REFUNDED
+```
+
+## Service API (inbound, from `tc-cardload-service`)
+
+| Method & path | Purpose |
+| --- | --- |
+| `POST /v1/aft` | Run limits + submit the AFT pull (requires `Idempotency-Key`) |
+| `GET /v1/aft/{id}` | Status of an AFT (proxies/caches the Visa status query) |
+| `POST /v1/aft/{id}/reversal` | Reverse an approved AFT (downstream failure / cancel) |
+| `POST /v1/aft/{id}/adjustment` | Adjust the amount of a completed AFT |
+| `POST /v1/aft/{id}/refund` | OCT refund to the sender's card |
+| `POST /v1/eligibility` | Card eligibility (PAAI) — if consolidated here |
+
+## Visa Developer Platform connectivity
+
+| Concern | Detail |
+| --- | --- |
+| Base host | `sandbox.api.visa.com` (sandbox) / `api.visa.com` (production) |
+| Transport auth | **Two-Way SSL (mutual TLS)** with the Visa project client certificate |
+| Message auth | `x-pay-token` (API key + shared secret HMAC) **or** userId/password per project setup |
+| Payload protection | **Message Level Encryption (MLE)** — JWE-encrypt request/response so the PAN is protected end-to-end, not just in transit |
+| Credentials | store certs / keys / shared secret in KMS/Vault; never in config |
+| Correlation | propagate the transaction id; capture Visa `transactionIdentifier` + `statusIdentifier` |
+
+## Security & PCI
+
+- Receive the card as a **Flex transient token / TMS instrument identifier** from
+  `tc-cardload-service` where possible; only de-tokenize the PAN at the moment of the Visa
+  call, inside the MLE boundary.
+- Never log PAN/CVV/expiry; mask everything. Keep this service in a tightly scoped CDE
+  segment.
+- Enforce **MLE** so PAN is encrypted at the message layer even past TLS termination.
+
+## Error handling, fail-closed & reconciliation
+
+- **Fail closed** on money movement: limit store down, MLE/cert failure, or signature
+  errors → reject; never submit unscreened/unprotected.
+- Bounded timeouts; on uncertain AFT responses follow the
+  [exactly-once](#idempotency--exactly-once-money-movement) GET-or-reverse rule, never a
+  blind resend.
+- Emit a record for **every** AFT / reversal / adjustment / refund (with Visa ids and
+  outcome) to `tc-settlement-reconciliation-service` so the settlement file can be matched
+  T+n, and reversals/refunds net correctly.
+
+## Observability
+
+- Correlate on transaction id; record Visa `transactionIdentifier` / `statusIdentifier` for
+  support.
+- Metrics: AFT approval/decline rates by `actionCode`, reversal & adjustment counts and
+  reasons, timeout / GET-status / forced-reversal counts, limit-rejection counts, Visa
+  latency.
+- Alert on: AFT decline spikes, reversal spikes, timeout/indeterminate spikes,
+  global-ceiling trips, and any fail-closed event.
+
+## Events
+
+The AFT lifecycle is event-driven (see [Architecture](/docs/specifications/architecture)).
+The HTTP endpoints in [Service API](#service-api-inbound-from-tc-cardload-service) remain for
+**ops/queries and the synchronous eligibility check**; the money movement is triggered and
+reported via events. Producers use the **transactional outbox**; consumers are **idempotent**
+on `eventId`; money events are **ordered** by `transactionId` (partition key).
+
+| Direction | Event | Counterpart |
+| --- | --- | --- |
+| consumes | `aft.requested` | cardload |
+| produces | `aft.completed` / `aft.declined` | cardload, ledger, reconciliation, admin |
+| consumes | `aft.reversal.requested` | cardload |
+| produces | `aft.reversed` | ledger, reconciliation, admin |
+| produces | `aft.adjusted` / `aft.refunded` | ledger, reconciliation, admin |
+| consumes | `limits.updated` | admin (reload authorization limits) |
+
+## Assumptions & open questions
+
+1. **Reverse vs adjust vs refund boundaries.** Modeled as reverse ≤ ~24h pre-settlement,
+   AFT adjustment for amount corrections, OCT refund ≤ ~30 days. Confirm exact windows and
+   which capabilities are enabled for your Visa program and region.
+2. **BAI / MCC values.** `allowedBai`/`allowedMcc` must be set to the values Visa approves
+   for this funding use case.
+3. **Eligibility ownership.** Spec recommends consolidating the card-eligibility (PAAI)
+   call into this service rather than `tc-cardload-service` calling Visa directly.
+4. **Exact Visa paths.** Confirm `reversefundstransactions` spelling, the AFT Adjustment
+   endpoint, and PAAI paths against the live API reference at integration time.
+
+## References
+
+- [Getting Started with Visa Direct](https://developer.visa.com/capabilities/visa_direct/docs)
+- [How to Use Visa Direct](https://developer.visa.com/capabilities/visa_direct/docs-how-to)
+- [Visa Direct API Reference](https://developer.visa.com/capabilities/visa_direct/reference)
+- [Payment Account Attributes Inquiry (PAAI) reference](https://developer.visa.com/capabilities/paai/reference)

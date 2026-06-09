@@ -1,0 +1,449 @@
+---
+title: tc-cardload-service
+description: Orchestration service for the Visa Direct top-up flow — Cybersource Decision Manager (fraud) and Payer Authentication (3DS) split into two independently configurable components.
+permission: admin
+---
+
+## Purpose & scope
+
+`tc-cardload-service` is the **orchestrator** of a single top-up. It receives a verified
+top-up request from [`tc-api-gateway`](/docs/specifications/tc-api-gateway), runs the
+risk and authentication checks, drives the Visa Direct AFT pull (via
+`tc-card-network-service`), and reports every outcome back to PVCB through the gateway's
+signed webhook egress.
+
+Risk and authentication are handled **entirely by Cybersource**:
+
+- **Fraud screening** → **Cybersource Decision Manager (DM)**.
+- **3-D Secure / SCA** → **Cybersource Payer Authentication**.
+
+Because Decision Manager must be able to be **turned off** (per environment, corridor, or
+incident), the two capabilities are built as **two distinct, independently configurable
+components** behind a common interface, sequenced by a small orchestrator. Turning DM off
+removes the fraud component from the pipeline without touching the authentication
+component or the rest of the flow.
+
+> This service handles card data and is in **PCI DSS scope**. The design below keeps the
+> raw PAN out of `tc-*` systems by using Cybersource tokenization — see
+> [Card data handling](#card-data-handling--pci).
+
+## Technical stack
+
+JDK 25, Spring Boot 4.0+ (Maven), Spring Data JPA on MySQL 8.4 LTS; messaging via **Spring
+Cloud Stream** (broker-abstracted — Kafka/RabbitMQ/cloud). This service is the **saga
+orchestrator** for the top-up
+(see [Architecture & service interaction](/docs/specifications/architecture)). Calls to
+Cybersource are **synchronous HTTPS**; coordination with the other `tc-*` services is
+**asynchronous events over Spring Cloud Stream**.
+
+## Position in the flow
+
+The slice of the sequence diagram this service owns:
+
+```
+gateway ──verified top-up──▶ tc-cardload-service
+                               │ 1. AFT eligibility  ──▶ tc-card-network-service ──▶ VISA Direct
+                               │ 2. Fraud screening  ──▶ Cybersource Decision Manager      (TOGGLEABLE)
+                               │ 3. Payer auth (3DS) ──▶ Cybersource Payer Authentication
+                               │      └─ challenge ──▶ (redirect URL back to PVCB → client)
+                               │ 4. (client 3DS done) ◀── gateway public callback
+                               │ 5. AFT pull         ──▶ tc-card-network-service ──▶ VISA Direct
+                               │ 6. Prefunding       ──▶ PVCB Core Banking
+                               └─ webhook outcome at each gate ──▶ gateway ──▶ PVCB
+```
+
+Note the ordering from the diagram: **fraud screening runs before payer authentication**,
+and the "redirect URL for 3DS" is the Payer Authentication step-up URL produced in step 3.
+
+## Component architecture (the two-component split)
+
+The headline requirement: fraud and authentication are **separate components** so DM can
+be configured on/off. The orchestrator owns the transaction state machine; each risk step
+is a pluggable component implementing one interface.
+
+```
+                       ┌──────────────────────────────────────────────┐
+   gateway ──▶  Orchestrator (transaction state machine, persistence)  │
+                       │   runs the ENABLED components, in order        │
+                       └───────┬───────────────────────┬───────────────┘
+                               │                        │
+                 ┌─────────────▼──────────┐   ┌─────────▼───────────────┐
+                 │ FraudScreeningComponent │   │ PayerAuthComponent       │
+                 │  (Decision Manager)     │   │  (Payer Authentication)  │
+                 │  ── toggleable ──       │   │                          │
+                 └─────────────┬──────────┘   └─────────┬───────────────┘
+                               └──────────┬─────────────┘
+                                ┌─────────▼──────────┐
+                                │ Cybersource adapter │  (auth, retries, mapping)
+                                └─────────────────────┘
+```
+
+### Common component contract
+
+Both components implement the same contract, so the orchestrator treats them uniformly and
+a disabled component simply isn't in the pipeline:
+
+```ts
+interface RiskComponent {
+  readonly name: 'fraud-screening' | 'payer-authentication';
+  isEnabled(cfg: CardloadConfig): boolean;        // config-driven toggle
+  // Synchronous gates return PASS/FAIL/HOLD; async gates return CHALLENGE + a resume token.
+  execute(txn: Transaction): Promise<ComponentResult>;
+  // Only payer-auth implements this; called when the client 3DS callback arrives.
+  resume?(txn: Transaction, callback: CallbackPayload): Promise<ComponentResult>;
+}
+
+type ComponentResult =
+  | { outcome: 'PASS';      data: Record<string, unknown> }     // proceed to next component
+  | { outcome: 'FAIL';      reason: string; code: string }      // terminal reject
+  | { outcome: 'HOLD';      reviewRef: string }                 // manual review (DM REVIEW)
+  | { outcome: 'CHALLENGE'; redirectUrl: string; resumeRef: string }; // await client callback
+```
+
+The orchestrator iterates `config.pipeline` (an ordered list of component names), skipping
+any whose `isEnabled()` is false. `PASS` advances; `FAIL`/`HOLD` are terminal (subject to
+review policy); `CHALLENGE` suspends the transaction until the gateway's public 3DS
+callback resumes it.
+
+## Configuration model
+
+A single config object controls which components run, in what order, and how each behaves.
+This is what makes Decision Manager switchable without code changes.
+
+```yaml
+cardload:
+  pipeline: [fraud-screening, payer-authentication]   # order; remove/disable to skip
+
+  fraudScreening:
+    enabled: true                  # ← the toggle: false removes DM from the flow entirely
+    provider: cybersource-decision-manager
+    onReview: HOLD                 # HOLD | ACCEPT | REJECT  — how to treat a DM REVIEW
+    failClosed: true               # DM call errors while enabled → reject (money movement)
+
+  payerAuthentication:
+    enabled: true
+    provider: cybersource-payer-authentication
+    challengeIndicator: "04"       # 3DS requestor challenge indicator (04 = challenge requested)
+    allowFrictionless: true        # accept a frictionless AUTHENTICATION_SUCCESSFUL with no step-up
+    minEci: ["05", "02", "06", "01"]  # acceptable ECI values for AFT (authenticated/attempted)
+    failClosed: true
+```
+
+Behavioral rules:
+
+- `fraudScreening.enabled = false` → the orchestrator never calls Decision Manager; the
+  state machine transitions straight from eligibility to payer authentication. No synthetic
+  "accept" is sent to Cybersource; the component is simply absent.
+- A component's `failClosed: true` means: if its Cybersource call errors (and the component
+  is enabled), the transaction is **rejected**, never passed through unscreened. This
+  mirrors the gateway's [fail-closed posture](/docs/specifications/tc-api-gateway).
+- `pipeline` order is honored; today it is `fraud → payer-auth` to match the diagram.
+
+## Transaction lifecycle
+
+```
+CREATED
+  └▶ AFT_ELIGIBILITY ──ineligible──▶ REJECTED_INELIGIBLE
+        └▶ FRAUD_SCREENING (skipped if DM off)
+              ├─ REJECT ───────────▶ REJECTED_FRAUD
+              ├─ REVIEW ───────────▶ IN_REVIEW  (per onReview policy)
+              └─ ACCEPT
+                   └▶ AUTH_SETUP ▶ AUTH_ENROLLMENT
+                         ├─ frictionless success ─┐
+                         ├─ challenge required ─▶ AWAITING_CHALLENGE
+                         │      └─(client callback)─▶ AUTH_VALIDATION
+                         └─ failed ───────────────▶ REJECTED_3DS
+                   AUTH_VALIDATION ─ fail ─▶ REJECTED_3DS
+                         └─ success ─┘
+                              └▶ AFT_PULL ── fail ──▶ FAILED_AFT
+                                    └─ success ─▶ PREFUNDING ── fail ──▶ FAILED_PREFUND
+                                                      └─ done ─▶ COMPLETED
+```
+
+A webhook is emitted to PVCB (via the gateway) on entry to every terminal state and on
+`AWAITING_CHALLENGE` (carrying the redirect URL). State is persisted so the async 3DS
+callback can resume the exact transaction; see [Idempotency & resumption](#idempotency-error-handling--resumption).
+
+## Component 1 — Fraud screening (Cybersource Decision Manager)
+
+Standalone Decision Manager screening (no authorization) via the Cybersource Risk API.
+
+- **Endpoint:** `POST /risk/v1/decisions`
+- **Decisions returned:** `ACCEPT`, `REJECT`, `REVIEW` (mapped to `PASS` / `FAIL` / `HOLD`).
+- **Score:** `riskInformation.score.result` (0–99) plus triggered `riskInformation.rules`
+  and `infoCodes`; the active DM **profile** decides the outcome — keep rule logic in the
+  Cybersource profile, not in this service.
+- **Device fingerprint:** the PVCB client must load the DM device-fingerprint script (org
+  id + session id) when the top-up screen opens; pass that id as
+  `deviceInformation.fingerprintSessionId`. Collect it up front so it doesn't add latency.
+
+Request (abbreviated):
+
+```json
+{
+  "clientReferenceInformation": { "code": "topup-<txnId>" },
+  "paymentInformation": { "tokenInformation": { "transientTokenJwt": "<flex-token>" } },
+  "orderInformation": {
+    "amountDetails": { "currency": "USD", "totalAmount": "100.00" },
+    "billTo": { "firstName": "...", "lastName": "...", "country": "US", "email": "...", "address1": "...", "locality": "...", "postalCode": "..." }
+  },
+  "deviceInformation": { "fingerprintSessionId": "<dmSessionId>", "ipAddress": "...", "userAgentBrowserValue": "..." },
+  "buyerInformation": { "merchantCustomerId": "<userId>" }
+}
+```
+
+Response (abbreviated):
+
+```json
+{
+  "id": "6543210...",
+  "status": "ACCEPT",
+  "riskInformation": {
+    "score": { "result": "38", "factorCodes": ["..."], "modelUsed": "default" },
+    "rules": [ { "name": "high-velocity", "decision": "MONITOR" } ],
+    "profile": { "name": "topup-default", "selectorRule": "..." }
+  }
+}
+```
+
+Handling:
+
+- `ACCEPT` → `PASS`.
+- `REJECT` → `FAIL` (code `FRAUD_REJECTED`) → `REJECTED_FRAUD` → reject webhook to PVCB.
+- `REVIEW` → `HOLD` per `onReview`: **HOLD** queues to ops (`IN_REVIEW`, no funds move),
+  **REJECT** treats it as a decline, **ACCEPT** lets it proceed (use with care for money
+  movement). Default **HOLD**.
+- **Feedback loop:** report confirmed outcomes back to DM via `POST /risk/v1/decisions/{id}/marking`
+  (suspect / fraud / creditback) so the models learn. Wire this from chargeback/recon.
+- **Disabled:** when `fraudScreening.enabled = false`, none of the above runs.
+
+## Component 2 — Payer authentication (Cybersource Payer Authentication, 3DS 2.x)
+
+3-D Secure 2.x via the Cybersource Risk API, in three calls plus an async client step.
+
+### Step A — Setup (device data collection)
+
+- **Endpoint:** `POST /risk/v1/authentication-setups`
+- Returns `consumerAuthenticationInformation.accessToken` (JWT), `deviceDataCollectionUrl`,
+  and `referenceId`. The PVCB client runs the 3DS Method (hidden iframe) against the DDC
+  URL with the JWT. Like the DM fingerprint, **kick this off when the screen loads** so it
+  overlaps with fraud screening.
+
+```json
+// request
+{ "clientReferenceInformation": { "code": "topup-<txnId>" },
+  "paymentInformation": { "tokenInformation": { "transientTokenJwt": "<flex-token>" } } }
+// response
+{ "consumerAuthenticationInformation": {
+    "accessToken": "<jwt>",
+    "deviceDataCollectionUrl": "https://centinelapi.cardinalcommerce.com/V1/Cruise/Collect",
+    "referenceId": "<refId>" },
+  "status": "COMPLETED" }
+```
+
+### Step B — Enrollment check
+
+- **Endpoint:** `POST /risk/v1/authentications`
+- Pass the setup `referenceId`, the order amount, and the `returnUrl` (the gateway's public
+  3DS callback). The response branches:
+
+```json
+// request
+{ "clientReferenceInformation": { "code": "topup-<txnId>" },
+  "orderInformation": { "amountDetails": { "currency": "USD", "totalAmount": "100.00" } },
+  "paymentInformation": { "tokenInformation": { "transientTokenJwt": "<flex-token>" } },
+  "consumerAuthenticationInformation": {
+    "referenceId": "<refId>",
+    "returnUrl": "https://gw.tc.example/v1/public/3ds/callback",
+    "challengeCode": "04" } }
+```
+
+| Response `status` | Meaning | Component result |
+| --- | --- | --- |
+| `AUTHENTICATION_SUCCESSFUL` | frictionless — no challenge; `cavv`/`eci`/`xid` returned | `PASS` (skip step-up) |
+| `PENDING_AUTHENTICATION` | challenge required; `stepUpUrl` + step-up JWT + `authenticationTransactionId` returned | `CHALLENGE` |
+| `AUTHENTICATION_FAILED` / `_REJECTED` | not authenticated | `FAIL` (`THREEDS_FAILED`) |
+
+For a challenge, `tc-cardload-service` composes the **redirect URL** (the `stepUpUrl` +
+the JWT, typically wrapped in a small tc-hosted page) and returns it as the
+`CHALLENGE.redirectUrl`. The orchestrator emits the `AWAITING_CHALLENGE` webhook so PVCB
+can render it for the tourist.
+
+### Step C — Resume on client callback, then validate
+
+When the tourist finishes the issuer challenge, the ACS posts back and the client hits the
+gateway's **single public endpoint**, which forwards "3DS challenge completed" here. The
+callback is a **trigger only** — this service fetches the authoritative result:
+
+- **Endpoint:** `POST /risk/v1/authentication-results`
+- Request carries `consumerAuthenticationInformation.authenticationTransactionId`.
+
+```json
+// response
+{ "status": "AUTHENTICATION_SUCCESSFUL",
+  "consumerAuthenticationInformation": {
+    "cavv": "...", "eci": "05", "xid": "...", "paresStatus": "Y",
+    "directoryServerTransactionId": "...", "specificationVersion": "2.2.0" } }
+```
+
+- `AUTHENTICATION_SUCCESSFUL` with an acceptable `eci` (per `minEci`) → `PASS`. Carry
+  `cavv` / `eci` / `xid` / `directoryServerTransactionId` / `specificationVersion` forward —
+  `tc-card-network-service` puts them in the **AFT authorization** for SCA/liability.
+- Anything else → `FAIL` (`THREEDS_FAILED`) → `REJECTED_3DS`.
+
+> **Never trust the client's "3DS completed."** The state advances only on the
+> `authentication-results` response, exactly as the diagram's "Query 3DS result" step
+> shows. The gateway's one-time callback token only authorizes *triggering* the query.
+
+## Orchestration scenarios
+
+The same pipeline produces two flows depending on the DM toggle:
+
+**Decision Manager ON** (default):
+
+```
+eligibility → DM /risk/v1/decisions → ACCEPT
+            → 3DS setup → 3DS enroll → (frictionless | challenge→callback→validate)
+            → AFT pull → prefunding → COMPLETED
+```
+
+**Decision Manager OFF** (`fraudScreening.enabled = false`):
+
+```
+eligibility → 3DS setup → 3DS enroll → (frictionless | challenge→callback→validate)
+            → AFT pull → prefunding → COMPLETED
+```
+
+No other component, contract, or webhook changes — only the fraud step is absent.
+
+## Service API
+
+### Inbound (called by `tc-api-gateway`)
+
+| Method & path | Purpose | Notes |
+| --- | --- | --- |
+| `POST /v1/topups` | Start a top-up; runs eligibility → enabled components | Requires `Idempotency-Key` (passed through from the gateway) |
+| `POST /v1/topups/{id}/3ds-complete` | Resume after client 3DS challenge | Target of the gateway's public callback forward |
+| `GET /v1/topups/{id}` | Status query | Read-only |
+
+### Outbound webhooks (to PVCB via gateway egress)
+
+Emitted on each terminal state and on `AWAITING_CHALLENGE`. Bodies are signed by the
+gateway's egress (tc private key) and carry the `Idempotency-Key` / a `Delivery-Id`:
+
+| Event | When |
+| --- | --- |
+| `topup.rejected` | ineligible / fraud reject / 3DS fail (with reason code) |
+| `topup.challenge_required` | challenge needed — includes the 3DS `redirectUrl` |
+| `topup.in_review` | DM `REVIEW` with `onReview: HOLD` |
+| `topup.failed` | AFT pull or prefunding failed |
+| `topup.succeeded` | AFT approved (and prefunding completed) |
+
+## Card data handling & PCI
+
+Keep the raw PAN out of `tc-*` systems:
+
+- The PVCB client captures the card with **Cybersource Flex Microform v2**, producing a
+  **transient token (JWT)**. `tc-cardload-service` passes that token to every Cybersource
+  call via `paymentInformation.tokenInformation.transientTokenJwt` — it never sees the PAN.
+- For repeat use, exchange the transient token for a **Token Management Service (TMS)**
+  instrument identifier; pass that to AFT.
+- Only a **card fingerprint** (not the PAN) is shared with the gateway's amount/velocity
+  limits, consistent with the gateway spec.
+- Never log PAN/CVV/track data; mask everything. The service stays in scope but with
+  minimized cardholder-data footprint.
+
+## Cybersource connectivity
+
+| Concern | Detail |
+| --- | --- |
+| Base host | `apitest.cybersource.com` (sandbox) / `api.cybersource.com` (production) |
+| Auth | REST **HTTP Signature** (merchant id + key id + shared secret) or **JWT/P12 cert**; store secrets in KMS/Vault |
+| Correlation | set `clientReferenceInformation.code = topup-<txnId>` on every call |
+| Idempotency | dedupe on our side keyed by `txnId`/`Idempotency-Key`; do not blindly retry payer-auth/decision calls that may have side effects |
+| Timeouts/retries | bounded timeouts; retry only idempotent GET-style reads; on persistent error apply the component's `failClosed` rule |
+| Environments | DM profile, Payer Auth config, and org/device-fingerprint ids differ per environment — keep them in config |
+
+### Verified Cybersource endpoints
+
+Confirmed against Cybersource's REST API reference and official REST SDK (checked June
+2026). The operation names in parentheses are the SDK method names.
+
+| Component | Operation | Method & path |
+| --- | --- | --- |
+| Payer auth | Setup / device data collection (`payerAuthSetup`) | `POST /risk/v1/authentication-setups` |
+| Payer auth | Check enrollment (`checkPayerAuthEnrollment`) | `POST /risk/v1/authentications` |
+| Payer auth | Validate results (`validateAuthenticationResults`) | `POST /risk/v1/authentication-results` |
+| Decision Manager | Create decision / screen order (`createBundledDecisionManagerCase`) | `POST /risk/v1/decisions` |
+| Decision Manager | Mark transaction — fraud feedback (`fraudUpdate`) | `POST /risk/v1/decisions/{id}/marking` |
+| Decision Manager | Action a review case (`actionDecisionManagerCase`) | `POST /risk/v1/decisions/{id}/actions` |
+| Decision Manager | Comment on a case (`commentDecisionManagerCase`) | `POST /risk/v1/decisions/{id}/comments` |
+| Decision Manager | Add a list entry (`addNegative`) | `POST /risk/v1/lists/{type}/entries` |
+
+> The standalone fraud screen in [Component 1](#component-1--fraud-screening-cybersource-decision-manager)
+> is the **create-decision** call (`POST /risk/v1/decisions`); the SDK names it
+> `createBundledDecisionManagerCase`. Both components live under the same `/risk/v1/*`
+> Risk service.
+
+Public documentation:
+
+- [Cybersource REST API reference (interactive console)](https://developer.cybersource.com/api-reference-assets/index.html)
+- [Payer Authentication developer guide (REST)](https://developer.cybersource.com/docs/cybs/en-us/payer-authentication/developer/all/rest/payer-auth/pa-about-guide.html)
+- [Decision Manager developer guide](https://developer.cybersource.com/library/documentation/dev_guides/Decision_Manager_DG/html/index.html)
+- Endpoint paths (official REST SDK): [PayerAuthenticationApi](https://github.com/CyberSource/cybersource-rest-client-php/blob/master/docs/Api/PayerAuthenticationApi.md) · [DecisionManagerApi](https://github.com/CyberSource/cybersource-rest-client-php/blob/master/docs/Api/DecisionManagerApi.md)
+
+## Idempotency, error handling & resumption
+
+- Every transaction is **persisted** with its state, the Cybersource ids (`decisionId`,
+  `referenceId`, `authenticationTransactionId`), and the `Idempotency-Key`. The async 3DS
+  callback resumes by `txnId` → exactly-once advancement.
+- Re-delivery of the same `POST /v1/topups` (same `Idempotency-Key`) returns the current
+  state, never a second top-up.
+- **Fail closed on money movement:** if an enabled component's Cybersource call cannot be
+  completed, the transaction is rejected — never advanced unscreened/unauthenticated.
+- A late or duplicate 3DS callback for an already-resolved transaction is a no-op that
+  returns the current state.
+
+## Observability
+
+- Correlate on `txnId` end-to-end (propagate the gateway's `correlation-id`).
+- Metrics: fraud `ACCEPT/REJECT/REVIEW` rates and score distribution, 3DS
+  frictionless-vs-challenge ratio, challenge abandonment, AFT approval rate, and component
+  error / fail-closed counts.
+- Structured logs to SIEM with all card data masked; record Cybersource request ids for
+  support.
+- Alert on: fraud-reject spikes, 3DS failure spikes, Cybersource error-rate / latency, and
+  fail-closed counts.
+
+## Events
+
+Internal coordination is event-driven (see
+[Architecture](/docs/specifications/architecture)). The HTTP endpoints in
+[Service API](#service-api) are the **synchronous edge ingress + 3DS callback**; the AFT,
+prefunding, reversal, and partner-webhook interactions are **async events**. As the
+orchestrator, this service drives the saga and its compensation.
+
+| Direction | Event | Counterpart |
+| --- | --- | --- |
+| produces | `aft.requested` | card-network |
+| consumes | `aft.completed` / `aft.declined` | card-network |
+| produces | `prefunding.requested` | core-banking adapter |
+| consumes | `prefunding.completed` / `prefunding.failed` | core-banking adapter |
+| produces | `aft.reversal.requested` (compensation, on `prefunding.failed`) | card-network |
+| produces | `partner.notification.requested` (reject / challenge / success) | gateway webhook egress |
+
+The outbound webhooks in [Service API](#service-api) are emitted as
+`partner.notification.requested` events (at-least-once, DLQ) rather than direct calls.
+
+## Assumptions & open questions
+
+1. **REVIEW policy.** Default is `HOLD` (queue, no funds move). Confirm whether the business
+   wants auto-reject instead, and the ops SLA for clearing the review queue.
+2. **3DS mandatory?** Spec assumes payer authentication is always on for cross-border AFT
+   (SCA / liability). Confirm whether any low-value/low-risk corridor may skip it — if so,
+   it becomes a second toggle like DM.
+3. **Frictionless acceptance.** `allowFrictionless` lets a frictionless
+   `AUTHENTICATION_SUCCESSFUL` proceed with no step-up; confirm acceptable ECI set with
+   risk/Visa.
+4. **AFT eligibility source.** Modeled as a pre-gate via `tc-card-network-service` to Visa
+   Direct (card attributes / funds-transfer eligibility), not Cybersource.

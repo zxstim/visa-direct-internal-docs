@@ -1,0 +1,427 @@
+---
+title: tc-admin-service
+description: Internal admin portal — Spring Security authentication (session, password, TOTP, passkeys) with sign-up + super-admin approval and RBAC, full user-activity audit trail, configurable authorization limits, and operational dashboards (live auth, settlement reports).
+permission: admin
+---
+
+## Purpose & scope
+
+`tc-admin-service` is the **internal back-office portal** for operating the Visa Direct
+top-up platform. It is reached only through the gateway's locked-down admin route (see the
+gateway's [admin pass-through](/docs/specifications/tc-api-gateway)): the gateway provides
+the network perimeter (internal listener, IP allowlist, transport), and **this service owns
+the user identity, sessions, MFA, and role-based access**.
+
+It does four things:
+
+1. **Authentication & authorization** with **Spring Security** — server-side session
+   tokens, email + password, **TOTP**, and **passkeys**; sign-up with super-admin approval;
+   strict session refresh; tags and role-based permissions.
+2. **Activity audit trail** — records every user action, including front-end navigation and
+   button clicks, as an immutable audit trail.
+3. **System configuration** — manage configurable system limits/parameters; **authorization
+   limits only for now**, designed to extend later.
+4. **Operational views** — live authorizations, settlement reports, exposure, breaks.
+
+> **Stack:** JDK 25, Spring Boot 4.0+ (Maven) / **Spring Security 7** (native passkeys +
+> multi-factor authorization), Spring Data JPA on MySQL 8.4 LTS, Redis-backed Spring Session, and
+> messaging via Spring Cloud Stream (broker-abstracted) for events. See
+> [Architecture & service interaction](/docs/specifications/architecture).
+
+## Position in the system
+
+```
+admin user ──▶ tc-api-gateway (admin route: internal listener + IP allowlist + mTLS)
+                     │  forward-only
+                     ▼
+              tc-admin-service  ── Spring Security (session, password, TOTP, passkey, RBAC)
+                     │  read-only aggregation
+   live auth ◀───────┼───────── tc-card-network-service
+   settlement ◀──────┼───────── tc-settlement-reconciliation-service
+   exposure ◀────────┼───────── tc-ledger-service
+   limits ───────────┴────────▶ propagated to gateway / card-network / ledger
+```
+
+The gateway handles perimeter security; do **not** rely on it for user identity — that is
+this service's job.
+
+---
+
+## 1. Authentication & authorization (Spring Security)
+
+### Factors & login flow
+
+| Factor | Mechanism | Notes |
+| --- | --- | --- |
+| Knowledge | email + password | `DaoAuthenticationProvider`, Argon2/BCrypt hashing |
+| Possession (TOTP) | authenticator-app 6-digit code | second factor after password |
+| Possession (passkey) | WebAuthn / FIDO2 | native Spring Security `webAuthn()`; can be sole factor or second factor |
+| Session | server-side session token (cookie) | Redis-backed, revocable, strict refresh |
+
+Login flow: **password → (TOTP if enrolled) → full session**, or **passkey → full
+session**. Every admin **must** enrol at least one strong factor (TOTP or passkey);
+password-only sessions are not granted operational authorities.
+
+### Dependencies
+
+```xml
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-security</artifactId></dependency>
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-jpa</artifactId></dependency>
+<dependency><groupId>org.springframework.session</groupId><artifactId>spring-session-data-redis</artifactId></dependency>
+<!-- Passkeys: native Spring Security WebAuthn (pulls in webauthn4j). Confirm exact artifact for your SS version. -->
+<dependency><groupId>org.springframework.security</groupId><artifactId>spring-security-webauthn</artifactId></dependency>
+<!-- TOTP code generation/validation -->
+<dependency><groupId>dev.samstevens.totp</groupId><artifactId>totp</artifactId><version>1.7.1</version></dependency>
+```
+
+### Session token & strict refresh policy
+
+Use **server-side sessions** (not JWT) so they are revocable. Spring Session in Redis
+stores them centrally; the browser holds only an opaque `JSESSIONID`-style cookie.
+
+```yaml
+# application.yml
+server:
+  servlet:
+    session:
+      timeout: 15m                 # idle timeout
+      cookie:
+        name: TC_ADMIN_SESSION
+        http-only: true
+        secure: true
+        same-site: strict
+spring:
+  session:
+    store-type: redis
+    timeout: 15m
+    redis:
+      namespace: tc:admin:session
+```
+
+"Strict refresh policy" = the following controls (all configurable):
+
+| Control | Setting | How |
+| --- | --- | --- |
+| Idle timeout | 15 min | session expires after inactivity |
+| Absolute lifetime | 8 h | re-login required regardless of activity (custom filter on session `creationTime`) |
+| Session-id rotation | on login & on factor step-up | `sessionFixation().changeSessionId()` |
+| Concurrency | 1 active session per user | `maximumSessions(1)` |
+| Global revocation | on password/role/approval change | delete the user's sessions via `FindByIndexNameSessionRepository` |
+| Step-up re-auth | < 5 min for sensitive ops | require recent authentication for limit changes / approvals |
+| Logout | invalidate + clear cookie | `logout()` |
+
+```java
+// absolute-lifetime filter (sketch)
+public class AbsoluteSessionTimeoutFilter extends OncePerRequestFilter {
+  static final long MAX_AGE_MS = Duration.ofHours(8).toMillis();
+  protected void doFilterInternal(HttpServletRequest req, HttpServletResponse res, FilterChain chain) {
+    HttpSession s = req.getSession(false);
+    if (s != null && System.currentTimeMillis() - s.getCreationTime() > MAX_AGE_MS) {
+      s.invalidate(); res.sendError(401, "session expired"); return;
+    }
+    chain.doFilter(req, res);
+  }
+}
+```
+
+### Email + password
+
+```java
+@Bean PasswordEncoder passwordEncoder() {
+  return PasswordEncoderFactories.createDelegatingPasswordEncoder(); // {argon2}/{bcrypt}
+}
+
+@Service class AdminUserDetailsService implements UserDetailsService {
+  public UserDetails loadUserByUsername(String email) {
+    AdminUser u = users.findByEmail(email).orElseThrow(() -> new UsernameNotFoundException(email));
+    return User.withUsername(u.getEmail())
+        .password(u.getPasswordHash())
+        .disabled(u.getStatus() != ACTIVE)          // PENDING_APPROVAL → disabled → DisabledException
+        .authorities(authorityResolver.resolve(u))  // permissions from roles (below)
+        .build();
+  }
+}
+```
+
+### TOTP (second factor)
+
+Use **Spring Security 7's native multi-factor authorization**: factors are modelled as
+`GrantedAuthority`s, and endpoints require more than one. Enable globally with
+`@EnableMultiFactorAuthentication` or per-endpoint/method via `AuthorizationManagerFactory`.
+The principal is **not** granted operational authorities until the required factors are
+satisfied — no custom "pre-auth role" plumbing.
+
+SS7 ships native factors for **password** (`FACTOR_PASSWORD`), **X.509**, **one-time token
+(OTT)**, and **WebAuthn/passkeys** (`WEBAUTHN_AUTHORITY`), but **not TOTP** — so add TOTP as
+a custom factor:
+
+- Enrolment: generate a secret, return an `otpauth://` URI + QR; store the secret
+  **encrypted** (KMS/Vault-wrapped). Validate codes with a library (e.g.
+  `dev.samstevens.totp`, `CodeVerifier`).
+- On a valid code, grant a `FACTOR_TOTP` authority (so the MFA rules are satisfied) and
+  rotate the session id. Passkeys and OTT are native factors and need no library.
+
+> **Step-up re-auth** (require a recent factor before sensitive endpoints) is also native in
+> SS7 — use it for limit changes and account approvals. See the
+> [MFA in Spring Security 7](https://spring.io/blog/2025/10/21/multi-factor-authentication-in-spring-security-7/) blog.
+
+### Passkeys (WebAuthn)
+
+Native in Spring Security (6.4+ and 7) via the `webAuthn()` DSL. It exposes registration at
+`/webauthn/register` and passkey login; persist credentials in JDBC. In SS7 a successful
+passkey login grants `WEBAUTHN_AUTHORITY`, satisfying the MFA rules above.
+
+```java
+http.webAuthn(w -> w
+    .rpName("TC Admin")
+    .rpId("admin.tc.example")               // must match the domain
+    .allowedOrigins("https://admin.tc.example"));
+
+// JDBC persistence beans
+@Bean PublicKeyCredentialUserEntityRepository userEntities(JdbcOperations ops) {
+  return new JdbcPublicKeyCredentialUserEntityRepository(ops);
+}
+@Bean UserCredentialRepository userCredentials(JdbcOperations ops) {
+  return new JdbcUserCredentialRepository(ops);
+}
+```
+
+### Sign-up + super-admin approval (no email verification)
+
+- Public `POST /api/signup` (email, password, requested role/tags). Creates an
+  `AdminUser` with status **`PENDING_APPROVAL`**. **No email verification.**
+- A pending user **cannot log in** (`UserDetails.disabled` → `DisabledException`).
+- **Exactly one `SUPER_ADMIN`** reviews pending accounts and approves them (status →
+  `ACTIVE`), assigning roles and tags. Approval requires `hasRole('SUPER_ADMIN')` + step-up
+  re-auth and is audited.
+- The super-admin account is **bootstrapped via migration/seed** (cannot be self-created
+  via sign-up), must have MFA enrolled, and is protected from deletion/demotion.
+
+Account states: `PENDING_APPROVAL → ACTIVE → SUSPENDED → DISABLED` (super admin transitions
+only).
+
+### RBAC, permissions & tags
+
+- **Permissions** are fine-grained authorities, e.g. `LIMITS_READ`, `LIMITS_WRITE`,
+  `ACCOUNTS_APPROVE`, `AUTH_LIVE_READ`, `SETTLEMENT_READ`, `AUDIT_READ`.
+- **Roles** group permissions, e.g. `SUPER_ADMIN` (all), `OPS` (live auth + settlement +
+  approve breaks), `FINANCE` (settlement + exposure), `AUDITOR` (audit + read-only),
+  `READ_ONLY`.
+- **Tags** are labels on users (and resources) for organization **and access scoping** —
+  e.g. a user tagged `corridor:VN` only sees VN transactions; `env:prod` gates prod data.
+  Tags layer attribute-based scoping on top of RBAC.
+
+```java
+@EnableMethodSecurity
+class MethodSecurityConfig {}
+
+@PreAuthorize("hasAuthority('LIMITS_WRITE')")
+public void updateAuthorizationLimit(...) { ... }
+
+// tag-scoped read
+@PostFilter("@scope.visibleToCaller(filterObject, authentication)")  // checks resource tags vs user tags
+public List<Authorization> liveAuthorizations(...) { ... }
+```
+
+### Putting it together — `SecurityFilterChain`
+
+```java
+@Bean
+SecurityFilterChain security(HttpSecurity http) throws Exception {
+  http
+    .authorizeHttpRequests(a -> a
+      .requestMatchers("/api/signup", "/api/auth/login", "/webauthn/**", "/login").permitAll()
+      .requestMatchers("/api/auth/mfa/verify").hasAuthority("FACTOR_PASSWORD") // password done, awaiting 2nd factor
+      .requestMatchers("/api/admin/**").hasRole("SUPER_ADMIN")
+      .anyRequest().authenticated())
+    .formLogin(Customizer.withDefaults())
+    .webAuthn(w -> w.rpName("TC Admin").rpId("admin.tc.example")
+                    .allowedOrigins("https://admin.tc.example"))
+    .sessionManagement(s -> s
+      .sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED)
+      .sessionFixation(f -> f.changeSessionId())
+      .maximumSessions(1).maxSessionsPreventsLogin(false))
+    .csrf(Customizer.withDefaults())                 // keep CSRF on for cookie sessions
+    .headers(h -> h.httpStrictTransportSecurity(Customizer.withDefaults()))
+    .addFilterBefore(new AbsoluteSessionTimeoutFilter(), AuthorizationFilter.class)
+    .logout(l -> l.deleteCookies("TC_ADMIN_SESSION").invalidateHttpSession(true));
+  return http.build();
+}
+```
+
+> **CSRF:** because sessions are cookie-based, keep CSRF protection enabled. For the SPA,
+> use `CookieCsrfTokenRepository` and send the token back on mutating requests.
+
+---
+
+## 2. Activity tracking & audit trail
+
+Capture **everything every user does**, both server actions and front-end interactions, as
+one immutable trail.
+
+### What is captured
+
+| Layer | Events | How |
+| --- | --- | --- |
+| Security | login, logout, MFA verify, passkey use, failed attempts, lockouts | Spring Security `AuthenticationSuccess/FailureEvent` listeners |
+| Server actions | every mutating call: limit change, account approval, break resolution (with before/after) | AOP aspect on service methods + JPA auditing |
+| Front-end | **screen/route navigation, button clicks**, form submits, views | SPA emits events → `POST /api/activity` (batched) |
+
+Activity event schema:
+
+```json
+{
+  "actorId": "<userId>",
+  "sessionId": "<server session id>",
+  "type": "NAVIGATE | CLICK | SUBMIT | VIEW | ACTION | AUTH",
+  "screen": "/settlement/breaks",          // route for NAVIGATE
+  "element": "approve-break-button",        // stable element id for CLICK (not its content)
+  "target": "break:12345",                  // affected resource for ACTION
+  "before": { }, "after": { },              // for mutating ACTIONs
+  "ip": "10.20.x.x",
+  "correlationId": "<from gateway>",
+  "ts": "2026-06-09T10:00:00Z"
+}
+```
+
+### Storage & integrity
+
+- **Append-only**, tamper-evident: each record stores a hash of `(prevHash + record)` to
+  form a hash chain, so deletion/alteration is detectable. Back with WORM-style storage and
+  ship to SIEM.
+- **Privacy:** capture element **identity, not content**; never capture PAN/CVV/secrets or
+  full form values. Mask sensitive fields.
+- **Access:** the audit trail is readable only with `AUDIT_READ` (auditors / super admin);
+  it is itself audited.
+- **Retention:** per data-retention policy; exportable for investigations.
+
+---
+
+## 3. System configuration (authorization limits)
+
+A **versioned, typed parameter store** managed in the admin UI. Only the **authorization
+limits** are in scope now; the store is generic so more parameter groups are added later.
+
+### Authorization limits managed here
+
+These are the limits enforced across the platform — they map to the gateway,
+`tc-card-network-service`, and `tc-ledger-service`:
+
+| Parameter | Consumer(s) |
+| --- | --- |
+| per-transaction max (per currency) | gateway, card-network |
+| currency allowlist | gateway, card-network |
+| BAI / MCC allowlist | card-network |
+| per-card daily sum & velocity | gateway, card-network |
+| per-BIN daily ceiling | card-network |
+| global daily ceiling (circuit breaker) | gateway, card-network |
+| prefunding exposure ceiling | ledger |
+
+### How changes work
+
+- Generic model: `parameter(key, scope, type, value, version, effectiveFrom, updatedBy)` —
+  full history retained; nothing overwritten.
+- **Maker-checker (4-eyes):** one admin proposes a limit change, a second (with
+  `LIMITS_WRITE`) approves it. Both steps require step-up re-auth and are audited with
+  before/after.
+- **Propagation:** consuming services read limits from a config API (pull with cache + TTL)
+  or subscribe to a published change event. A change is only "live" once all enforcement
+  layers have it; show propagation status in the UI.
+- **Validation & guardrails:** sane bounds (e.g. per-txn ≤ per-card-daily ≤ ceiling),
+  currency must be ISO 4217, no destructive change without confirmation.
+
+> Limits are financial controls — treat every change as a privileged, audited, reversible
+> action. Keep the previous version so a bad change can be rolled back instantly.
+
+---
+
+## 4. Operational dashboards
+
+The admin service **aggregates read-only** from the systems of record; it does not own this
+data.
+
+| View | Source | Content |
+| --- | --- | --- |
+| **Live authorizations** | `tc-card-network-service` (read API / event stream) | recent AFTs: status, amount, `actionCode`/decline reasons, velocity, reversals |
+| **Settlement reports** | `tc-settlement-reconciliation-service` | reconciliation summary, breaks by outcome, aging, unsettled receivables |
+| **Exposure** | `tc-ledger-service` | prefunding exposure vs ceiling, balances, trial-balance health |
+| **Fraud / 3DS** (optional) | `tc-cardload-service` | DM accept/reject/review, 3DS frictionless-vs-challenge |
+
+- All views are **permission- and tag-scoped** (`AUTH_LIVE_READ`, `SETTLEMENT_READ`, …).
+- Dashboards cache with short TTLs; never mutate source systems.
+
+---
+
+## Service API (surface)
+
+| Area | Endpoints |
+| --- | --- |
+| Auth | `POST /api/auth/login`, `POST /api/auth/mfa/verify`, `POST /api/auth/logout`, `/webauthn/**`, `POST /api/auth/totp/enrol` |
+| Sign-up / approval | `POST /api/signup`, `GET /api/admin/pending`, `POST /api/admin/users/{id}/approve`, `/suspend`, `/roles`, `/tags` |
+| Activity | `POST /api/activity` (ingest), `GET /api/audit` (`AUDIT_READ`) |
+| Limits | `GET /api/limits`, `POST /api/limits/proposals`, `POST /api/limits/proposals/{id}/approve` |
+| Dashboards | `GET /api/ops/authorizations`, `GET /api/ops/settlement`, `GET /api/ops/exposure` |
+
+## Data model
+
+- `admin_users` — email, passwordHash, status, createdAt.
+- `roles`, `permissions`, `role_permissions`, `user_roles`.
+- `tags`, `user_tags` (+ resource tags for scoping).
+- `totp_secrets` (encrypted), WebAuthn tables (`PublicKeyCredentialUserEntity`,
+  `UserCredential`).
+- `parameters` (+ `parameter_versions`, `parameter_proposals` for maker-checker).
+- `activity_log` (append-only, hash-chained).
+- Spring Session tables/keys in Redis.
+
+## Security hardening
+
+- CSRF on (cookie sessions); CORS restricted to the admin SPA origin; security headers
+  (HSTS, frame-deny, CSP).
+- Brute-force: account lockout after N failed attempts + backoff; also rate-limit at the
+  gateway.
+- Secrets (TOTP keys, DB, Redis) in KMS/Vault; passwords Argon2/BCrypt.
+- All privileged actions require step-up re-auth and are audited.
+
+## Observability
+
+- Metrics: logins/failures by factor, lockouts, active sessions, limit changes, audit
+  ingest rate, dashboard query latency.
+- Alert on: failed-login spikes, super-admin actions, limit changes, audit hash-chain
+  verification failure.
+
+## Events
+
+Dashboards are **CQRS read models** built from events; limit changes are **published** as
+events (see [Architecture](/docs/specifications/architecture)). Consumers are idempotent on
+`eventId`.
+
+| Direction | Event | Counterpart |
+| --- | --- | --- |
+| consumes | `aft.completed` / `aft.declined` / `aft.reversed` / `aft.adjusted` / `aft.refunded` | card-network (live-auth view) |
+| consumes | `prefunding.completed` / `prefunding.failed` | core-banking adapter |
+| consumes | `settlement.matched` / `settlement.break` | reconciliation (settlement + breaks views) |
+| consumes | `prefunding.exposure.updated` | ledger (exposure view) |
+| produces | `limits.updated` | card-network, ledger (+ Kong via decK relay) |
+
+> The dashboard data sources in [section 4](#4-operational-dashboards) are populated by
+> these event consumers, not by live queries against the owning services.
+
+## Assumptions & open questions
+
+1. **Single super admin.** Modeled as exactly one bootstrapped `SUPER_ADMIN` who approves
+   accounts; confirm whether a break-glass second super admin is needed for continuity.
+2. **Spring version.** Baseline **Spring Boot 4.0+ / Spring Security 7** (native passkeys +
+   multi-factor authorization). TOTP is added as a custom factor (no native TOTP in SS7);
+   plan the ~yearly Spring upgrade per the [version policy](/docs/specifications/architecture).
+3. **Front-end telemetry granularity.** "Every click/navigation" can be high-volume —
+   confirm sampling/retention and that no field content is captured.
+4. **Limit propagation transport.** Pull-with-cache vs published events to the enforcement
+   services — pick per the platform's eventing choice.
+
+## References
+
+- [Spring Security — Passkeys](https://docs.spring.io/spring-security/reference/servlet/authentication/passkeys.html)
+- [Spring Security — Session Management](https://docs.spring.io/spring-security/reference/servlet/authentication/session-management.html)
+- [Spring Session](https://docs.spring.io/spring-session/reference/)
+- [Multi-Factor Authentication in Spring Security 7](https://spring.io/blog/2025/10/21/multi-factor-authentication-in-spring-security-7/)

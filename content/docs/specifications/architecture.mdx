@@ -1,0 +1,220 @@
+---
+title: Architecture & service interaction
+description: Platform architecture — Java/Spring Boot microservices communicating asynchronously via Spring Cloud Stream (broker-abstracted — Kafka/RabbitMQ or any cloud), synchronous HTTP only at the edge and to external providers. Tech stack, sync-vs-async methodology, event catalog, the top-up saga, and the messaging patterns every service must follow.
+permission: admin
+---
+
+## Technical stack
+
+The platform is built as **independently deployable microservices**, each owning its own
+datastore and publishing/consuming events. This page is the contract every `tc-*` service
+spec refers to.
+
+| Concern | Choice |
+| --- | --- |
+| Language / framework | **JDK 25 LTS, Spring Boot 4.0+** (Spring Security 7, Spring Data JPA) |
+| Service model | microservices — one bounded context per service, private datastore, no shared DB |
+| Messaging | **Spring Cloud Stream** (functional model) — **broker is a deployment choice**: Kafka or RabbitMQ (portable, recommended), or a cloud-native binder (AWS SNS/Kinesis, Azure Service Bus/Event Hubs, GCP Pub/Sub). No broker-specific code. |
+| Edge | **Kong** API gateway (`tc-api-gateway`) — synchronous HTTP at the perimeter only |
+| External providers | Cybersource, Visa Direct, PVCB — synchronous HTTPS / SFTP |
+| Build & tooling | **Maven**, IntelliJ IDEA, MySQL Workbench, Flyway (migrations), Insomnia (HTTP APIs), Testcontainers / docker-compose (local broker: Kafka, Redpanda, or RabbitMQ) |
+| Datastore | per-service **MySQL 8.4 LTS** (InnoDB; `DECIMAL` for money; strict SQL mode); Redis for sessions/counters where noted |
+
+The services: `tc-api-gateway` (Kong edge), `tc-cardload-service` (orchestrator),
+`tc-card-network-service` (Visa Direct), `tc-ledger-service` (system of record),
+`tc-settlement-reconciliation-service`, `tc-admin-service`.
+
+> **Data ownership.** Each service owns its data. A service never reads another's database;
+> it learns about other contexts only through **events** and builds its own local read model
+> (CQRS). Cross-service consistency is **eventual**.
+
+> **Tooling note.** Insomnia covers the synchronous HTTP APIs and provider calls but **not**
+> the event flows — run the broker locally with **docker-compose** (Kafka/Redpanda or
+> RabbitMQ) and use **Testcontainers** (MySQL + the broker) for integration tests of the
+> event-driven paths.
+> **Version policy (production-ready, not EOL).** Use **JDK 25 LTS** — Spring Framework 7 /
+> Spring Boot 4 recommend **JDK 25+ for production** (and require 25+ for GraalVM native
+> images); you get compact object headers (~10–22% less heap) and the virtual-thread pinning
+> fix. JDK 21 LTS is still supported (Boot 4 retains a Java 17 baseline) but 25 is the aligned
+> choice; avoid JDK 17 for a new build. Use **Spring Boot 4.0+**
+> with **Spring Security 7** — Spring Boot 3.4 is already EOL (Dec 2025) and 3.5 OSS support
+> ends June 2026. Spring releases get ~13 months of OSS support, so **track the latest minor
+> and budget a yearly upgrade**; the final 4.x minor gets a 5-year enterprise extension.
+> Use **MySQL 8.4 LTS** (support to ~2032) — MySQL 8.0 reaches EOL April 2026, and the 9.x
+> "Innovation" releases are short-support (next LTS is 9.7).
+
+## When synchronous, when asynchronous
+
+| Interaction | Style | Why |
+| --- | --- | --- |
+| PVCB → Kong → `tc-cardload-service` (start a top-up) | **sync HTTP** (returns `202`, results via webhook) | the caller needs an immediate accept/reject |
+| `tc-cardload-service` → Cybersource (DM, Payer Auth) | **sync HTTPS** | request/response provider API |
+| `tc-card-network-service` → Visa Direct / PAAI | **sync HTTPS (mTLS)** | request/response provider API |
+| `tc-settlement-reconciliation-service` ← settlement file | **SFTP fetch** | batch file |
+| admin queries / dashboards on demand | **sync HTTP** | interactive reads |
+| **everything between `tc-*` services** | **async events (Spring Cloud Stream)** | decoupling, resilience, retries, fan-out |
+
+**Rule of thumb:** the edge and external-provider calls are synchronous; **all internal
+state propagation and the money-movement lifecycle are event-driven over the broker.** This keeps
+services decoupled and makes the long-running, multi-step top-up resilient to partial
+failure.
+
+## Messaging topology (broker-agnostic)
+
+Each event is a Spring Cloud Stream **destination** (a topic/exchange). Every consuming
+service binds its own **consumer group**, so one event fans out to all interested services
+while each gets independent delivery, retries, and a dead-letter destination.
+
+```
+producer ──(transactional outbox → relay)──▶ destination: aft.completed
+                                                  ├──▶ group: ledger         ──▶ tc-ledger-service
+                                                  ├──▶ group: reconciliation ──▶ tc-settlement-reconciliation-service
+                                                  ├──▶ group: cardload       ──▶ tc-cardload-service
+                                                  └──▶ group: admin          ──▶ tc-admin-service
+                                                          each group has its own dead-letter destination
+```
+
+- **Fan-out:** one destination → one **consumer group per service** (Kafka: one topic, many
+  groups; RabbitMQ: a topic exchange → one queue per group; the cloud brokers follow the same
+  shape).
+- **Ordering** for money events via a **partition / ordering key** = `transactionId` (or
+  `accountId` for ledger postings), so per-entity events are processed in order.
+- **De-duplication** is enforced by the **consumer** on `eventId` (see Idempotent consumers),
+  not relied upon from the broker — not every broker guarantees it.
+- **Dead-letter** destination per binding with a retry/backoff policy + an alarm on its depth.
+- Tune consumer concurrency and **max processing time**; set retention generously so money
+  events are never silently lost.
+
+### Broker is a deployment choice
+
+The application code (functional `Consumer`/`Supplier`/`Function` beans + `StreamBridge`) is
+**identical regardless of broker** — only the binder dependency and config change. This is
+what avoids cloud lock-in: a customer who is not on AWS swaps the binder, not the code.
+
+| Concern | Kafka (recommended) | RabbitMQ | AWS | Azure | GCP |
+| --- | --- | --- | --- | --- | --- |
+| Binder | `...-binder-kafka` | `...-binder-rabbit` | SNS / Kinesis | Service Bus / Event Hubs | Pub/Sub |
+| Fan-out | topic + consumer groups | topic exchange + queues | SNS→SQS | topics + subscriptions | topic + subscriptions |
+| Ordering | partition key | consistent-hash exchange | SQS FIFO group id | session id | ordering key |
+| Replay | retained log ✅ | needs an event store | limited | limited | limited |
+| Runs on | anywhere (self-host, MSK, Confluent, Redpanda) | anywhere (self-host, Amazon MQ, CloudAMQP) | AWS | Azure | GCP |
+
+**Recommended default: Apache Kafka** — its retained, ordered, replayable log is the best fit
+for the CQRS read-model rebuilds and reconciliation replay this platform relies on, and it
+runs on any cloud or on-prem. **RabbitMQ** is a lighter alternative when streaming/replay
+isn't needed. Either way the broker stays a deployment decision, not a code dependency.
+
+## Mandatory patterns
+
+1. **Transactional outbox.** A producer writes its state change **and** the event to an
+   `outbox` table in the **same DB transaction**; a relay (poller or CDC) publishes the
+   outbox rows to the broker. This removes the dual-write race ("DB committed but event lost").
+2. **Idempotent consumers.** Delivery is **at-least-once** — every consumer dedupes on `eventId`
+   (persist processed ids) so a redelivery is a no-op. This is what makes money movement
+   exactly-once *in effect*.
+3. **Saga with compensation.** The top-up spans several services; it is a saga (see below)
+   with **compensating actions** — e.g. if prefunding fails after the AFT, emit an AFT
+   reversal. `tc-cardload-service` is the **orchestrator**; downstream fan-out
+   (ledger / reconciliation / admin) is **choreography**.
+4. **CQRS read models.** `tc-admin-service` and `tc-settlement-reconciliation-service` build
+   local projections from events (for dashboards / matching) instead of querying owners.
+5. **Event envelope + versioning** (below).
+
+## Event envelope
+
+Every message uses one JSON envelope so consumers, tracing, and idempotency are uniform:
+
+```json
+{
+  "eventId": "<uuid>",            // idempotency key
+  "type": "aft.completed",
+  "version": 1,                    // schema version; evolve backward-compatibly
+  "occurredAt": "2026-06-09T10:00:00Z",
+  "correlationId": "<from gateway>",
+  "transactionId": "topup-<id>",  // partition / ordering key
+  "producer": "tc-card-network-service",
+  "payload": { }
+}
+```
+
+## Event catalog
+
+Ordered = per-entity ordering via partition key. Fan-out = one destination → multiple consumer groups.
+
+| Event | Producer | Consumers | Notes |
+| --- | --- | --- | --- |
+| `aft.requested` | cardload | card-network | ordered by transactionId |
+| `aft.completed` / `aft.declined` | card-network | cardload, ledger, reconciliation, admin | ordered, fan-out |
+| `aft.reversal.requested` | cardload | card-network | compensation |
+| `aft.reversed` | card-network | ledger, reconciliation, admin | ordered, fan-out |
+| `aft.adjusted` / `aft.refunded` | card-network | ledger, reconciliation, admin | fan-out |
+| `prefunding.requested` | cardload | core-banking adapter | |
+| `prefunding.completed` / `prefunding.failed` | core-banking adapter | cardload, ledger, reconciliation, admin | ordered, fan-out |
+| `settlement.matched` | reconciliation | ledger, admin | clears the receivable |
+| `settlement.break` | reconciliation | admin (ops) | exception |
+| `partner.notification.requested` | cardload | gateway webhook egress | drives the signed PVCB webhook |
+| `limits.updated` | admin | card-network, ledger (+ Kong via decK relay) | config propagation |
+
+## The top-up saga
+
+Happy path (events in **bold**):
+
+1. **Edge (sync):** PVCB → Kong → `tc-cardload-service` `POST /v1/topups`, returns `202`.
+2. cardload: eligibility (sync query to card-network/PAAI) → Decision Manager (sync) →
+   Payer Authentication (sync; challenge returned to PVCB as a webhook).
+3. On 3DS pass, cardload emits **`aft.requested`**.
+4. card-network calls Visa (sync) → emits **`aft.completed`** (or `aft.declined`).
+5. Fan-out: ledger books the receivable; reconciliation updates its read model; admin
+   updates dashboards; cardload emits **`partner.notification.requested`** (success) and
+   **`prefunding.requested`**.
+6. core-banking adapter funds the account → emits **`prefunding.completed`**; ledger books
+   the advance; cardload notifies PVCB of success.
+7. T+n: reconciliation matches the settlement file → **`settlement.matched`** → ledger
+   clears the receivable.
+
+Compensation: if **`prefunding.failed`** arrives, cardload emits **`aft.reversal.requested`**
+→ card-network reverses at Visa → **`aft.reversed`** → ledger books the reversal. No funds
+are left pulled from the cardholder.
+
+## Spring implementation
+
+```xml
+<dependency><groupId>org.springframework.cloud</groupId><artifactId>spring-cloud-stream</artifactId></dependency>
+<!-- pick ONE binder per deployment — the code below is unchanged either way -->
+<dependency><groupId>org.springframework.cloud</groupId><artifactId>spring-cloud-stream-binder-kafka</artifactId></dependency>
+<!-- or: spring-cloud-stream-binder-rabbit / a cloud-native binder (SNS, Service Bus, Pub/Sub) -->
+```
+
+```java
+// Consumer — idempotent; bound by config (spring.cloud.stream.bindings.onAftCompleted-in-0.*)
+@Bean
+public Consumer<EventEnvelope<AftCompleted>> onAftCompleted() {
+  return e -> {
+    if (!processed.firstSeen(e.eventId())) return; // idempotent: skip redelivery
+    ledger.bookReceivable(e.payload());            // own DB tx
+  };                                               // ack on return; throw → retry → dead-letter
+}
+
+// Producer — via transactional outbox
+@Transactional
+public void completeAft(Aft aft) {
+  aftRepo.save(aft);                               // state change
+  outbox.add(EventEnvelope.of("aft.completed", aft.txnId(), payload));  // same tx
+}                                                  // relay publishes outbox via StreamBridge later
+```
+
+- Consumers are functional `Consumer`/`Function` beans; producers use the outbox relay +
+  `StreamBridge` (or a `Supplier`). JSON via Jackson. Destinations, consumer groups, the
+  partition key, retries, and the dead-letter target are **configuration, not code** — and
+  swapping broker is a binder/config change only.
+- A handler that throws is retried per the binding's backoff policy, then lands in the
+  dead-letter destination — alarm on it. **Fail closed** for money movement: a consumer that
+  cannot safely process must not ack-and-drop.
+
+## Reliability & guarantees
+
+- **At-least-once** delivery + **idempotent consumers** ⇒ exactly-once *effect*.
+- **Ordering** per entity via the partition/ordering key (`transactionId` / `accountId`).
+- **No lost events** via the outbox; **no silent drops** via DLQ + alarms.
+- **Correlation:** the gateway's `correlationId` is carried in every envelope, so a top-up is
+  traceable end-to-end across services and queues (OpenTelemetry + structured logs).

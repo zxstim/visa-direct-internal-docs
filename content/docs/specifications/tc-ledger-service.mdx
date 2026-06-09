@@ -1,0 +1,253 @@
+---
+title: tc-ledger-service
+description: Double-entry system of record for the Visa Direct top-up flow — books AFT receivables, prefunding advances, settlement clearing, reversals/adjustments, and enforces prefunding liquidity exposure limits.
+permission: admin
+---
+
+## Purpose & scope
+
+`tc-ledger-service` is the **financial system of record**. It is an immutable,
+double-entry ledger that records every money movement in the top-up lifecycle so the
+business always knows, to the cent: what Visa owes us, what we have advanced to customers,
+what fees we earned, and what is still unsettled.
+
+In the sequence diagram its explicit input is the **prefunding outcome** — PVCB Core
+Banking forwards "details of the completed prefunding transaction" and "details of the
+failed prefunding transaction" to this service. But a ledger that only saw prefunding
+would not balance, so this service books the **whole money lifecycle**:
+
+1. The **AFT receivable** (funds pulled from the card → Visa owes us at settlement).
+2. The **prefunding advance** (we credit the tourist's VND account immediately, from our
+   own liquidity, because Visa settles T+n).
+3. **Settlement clearing** (Visa pays us T+n → the receivable clears, the pool is repaid).
+4. **Reversals / adjustments / refunds** (corrections must net correctly).
+
+It also enforces the **prefunding liquidity exposure limit** — the control behind the
+program's "advanced funding" prerequisite (the acquirer must hold enough liquidity for
+2–3 days of volume).
+
+> The ledger is **authoritative but not the matcher**. Matching the Visa settlement file
+> against ledger entries is done by `tc-settlement-reconciliation-service`, which instructs
+> this ledger to post clearing entries. See [Settlement interface](#settlement--reconciliation-interface).
+
+## Technical stack
+
+JDK 25, Spring Boot 4.0+ (Maven), Spring Data JPA on **MySQL 8.4 LTS (InnoDB)** with `DECIMAL`
+money columns and strict SQL mode; messaging via **Spring Cloud Stream** (broker-abstracted). The ledger is an **event consumer** — it books entries in response to events from
+card-network, the core-banking adapter, and reconciliation (see
+[Architecture & service interaction](/docs/specifications/architecture)). Posting is a single
+local DB transaction; consumers are **idempotent**.
+
+## Position in the flow
+
+```
+tc-card-network-service ──AFT approved / reversed / adjusted / refunded──▶ ┐
+PVCB Core Banking ──────prefunding completed / failed───────────────────▶ ├─ tc-ledger-service
+tc-settlement-reconciliation-service ──matched settlement lines──────────▶ ┘   (post balanced entries)
+                                                                               │
+                                                                  exposure / balances / trial balance
+                                                                               ▼
+                                                                 treasury & tc-admin-service views
+```
+
+## Core principles
+
+- **Double-entry & always balanced.** Every business event posts a journal entry whose
+  legs sum to **zero per currency**. A non-balancing entry is rejected, never stored.
+- **Immutable / append-only.** Entries are never edited or deleted. Corrections are made
+  with **reversing entries** that reference the original. Full audit trail.
+- **Idempotent / exactly-once.** Each business event posts once; replays are no-ops. Money
+  events must never be double-booked.
+- **Multi-currency.** Postings are per-currency (USD pulled, VND funded); FX is an explicit
+  linked pair of legs at a recorded rate.
+- **Derivable balances.** Account balances are reconstructable from the journal at any time;
+  materialized balances are an optimization, not the source of truth.
+- **Fail closed.** If an event cannot be posted atomically and balanced, it is rejected and
+  surfaced — never partially applied.
+
+## Account model (chart of accounts)
+
+Illustrative — finalize the exact chart with finance/treasury. Each account has a type and
+a normal side; assets/expenses are debit-normal, liabilities/revenue/equity credit-normal.
+
+| Account | Type | Meaning |
+| --- | --- | --- |
+| `visa_receivable` | Asset | Owed by Visa from approved AFTs, until settled (USD) |
+| `nostro_settlement` | Asset | Bank/nostro where the Visa settlement lands |
+| `prefunding_pool` | Asset | Our liquidity used to advance funds to customers |
+| `customer_funds_payable` | Liability | Obligation to make funds available to the customer |
+| `fx_clearing` | Clearing | Bridges the USD and VND legs of a conversion |
+| `fee_income` | Revenue | Service / FX-margin fees we earn |
+| `scheme_fees_expense` | Expense | Visa scheme fees |
+| `fx_gain_loss` | Revenue/Expense | Realized FX difference at settlement |
+| `suspense` | Clearing | In-flight / unmatched / exception holding |
+
+## Money lifecycle & postings
+
+Canonical legs per event (FX and fee legs simplified; finalize with finance). Dr = debit,
+Cr = credit.
+
+| Event | Postings |
+| --- | --- |
+| **AFT approved** (USD pulled) | Dr `visa_receivable` (USD) · Cr `customer_funds_payable` (USD) |
+| **FX conversion** (USD→VND) | Dr `customer_funds_payable` (USD) · Cr `fx_clearing` (USD); Dr `fx_clearing` (VND) · Cr `customer_funds_payable` (VND) · Cr `fee_income` (FX margin) |
+| **Prefunding completed** (VND advanced) | Dr `customer_funds_payable` (VND) · Cr `prefunding_pool` (VND) |
+| **Prefunding failed** | No funding leg; flag the transaction and hold in `suspense`; trigger AFT reversal (see below) |
+| **Settlement received** (T+n) | Dr `nostro_settlement` (USD) · Cr `visa_receivable` (USD); realize `fx_gain_loss`; replenish `prefunding_pool` |
+| **AFT reversal** | Reversing entries of the AFT/funding legs, referencing the original entry |
+| **Adjustment / refund (OCT)** | Booked as new balanced entries referencing the original `transactionId` |
+
+> **Worked example (illustrative).** A USD 100 top-up at 25,000 VND/USD with a 1% FX
+> margin: on AFT approval, `visa_receivable` +100 USD / `customer_funds_payable` +100 USD.
+> After FX, the customer is owed 2,475,000 VND and `fee_income` earns 25,000 VND. On
+> prefunding completion, `customer_funds_payable` −2,475,000 VND / `prefunding_pool`
+> −2,475,000 VND. At settlement, `nostro_settlement` +100 USD / `visa_receivable` −100 USD
+> and the pool is replenished. Exact legs/rounding/fee treatment are owned by finance.
+
+## Prefunding ingestion (the diagram's explicit input)
+
+PVCB Core Banking forwards every prefunding outcome here:
+
+- **Completed** → post the prefunding advance legs; the transaction's funding is now
+  recognized. Mark the AFT receivable as backing an outstanding advance (counts toward
+  [exposure](#prefunding-liquidity-exposure-limit)) until settlement clears it.
+- **Failed** → **do not** book a funding leg. The AFT was already approved (funds pulled),
+  so an un-fundable transaction is a break: hold it in `suspense`, raise an exception, and
+  signal `tc-card-network-service` to **reverse the AFT** so no funds are left pulled from
+  the cardholder. The ledger records the reversal when it is confirmed.
+
+Both events are **idempotent** on the business `transactionId` + event type.
+
+## Prefunding (liquidity) exposure limit
+
+The control behind advanced funding: track the **outstanding prefunded-but-unsettled
+exposure** and cap it.
+
+- `exposure = Σ prefunding advances not yet cleared by settlement`.
+- A **configurable ceiling** (sized to 2–3 days of expected volume, per corridor/currency).
+- When exposure approaches the ceiling: warn treasury; at the ceiling: **reject / throttle**
+  new prefunding and signal upstream (`tc-cardload-service` / `tc-card-network-service`) so
+  new top-ups are held rather than funded beyond available liquidity.
+- Expose real-time exposure and balances to treasury and `tc-admin-service`.
+- **Fail closed:** if exposure cannot be computed, hold new prefunding.
+
+```yaml
+ledger:
+  exposure:
+    ceiling:        { USD: 5000000 }     # outstanding prefunded cap
+    warnThreshold:  0.8                   # warn treasury at 80%
+    perCurrency:    true
+    failClosed:     true
+  posting:
+    requireBalanced: true                 # reject any entry that doesn't net to zero
+    enforceIdempotency: true
+```
+
+## Idempotency & exactly-once posting
+
+- Every inbound event carries a unique key (`transactionId` + `eventType`, or an explicit
+  `Idempotency-Key`). The ledger dedupes on it; a replay returns the existing journal entry.
+- Posting is a single atomic database transaction: write the journal entry + all legs +
+  update materialized balances, or nothing.
+- A balanced-entry constraint (`Σ debits == Σ credits` per currency) is enforced at write
+  time.
+
+## Immutability, corrections & audit
+
+- Journal entries and legs are **append-only** — no `UPDATE`/`DELETE`.
+- A correction is a **reversing entry** that references `reversesEntryId`; the original
+  stays visible. This preserves a defensible audit trail for finance and regulators.
+- Every entry records: source service, business `transactionId`, event type, actor, and
+  timestamp.
+
+## Settlement & reconciliation interface
+
+- `tc-settlement-reconciliation-service` matches the Visa settlement file lines against
+  `visa_receivable` entries and publishes a **`settlement.matched`** event, which this
+  ledger consumes to post the **settlement-received** clearing entries (and FX gain/loss).
+- **Breaks** (settlement line with no matching ledger entry, or vice versa) are posted to
+  `suspense` and raised as exceptions for ops — never silently dropped.
+- The ledger exposes per-transaction state so reconciliation can match on Visa
+  `transactionIdentifier` / RRN / amount.
+
+## Service API
+
+### Inbound (events & posting)
+
+| Method & path | Purpose | Source |
+| --- | --- | --- |
+| `POST /v1/postings` | Post a balanced journal entry (idempotent) | internal callers |
+| `POST /v1/events/aft` | AFT approved / reversed / adjusted / refunded | `tc-card-network-service` |
+| `POST /v1/events/prefunding` | Prefunding completed / failed | PVCB Core Banking |
+| `POST /v1/events/settlement` | Matched settlement line | `tc-settlement-reconciliation-service` |
+
+### Queries
+
+| Method & path | Purpose |
+| --- | --- |
+| `GET /v1/accounts/{id}/balance` | Account balance (per currency) |
+| `GET /v1/transactions/{id}` | All postings for a business transaction |
+| `GET /v1/exposure` | Current outstanding prefunding exposure vs ceiling |
+| `GET /v1/reports/trial-balance` | Trial balance for a period |
+
+## Data model
+
+- `accounts` — id, type, normal side, currency policy.
+- `journal_entries` — id, business `transactionId`, eventType, `reversesEntryId?`,
+  idempotencyKey (unique), createdAt, source. **Append-only.**
+- `postings` — entryId, accountId, direction (Dr/Cr), amount, currency. Sum per (entry,
+  currency) must be zero.
+- `account_balances` — materialized per (account, currency); rebuildable from `postings`.
+- `exposure` — derived/materialized outstanding-prefunded per currency.
+
+## Consistency, integrity & period close
+
+- Balanced-entry invariant enforced per write; periodic **trial-balance** job verifies the
+  whole book nets to zero per currency.
+- Materialized balances reconciled against the journal on a schedule; any drift alerts.
+- Period close locks a reporting window; post-close corrections use reversing entries dated
+  in the open period.
+
+## Error handling & fail-closed
+
+- Reject (never partially post) any entry that is unbalanced, duplicates an idempotency key
+  with a different payload, or references a missing account.
+- Fail closed on exposure-store or DB unavailability for **new prefunding/postings**;
+  read-only queries may serve last-known balances clearly marked as such.
+- All rejects emit metrics + structured logs for ops.
+
+## Observability
+
+- Metrics: posting throughput, rejected/unbalanced entries, outstanding exposure vs
+  ceiling, suspense balance, settlement-match rate, FX gain/loss.
+- Alert on: exposure breaching `warnThreshold`/ceiling, non-zero/growing `suspense`,
+  trial-balance drift, prefunding-failure spikes, and any fail-closed event.
+- Structured, append-only audit log to SIEM; correlate on business `transactionId`.
+
+## Events
+
+Postings are driven by events (see [Architecture](/docs/specifications/architecture)). The
+`POST /v1/events/*` entries in [Service API](#service-api) are the logical message handlers
+(functional `Consumer` beans) plus a replay/admin path; in production they are delivered by
+the broker, not called directly. Consumers are **idempotent** on `eventId` (+ `transactionId`
++ event type); ledger postings are ordered by `accountId` (partition key).
+
+| Direction | Event | Counterpart |
+| --- | --- | --- |
+| consumes | `aft.completed` / `aft.reversed` / `aft.adjusted` / `aft.refunded` | card-network |
+| consumes | `prefunding.completed` / `prefunding.failed` | core-banking adapter |
+| consumes | `settlement.matched` | reconciliation |
+| consumes | `limits.updated` (prefunding exposure ceiling) | admin |
+| produces | `prefunding.exposure.updated` (optional, for dashboards) | admin |
+
+## Assumptions & open questions
+
+1. **Chart of accounts & FX/fee booking** are illustrative here — finance/treasury own the
+   final account list, rounding rules, and fee treatment.
+2. **Customer balance ownership.** Assumed the authoritative VND customer balance lives in
+   PVCB Core Banking; the ledger mirrors movements for reconciliation rather than being the
+   customer's wallet. Confirm.
+3. **Who issues the prefunding request & forwards outcomes.** Modeled as Core Banking
+   forwarding completed/failed events here; confirm the exact emitter and transport.
+4. **Exposure ceiling sizing** must be set with treasury per corridor/currency and kept in
+   sync with actual funded liquidity.

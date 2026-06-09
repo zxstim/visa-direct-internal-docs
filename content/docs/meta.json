@@ -1,6 +1,7 @@
 {
   "pages": [
-    "index"
+    "index",
+    "specifications"
   ],
   "defaultOpen": false
 }
