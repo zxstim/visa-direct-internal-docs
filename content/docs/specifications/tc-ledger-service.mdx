@@ -241,7 +241,8 @@ CREATE TABLE journal_entry (                       -- append-only
   entry_ref         CHAR(36)     NOT NULL,         -- unique business id
   idempotency_key   VARCHAR(96)  NOT NULL,         -- e.g. <transaction_ref>:<event_type>
   event_type        VARCHAR(40)  NOT NULL,         -- AFT_APPROVED/FX_CONVERSION/PREFUNDING_COMPLETED/SETTLEMENT_RECEIVED/REVERSAL/ADJUSTMENT/REFUND
-  transaction_ref   VARCHAR(48)  NULL,             -- business topup id
+  transaction_ref   VARCHAR(48)  NULL,             -- business topup id (trace spine)
+  correlation_id    VARCHAR(64)  NULL,             -- trace id (= OpenTelemetry trace), from the event envelope
   reverses_entry_id BIGINT UNSIGNED NULL,          -- correction → original entry
   source            VARCHAR(40)  NOT NULL,         -- producing service
   description       VARCHAR(255) NULL,
@@ -249,6 +250,7 @@ CREATE TABLE journal_entry (                       -- append-only
   UNIQUE KEY uk_je_ref  (entry_ref),
   UNIQUE KEY uk_je_idem (idempotency_key),
   KEY idx_je_txn (transaction_ref),
+  KEY idx_je_corr (correlation_id),
   KEY idx_je_created (created_at),
   CONSTRAINT fk_je_reverses FOREIGN KEY (reverses_entry_id) REFERENCES journal_entry(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -343,7 +345,8 @@ Table journal_entry {
   entry_ref char(36) [not null, unique]
   idempotency_key varchar(96) [not null, unique]
   event_type varchar(40) [not null]
-  transaction_ref varchar(48)
+  transaction_ref varchar(48) [note: 'business id (trace spine)']
+  correlation_id varchar(64) [note: 'trace id']
   reverses_entry_id bigint [note: 'correction → original entry']
   source varchar(40) [not null]
   description varchar(255)

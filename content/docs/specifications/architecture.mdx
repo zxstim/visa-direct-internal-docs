@@ -219,6 +219,67 @@ public void completeAft(Aft aft) {
 - **Correlation:** the gateway's `correlationId` is carried in every envelope, so a top-up is
   traceable end-to-end across services and queues (OpenTelemetry + structured logs).
 
+## Transaction traceability
+
+Every transaction must be reconstructable end-to-end — across services, events, databases,
+and external providers — for support, audit, and regulatory needs. Three identifiers carry
+the trace:
+
+| Identifier | Scope | Where it lives |
+| --- | --- | --- |
+| `correlation_id` | **One trace** for the whole top-up = the **OpenTelemetry trace id** | Stamped by `tc-api-gateway` on first contact; carried in **every event envelope**, HTTP hop, log line, and the PVCB webhook |
+| `transaction_ref` | **The business top-up** (`topup-<uuid>`) | The spine across **every service's database** |
+| Provider ids | The external leg | Cybersource `decisionId` / `authenticationTransactionId`; Visa `transactionIdentifier` / STAN / RRN / `statusIdentifier`; settlement `settlement_id` |
+
+Rules (normative):
+
+- The gateway **MUST** assign `correlation_id` once and propagate it unchanged; services
+  **MUST NOT** regenerate it. It is also returned to PVCB (webhook `Delivery-Id` +
+  correlation) so the partner can trace too.
+- **Every transaction-scoped row MUST carry both `transaction_ref` and `correlation_id`**
+  (child rows may instead FK to an aggregate that carries them). This lets you pivot a query
+  on either the business id or the trace id in any service.
+- Each service **MUST** set `clientReferenceInformation.code` (Cybersource) and the Visa
+  trace fields to values derived from `transaction_ref`, so external systems are joinable
+  back to the transaction.
+- State changes are auditable: the per-service **state-transition tables**, the **append-only
+  ledger**, and the **hash-chained `activity_log`** record who/what/when, each tagged with
+  the triggering `event_id` (causation).
+
+**Reconstructing a transaction:** query each service DB by `transaction_ref`; pull logs and
+distributed traces by `correlation_id`; follow the external legs by the stored provider ids.
+The reconciliation service bridges the Visa `transaction_identifier` back to `transaction_ref`
+via its `auth_leg` read model.
+
+## Data durability — primary + standby (HA/DR)
+
+Each service owns a **primary MySQL 8.4** database **and a standby replica — the "backup
+database"**. The standby is a true mirror maintained by **MySQL replication**, **not**
+application-level dual-write (which would risk divergence and break the single-writer model).
+
+- **Replication:** semi-synchronous for the money-movement services (RPO ≈ 0), or a managed
+  **Multi-AZ** primary/standby. Async read-replicas may additionally serve reporting.
+- **Backups + PITR:** automated daily snapshots plus **binlog point-in-time recovery**;
+  retained per the data-retention/PCI policy, with periodic **restore drills** (an untested
+  backup is not a backup).
+- **Failover:** promote the standby; target **RTO** of minutes. The **outbox** and
+  **append-only audit/ledger** tables replicate too, so undelivered events and the full
+  trace survive a failover — preserving exactly-once and traceability.
+- **Supporting stores:** Redis (sessions/counters/nonce) runs **HA (replica/Sentinel or
+  cluster)**; the broker has its own replication. These are recovery dependencies, not
+  systems of record — the durable truth is each service's MySQL + its standby.
+
+| Service | Primary (main DB) | Standby (backup DB) | Replication |
+| --- | --- | --- | --- |
+| tc-cardload-service | `cardload` | `cardload-standby` | semi-sync / Multi-AZ |
+| tc-card-network-service | `cardnet` | `cardnet-standby` | semi-sync / Multi-AZ |
+| tc-ledger-service | `ledger` | `ledger-standby` | **semi-sync** (system of record) |
+| tc-settlement-reconciliation-service | `recon` | `recon-standby` | semi-sync / Multi-AZ |
+| tc-admin-service | `admin` | `admin-standby` | async acceptable |
+
+> Backups protect against corruption/deletion (PITR); the standby protects against instance
+> loss (failover). You need **both** — they cover different failures.
+
 ## System-wide data map (DBML)
 
 A single-canvas view of **every service's tables on one diagram**. Each service owns its own
