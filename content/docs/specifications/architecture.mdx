@@ -218,3 +218,428 @@ public void completeAft(Aft aft) {
 - **No lost events** via the outbox; **no silent drops** via DLQ + alarms.
 - **Correlation:** the gateway's `correlationId` is carried in every envelope, so a top-up is
   traceable end-to-end across services and queues (OpenTelemetry + structured logs).
+
+## System-wide data map (DBML)
+
+A single-canvas view of **every service's tables on one diagram**. Each service owns its own
+database, so this is **schema-namespaced per service** (`cardload.*`, `cardnet.*`, `ledger.*`,
+`recon.*`, `admin.*`) and grouped with `TableGroup`. Columns are trimmed to keys and
+correlation fields — the **full column-level DBML lives in each service spec**.
+
+- **Solid relationships within a service** are real foreign keys.
+- **Cross-service links are logical** — there are **no cross-database FKs**. They are
+  correlations over the shared **`transaction_ref`** (business id) and Visa
+  **`transaction_identifier`**, resolved by **events** (eventual consistency), not joins.
+- Messaging (`outbox` → broker → `processed_event`) is the backbone but is omitted as
+  drawn refs to avoid a hairball; see the [event catalog](#event-catalog).
+
+Paste into [dbdiagram.io](https://dbdiagram.io):
+
+```
+// Visa Direct top-up platform — system-wide data map
+// Each service = its own database (schema namespace). Cross-service = logical, via transaction_ref / transaction_identifier.
+
+//==================== tc-cardload-service ====================
+Table cardload.topup {
+  id bigint [pk, increment]
+  transaction_ref varchar(48) [not null, unique, note: 'business id']
+  idempotency_key varchar(64) [not null, unique]
+  status varchar(40) [not null]
+  amount decimal(18,2) [not null]
+  currency char(3) [not null]
+  customer_ref varchar(64)
+  created_at datetime
+}
+Table cardload.fraud_screening {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
+  decision varchar(20) [not null]
+  score smallint
+  created_at datetime
+}
+Table cardload.payer_authentication {
+  id bigint [pk, increment]
+  topup_id bigint [not null, unique]
+  status varchar(40)
+  cavv varchar(64)
+  eci varchar(4)
+  created_at datetime
+}
+Table cardload.aft_result {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
+  result varchar(20) [not null]
+  visa_txn_id varchar(40)
+  created_at datetime
+}
+Table cardload.prefunding {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
+  status varchar(20) [not null]
+  funded_amount decimal(20,2)
+  created_at datetime
+}
+Table cardload.topup_state_transition {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
+  to_status varchar(40) [not null]
+  created_at datetime
+}
+Table cardload.outbox {
+  id bigint [pk, increment]
+  event_id char(36) [not null, unique]
+  event_type varchar(64) [not null]
+  status varchar(20) [not null]
+}
+Table cardload.processed_event {
+  event_id char(36) [pk]
+  event_type varchar(64) [not null]
+}
+
+//==================== tc-card-network-service ====================
+Table cardnet.aft_transaction {
+  id bigint [pk, increment]
+  transaction_ref varchar(48) [not null, unique, note: 'business id']
+  idempotency_key varchar(64) [not null, unique]
+  status varchar(40) [not null]
+  amount decimal(18,2) [not null]
+  currency char(3) [not null]
+  transaction_identifier varchar(40) [note: 'Visa txn id']
+  status_identifier varchar(40)
+  action_code varchar(4)
+  created_at datetime
+}
+Table cardnet.aft_correction {
+  id bigint [pk, increment]
+  aft_transaction_id bigint [not null]
+  type varchar(20) [not null]
+  status varchar(20) [not null]
+  amount decimal(18,2)
+  created_at datetime
+}
+Table cardnet.visa_call {
+  id bigint [pk, increment]
+  aft_transaction_id bigint
+  operation varchar(30) [not null]
+  action_code varchar(4)
+  created_at datetime
+}
+Table cardnet.limit_config {
+  id bigint [pk, increment]
+  version int [not null, unique]
+  source varchar(40) [not null]
+  effective_from datetime [not null]
+}
+Table cardnet.aft_state_transition {
+  id bigint [pk, increment]
+  aft_transaction_id bigint [not null]
+  to_status varchar(40) [not null]
+  created_at datetime
+}
+Table cardnet.outbox {
+  id bigint [pk, increment]
+  event_id char(36) [not null, unique]
+  event_type varchar(64) [not null]
+  status varchar(20) [not null]
+}
+Table cardnet.processed_event {
+  event_id char(36) [pk]
+  event_type varchar(64) [not null]
+}
+
+//==================== tc-ledger-service ====================
+Table ledger.account {
+  id bigint [pk, increment]
+  code varchar(64) [not null, unique]
+  type varchar(20) [not null]
+  normal_side varchar(6) [not null]
+}
+Table ledger.journal_entry {
+  id bigint [pk, increment]
+  entry_ref char(36) [not null, unique]
+  idempotency_key varchar(96) [not null, unique]
+  event_type varchar(40) [not null]
+  transaction_ref varchar(48) [note: 'business id']
+  reverses_entry_id bigint
+  created_at datetime
+}
+Table ledger.posting {
+  id bigint [pk, increment]
+  journal_entry_id bigint [not null]
+  account_id bigint [not null]
+  direction varchar(6) [not null]
+  amount decimal(23,4) [not null]
+  currency char(3) [not null]
+}
+Table ledger.account_balance {
+  account_id bigint
+  currency char(3)
+  balance decimal(23,4) [not null]
+  indexes {
+    (account_id, currency) [pk]
+  }
+}
+Table ledger.exposure {
+  currency char(3) [pk]
+  outstanding_amount decimal(23,4) [not null]
+  ceiling_amount decimal(23,4)
+}
+Table ledger.outbox {
+  id bigint [pk, increment]
+  event_id char(36) [not null, unique]
+  event_type varchar(64) [not null]
+  status varchar(20) [not null]
+}
+Table ledger.processed_event {
+  event_id char(36) [pk]
+  event_type varchar(64) [not null]
+}
+
+//==================== tc-settlement-reconciliation-service ====================
+Table recon.settlement_file {
+  id bigint [pk, increment]
+  file_hash char(64) [not null, unique]
+  status varchar(20) [not null]
+  record_count int
+}
+Table recon.settlement_raw_record {
+  id bigint [pk, increment]
+  settlement_file_id bigint [not null]
+  line_number int [not null]
+  record_type varchar(10)
+  raw_line text [not null, note: 'as-is verbatim']
+}
+Table recon.settlement_record {
+  id bigint [pk, increment]
+  settlement_file_id bigint [not null]
+  raw_record_id bigint
+  settlement_id varchar(64) [not null, unique]
+  transaction_identifier varchar(40) [note: 'Visa txn id']
+  settled_amount decimal(18,2)
+  settlement_currency char(3)
+  transaction_type varchar(20)
+}
+Table recon.auth_leg {
+  transaction_ref varchar(48) [pk, note: 'business id']
+  visa_transaction_identifier varchar(40)
+  authorized_amount decimal(18,2)
+  auth_status varchar(20)
+}
+Table recon.prefunding_leg {
+  transaction_ref varchar(48) [pk, note: 'business id']
+  funded_amount decimal(20,2)
+  status varchar(20)
+}
+Table recon.reconciliation_result {
+  id bigint [pk, increment]
+  settlement_record_id bigint
+  transaction_ref varchar(48)
+  visa_transaction_identifier varchar(40)
+  outcome varchar(30) [not null]
+  status varchar(20) [not null]
+}
+Table recon.outbox {
+  id bigint [pk, increment]
+  event_id char(36) [not null, unique]
+  event_type varchar(64) [not null]
+  status varchar(20) [not null]
+}
+Table recon.processed_event {
+  event_id char(36) [pk]
+  event_type varchar(64) [not null]
+}
+
+//==================== tc-admin-service ====================
+Table admin.admin_user {
+  id bigint [pk, increment]
+  email varchar(255) [not null, unique]
+  status varchar(20) [not null]
+  approved_by bigint
+}
+Table admin.role {
+  id bigint [pk, increment]
+  name varchar(40) [not null, unique]
+}
+Table admin.permission {
+  id bigint [pk, increment]
+  code varchar(64) [not null, unique]
+}
+Table admin.role_permission {
+  role_id bigint
+  permission_id bigint
+  indexes {
+    (role_id, permission_id) [pk]
+  }
+}
+Table admin.user_role {
+  user_id bigint
+  role_id bigint
+  indexes {
+    (user_id, role_id) [pk]
+  }
+}
+Table admin.tag {
+  id bigint [pk, increment]
+  tag_key varchar(40) [not null]
+  tag_value varchar(64) [not null]
+}
+Table admin.user_tag {
+  user_id bigint
+  tag_id bigint
+  indexes {
+    (user_id, tag_id) [pk]
+  }
+}
+Table admin.totp_secret {
+  user_id bigint [pk]
+}
+Table admin.webauthn_user_entity {
+  id varchar(255) [pk]
+  user_id bigint [not null, unique]
+}
+Table admin.webauthn_credential {
+  credential_id varchar(255) [pk]
+  user_entity_id varchar(255) [not null]
+}
+Table admin.parameter {
+  id bigint [pk, increment]
+  scope varchar(64) [not null]
+  param_key varchar(64) [not null]
+  current_version int [not null]
+}
+Table admin.parameter_version {
+  id bigint [pk, increment]
+  parameter_id bigint [not null]
+  version int [not null]
+}
+Table admin.parameter_proposal {
+  id bigint [pk, increment]
+  scope varchar(64) [not null]
+  param_key varchar(64) [not null]
+  status varchar(20) [not null]
+  proposed_by bigint [not null]
+  approved_by bigint
+}
+Table admin.activity_log {
+  id bigint [pk, increment]
+  actor_id bigint
+  type varchar(20) [not null]
+  screen varchar(255)
+  hash char(64) [not null]
+  created_at datetime
+}
+Table admin.outbox {
+  id bigint [pk, increment]
+  event_id char(36) [not null, unique]
+  event_type varchar(64) [not null]
+  status varchar(20) [not null]
+}
+Table admin.processed_event {
+  event_id char(36) [pk]
+  event_type varchar(64) [not null]
+}
+
+//==================== visual grouping ====================
+TableGroup "tc-cardload-service" {
+  cardload.topup
+  cardload.fraud_screening
+  cardload.payer_authentication
+  cardload.aft_result
+  cardload.prefunding
+  cardload.topup_state_transition
+  cardload.outbox
+  cardload.processed_event
+}
+TableGroup "tc-card-network-service" {
+  cardnet.aft_transaction
+  cardnet.aft_correction
+  cardnet.visa_call
+  cardnet.limit_config
+  cardnet.aft_state_transition
+  cardnet.outbox
+  cardnet.processed_event
+}
+TableGroup "tc-ledger-service" {
+  ledger.account
+  ledger.journal_entry
+  ledger.posting
+  ledger.account_balance
+  ledger.exposure
+  ledger.outbox
+  ledger.processed_event
+}
+TableGroup "tc-settlement-reconciliation-service" {
+  recon.settlement_file
+  recon.settlement_raw_record
+  recon.settlement_record
+  recon.auth_leg
+  recon.prefunding_leg
+  recon.reconciliation_result
+  recon.outbox
+  recon.processed_event
+}
+TableGroup "tc-admin-service" {
+  admin.admin_user
+  admin.role
+  admin.permission
+  admin.role_permission
+  admin.user_role
+  admin.tag
+  admin.user_tag
+  admin.totp_secret
+  admin.webauthn_user_entity
+  admin.webauthn_credential
+  admin.parameter
+  admin.parameter_version
+  admin.parameter_proposal
+  admin.activity_log
+  admin.outbox
+  admin.processed_event
+}
+
+//==================== intra-service foreign keys ====================
+Ref: cardload.fraud_screening.topup_id > cardload.topup.id
+Ref: cardload.payer_authentication.topup_id - cardload.topup.id
+Ref: cardload.aft_result.topup_id > cardload.topup.id
+Ref: cardload.prefunding.topup_id > cardload.topup.id
+Ref: cardload.topup_state_transition.topup_id > cardload.topup.id
+
+Ref: cardnet.aft_correction.aft_transaction_id > cardnet.aft_transaction.id
+Ref: cardnet.visa_call.aft_transaction_id > cardnet.aft_transaction.id
+Ref: cardnet.aft_state_transition.aft_transaction_id > cardnet.aft_transaction.id
+
+Ref: ledger.posting.journal_entry_id > ledger.journal_entry.id
+Ref: ledger.posting.account_id > ledger.account.id
+Ref: ledger.account_balance.account_id > ledger.account.id
+Ref: ledger.journal_entry.reverses_entry_id > ledger.journal_entry.id
+
+Ref: recon.settlement_raw_record.settlement_file_id > recon.settlement_file.id
+Ref: recon.settlement_record.settlement_file_id > recon.settlement_file.id
+Ref: recon.settlement_record.raw_record_id > recon.settlement_raw_record.id
+Ref: recon.reconciliation_result.settlement_record_id > recon.settlement_record.id
+
+Ref: admin.admin_user.approved_by > admin.admin_user.id
+Ref: admin.role_permission.role_id > admin.role.id
+Ref: admin.role_permission.permission_id > admin.permission.id
+Ref: admin.user_role.user_id > admin.admin_user.id
+Ref: admin.user_role.role_id > admin.role.id
+Ref: admin.user_tag.user_id > admin.admin_user.id
+Ref: admin.user_tag.tag_id > admin.tag.id
+Ref: admin.totp_secret.user_id - admin.admin_user.id
+Ref: admin.webauthn_user_entity.user_id - admin.admin_user.id
+Ref: admin.webauthn_credential.user_entity_id > admin.webauthn_user_entity.id
+Ref: admin.parameter_version.parameter_id > admin.parameter.id
+Ref: admin.parameter_proposal.proposed_by > admin.admin_user.id
+Ref: admin.parameter_proposal.approved_by > admin.admin_user.id
+Ref: admin.activity_log.actor_id > admin.admin_user.id
+
+//==================== cross-service correlations (LOGICAL — no DB FK) ====================
+// same business top-up id flows across services:
+Ref: cardnet.aft_transaction.transaction_ref - cardload.topup.transaction_ref
+Ref: ledger.journal_entry.transaction_ref > cardload.topup.transaction_ref
+Ref: recon.auth_leg.transaction_ref - cardload.topup.transaction_ref
+Ref: recon.prefunding_leg.transaction_ref - cardload.topup.transaction_ref
+// Visa transaction identifier joins settlement to the AFT:
+Ref: recon.settlement_record.transaction_identifier > cardnet.aft_transaction.transaction_identifier
+// config propagation: admin.parameter --(limits.updated event)--> cardnet.limit_config / ledger.exposure (not drawn)
+```

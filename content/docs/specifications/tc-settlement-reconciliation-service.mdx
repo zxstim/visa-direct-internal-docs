@@ -186,6 +186,310 @@ Each settlement detail record is parsed into a **canonical settlement record**:
   (open/resolved), resolver.
 - `exceptions` — open breaks for ops, with aging.
 
+## Database schema
+
+**MySQL 8.4 LTS / InnoDB, `utf8mb4`.** The pipeline is **stage-then-process**, mirrored in
+the tables:
+
+```
+Visa file ─▶ settlement_file ─▶ settlement_raw_record (AS-IS)  ─▶ settlement_record (normalized)
+                                                                        │
+auth_leg / prefunding_leg (CQRS read models from events) ──────▶ reconciliation_result
+```
+
+- **`settlement_raw_record` is the as-is landing table** you asked for: the parser writes
+  every record **verbatim** here first (`raw_line` + positional fields as untyped strings),
+  before any interpretation. This preserves an exact copy of what Visa sent, so the file can
+  be **re-parsed or audited** without re-fetching, and a parser bug can be replayed.
+- `settlement_record` is the **typed/normalized** derivation, each row linking back to its
+  `raw_record_id`.
+- `auth_leg` and `prefunding_leg` are **CQRS read models** built from `aft.*` / `prefunding.*`
+  events; the matcher joins them with `settlement_record`.
+- Files dedupe on `file_hash`; reconciliation is replayable; consumers idempotent via
+  `processed_event`.
+
+```sql
+CREATE TABLE settlement_file (
+  id                     BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  file_name              VARCHAR(255) NOT NULL,
+  file_hash              CHAR(64)     NOT NULL,    -- sha-256, dedupe key
+  sequence_number        BIGINT       NULL,
+  format                 VARCHAR(20)  NULL,        -- VSS_TC46 / BASE_II / ...
+  status                 VARCHAR(20)  NOT NULL,    -- RECEIVED/VALIDATED/PARSED/MATCHED/FAILED
+  record_count           INT          NULL,
+  control_total_amount   DECIMAL(23,2) NULL,
+  control_total_currency CHAR(3)      NULL,
+  validation_error       VARCHAR(255) NULL,
+  received_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  processed_at           DATETIME(3)  NULL,
+  UNIQUE KEY uk_file_hash (file_hash),
+  KEY idx_file_status (status),
+  CONSTRAINT chk_file_status CHECK (status IN ('RECEIVED','VALIDATED','PARSED','MATCHED','FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- AS-IS staging: each Visa record stored verbatim before any normalization.
+CREATE TABLE settlement_raw_record (
+  id                 BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  settlement_file_id BIGINT UNSIGNED NOT NULL,
+  line_number        INT          NOT NULL,
+  record_type        VARCHAR(10)  NULL,           -- TCR/TC code as read, e.g. 'TCR0','TC46'
+  raw_line           TEXT         NOT NULL,        -- the literal line, byte-for-byte
+  raw_fields         JSON         NULL,            -- positionally split fields, as untyped strings
+  parsed             BOOLEAN      NOT NULL DEFAULT FALSE,
+  created_at         DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_raw_file (settlement_file_id, line_number),
+  CONSTRAINT fk_raw_file FOREIGN KEY (settlement_file_id) REFERENCES settlement_file(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Normalized/typed records derived from the raw rows.
+CREATE TABLE settlement_record (
+  id                         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  settlement_file_id         BIGINT UNSIGNED NOT NULL,
+  raw_record_id              BIGINT UNSIGNED NULL,   -- link back to the as-is line
+  settlement_id              VARCHAR(64)  NOT NULL,  -- file:seq
+  transaction_identifier     VARCHAR(40)  NULL,      -- primary join key to the AFT
+  retrieval_reference_number VARCHAR(12)  NULL,
+  settled_amount             DECIMAL(18,2) NULL,
+  settlement_currency        CHAR(3)      NULL,
+  interchange_fee            DECIMAL(18,4) NULL,
+  scheme_fees                DECIMAL(18,4) NULL,
+  transaction_type           VARCHAR(20)  NULL,      -- AFT/AFTR/OCT/ADJUSTMENT
+  settlement_date            DATE         NULL,
+  funds_type                 VARCHAR(20)  NULL,
+  created_at                 DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_srec_settlement (settlement_id),
+  KEY idx_srec_txnid (transaction_identifier),
+  KEY idx_srec_file (settlement_file_id),
+  CONSTRAINT fk_srec_file FOREIGN KEY (settlement_file_id) REFERENCES settlement_file(id),
+  CONSTRAINT fk_srec_raw  FOREIGN KEY (raw_record_id) REFERENCES settlement_raw_record(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- CQRS read models fed by events.
+CREATE TABLE auth_leg (
+  transaction_ref             VARCHAR(48) NOT NULL PRIMARY KEY,
+  visa_transaction_identifier VARCHAR(40) NULL,
+  retrieval_reference_number  VARCHAR(12) NULL,
+  stan                        INT UNSIGNED NULL,
+  acquiring_bin               VARCHAR(11) NULL,
+  authorized_amount           DECIMAL(18,2) NULL,
+  currency                    CHAR(3)     NULL,
+  approval_code               VARCHAR(10) NULL,
+  auth_status                 VARCHAR(20) NULL,      -- APPROVED/REVERSED/ADJUSTED/REFUNDED
+  auth_date                   DATETIME(3) NULL,
+  updated_at                  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  KEY idx_authleg_txnid (visa_transaction_identifier)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE prefunding_leg (
+  transaction_ref VARCHAR(48)  NOT NULL PRIMARY KEY,
+  funded_amount   DECIMAL(20,2) NULL,
+  funded_currency CHAR(3)      NULL,
+  fx_rate         DECIMAL(18,6) NULL,
+  status          VARCHAR(20)  NULL,                 -- COMPLETED/FAILED
+  prefund_at      DATETIME(3)  NULL,
+  updated_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE reconciliation_result (
+  id                          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  settlement_record_id        BIGINT UNSIGNED NULL,  -- null for UNSETTLED (auth+prefund, no settlement line)
+  transaction_ref             VARCHAR(48)  NULL,
+  visa_transaction_identifier VARCHAR(40)  NULL,
+  outcome                     VARCHAR(30)  NOT NULL, -- see CHECK
+  status                      VARCHAR(20)  NOT NULL DEFAULT 'OPEN',  -- OPEN/RESOLVED (MATCHED auto-resolved)
+  discrepancy_json            JSON         NULL,
+  resolver                    VARCHAR(64)  NULL,
+  resolved_at                 DATETIME(3)  NULL,
+  created_at                  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_recon_outcome (outcome, status),
+  KEY idx_recon_txn (transaction_ref),
+  CONSTRAINT fk_recon_srec FOREIGN KEY (settlement_record_id) REFERENCES settlement_record(id),
+  CONSTRAINT chk_recon_outcome CHECK (outcome IN (
+    'MATCHED','AMOUNT_MISMATCH','UNSETTLED','ORPHAN_SETTLEMENT','MISSING_PREFUND',
+    'REVERSAL','ADJUSTMENT','DUPLICATE_SETTLEMENT')),
+  CONSTRAINT chk_recon_status CHECK (status IN ('OPEN','RESOLVED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE outbox (
+  id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  event_id     CHAR(36)     NOT NULL,
+  event_type   VARCHAR(64)  NOT NULL,     -- settlement.matched / settlement.break
+  aggregate_id VARCHAR(48)  NOT NULL,
+  payload      JSON         NOT NULL,
+  status       VARCHAR(20)  NOT NULL DEFAULT 'PENDING',
+  attempts     INT          NOT NULL DEFAULT 0,
+  available_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  published_at DATETIME(3)  NULL,
+  created_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_outbox_event (event_id),
+  KEY idx_outbox_dispatch (status, available_at),
+  CONSTRAINT chk_outbox_status CHECK (status IN ('PENDING','PUBLISHED','FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE processed_event (
+  event_id     CHAR(36)    NOT NULL PRIMARY KEY,   -- aft.* / prefunding.*
+  event_type   VARCHAR(64) NOT NULL,
+  transaction_ref VARCHAR(48) NULL,
+  processed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> **Notes.** `raw_line` is `TEXT` to hold any record width; for fixed-width VSS you may also
+> store the offsets in `raw_fields`. JSON columns are scrubbed of PAN; manage DDL with Flyway.
+
+### dbdiagram (DBML)
+
+Paste into [dbdiagram.io](https://dbdiagram.io):
+
+```
+// DBML for tc-settlement-reconciliation-service — paste into https://dbdiagram.io
+
+Enum file_status { RECEIVED VALIDATED PARSED MATCHED FAILED }
+Enum recon_outcome {
+  MATCHED
+  AMOUNT_MISMATCH
+  UNSETTLED
+  ORPHAN_SETTLEMENT
+  MISSING_PREFUND
+  REVERSAL
+  ADJUSTMENT
+  DUPLICATE_SETTLEMENT
+}
+Enum recon_status { OPEN RESOLVED }
+Enum outbox_status { PENDING PUBLISHED FAILED }
+
+Table settlement_file {
+  id bigint [pk, increment]
+  file_name varchar(255) [not null]
+  file_hash char(64) [not null, unique, note: 'sha-256 dedupe key']
+  sequence_number bigint
+  format varchar(20) [note: 'VSS_TC46 / BASE_II']
+  status file_status [not null]
+  record_count int
+  control_total_amount decimal(23,2)
+  control_total_currency char(3)
+  validation_error varchar(255)
+  received_at datetime [not null, default: `now()`]
+  processed_at datetime
+
+  indexes {
+    status [name: 'idx_file_status']
+  }
+}
+
+Table settlement_raw_record {
+  id bigint [pk, increment]
+  settlement_file_id bigint [not null]
+  line_number int [not null]
+  record_type varchar(10) [note: 'TCR0/TC46 as read']
+  raw_line text [not null, note: 'verbatim line, byte-for-byte']
+  raw_fields json [note: 'positional fields as untyped strings']
+  parsed boolean [not null, default: false]
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    (settlement_file_id, line_number) [name: 'idx_raw_file']
+  }
+}
+
+Table settlement_record {
+  id bigint [pk, increment]
+  settlement_file_id bigint [not null]
+  raw_record_id bigint [note: 'link back to as-is line']
+  settlement_id varchar(64) [not null, unique]
+  transaction_identifier varchar(40) [note: 'primary join key to AFT']
+  retrieval_reference_number varchar(12)
+  settled_amount decimal(18,2)
+  settlement_currency char(3)
+  interchange_fee decimal(18,4)
+  scheme_fees decimal(18,4)
+  transaction_type varchar(20) [note: 'AFT/AFTR/OCT/ADJUSTMENT']
+  settlement_date date
+  funds_type varchar(20)
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    transaction_identifier [name: 'idx_srec_txnid']
+    settlement_file_id [name: 'idx_srec_file']
+  }
+}
+
+Table auth_leg {
+  transaction_ref varchar(48) [pk]
+  visa_transaction_identifier varchar(40)
+  retrieval_reference_number varchar(12)
+  stan int
+  acquiring_bin varchar(11)
+  authorized_amount decimal(18,2)
+  currency char(3)
+  approval_code varchar(10)
+  auth_status varchar(20)
+  auth_date datetime
+  updated_at datetime [not null, default: `now()`]
+
+  indexes {
+    visa_transaction_identifier [name: 'idx_authleg_txnid']
+  }
+}
+
+Table prefunding_leg {
+  transaction_ref varchar(48) [pk]
+  funded_amount decimal(20,2)
+  funded_currency char(3)
+  fx_rate decimal(18,6)
+  status varchar(20)
+  prefund_at datetime
+  updated_at datetime [not null, default: `now()`]
+}
+
+Table reconciliation_result {
+  id bigint [pk, increment]
+  settlement_record_id bigint [note: 'null for UNSETTLED']
+  transaction_ref varchar(48)
+  visa_transaction_identifier varchar(40)
+  outcome recon_outcome [not null]
+  status recon_status [not null, default: 'OPEN']
+  discrepancy_json json
+  resolver varchar(64)
+  resolved_at datetime
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    (outcome, status) [name: 'idx_recon_outcome']
+    transaction_ref [name: 'idx_recon_txn']
+  }
+}
+
+Table outbox {
+  id bigint [pk, increment]
+  event_id char(36) [not null, unique]
+  event_type varchar(64) [not null]
+  aggregate_id varchar(48) [not null]
+  payload json [not null]
+  status outbox_status [not null, default: 'PENDING']
+  attempts int [not null, default: 0]
+  available_at datetime [not null, default: `now()`]
+  published_at datetime
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    (status, available_at) [name: 'idx_outbox_dispatch']
+  }
+}
+
+Table processed_event {
+  event_id char(36) [pk]
+  event_type varchar(64) [not null]
+  transaction_ref varchar(48)
+  processed_at datetime [not null, default: `now()`]
+}
+
+Ref: settlement_raw_record.settlement_file_id > settlement_file.id
+Ref: settlement_record.settlement_file_id > settlement_file.id
+Ref: settlement_record.raw_record_id > settlement_raw_record.id
+Ref: reconciliation_result.settlement_record_id > settlement_record.id
+```
+
 ## Security & PCI
 
 - SFTP over **key-based auth**; keys in KMS/Vault; host-key pinning on the secure-storage

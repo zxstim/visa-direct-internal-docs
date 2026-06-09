@@ -200,6 +200,227 @@ ledger:
 - `account_balances` — materialized per (account, currency); rebuildable from `postings`.
 - `exposure` — derived/materialized outstanding-prefunded per currency.
 
+## Database schema
+
+**MySQL 8.4 LTS / InnoDB, `utf8mb4`.** Design decisions:
+
+- Classic double-entry: `journal_entry` (1) → `posting` (N). Every entry's postings sum to
+  **zero per currency** — enforced at write; a periodic trial-balance job re-verifies.
+- **Append-only:** `journal_entry`/`posting` are never updated or deleted; corrections are
+  **reversing entries** linked via `reverses_entry_id`.
+- **Idempotent:** unique `idempotency_key` on `journal_entry` (a replayed event posts once),
+  plus the messaging inbox (`processed_event`).
+- **Multi-currency:** postings are per-currency; `account_balance` is materialized per
+  `(account, currency)` and rebuildable from `posting`. Money as `DECIMAL(23,4)`.
+- `exposure` materializes outstanding prefunded-but-unsettled per currency vs the ceiling
+  (from `limits.updated`).
+
+```
+account ◀── posting ──▶ journal_entry ──(self) reverses_entry_id
+   │                         ▲
+account_balance        (1 entry → N postings, balanced per currency)
+   exposure · outbox · processed_event   (standalone)
+```
+
+```sql
+CREATE TABLE account (
+  id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  code        VARCHAR(64)  NOT NULL,    -- 'visa_receivable', 'prefunding_pool', ...
+  name        VARCHAR(128) NOT NULL,
+  type        VARCHAR(20)  NOT NULL,    -- ASSET/LIABILITY/REVENUE/EXPENSE/EQUITY/CLEARING
+  normal_side VARCHAR(6)   NOT NULL,    -- DEBIT/CREDIT
+  active      BOOLEAN      NOT NULL DEFAULT TRUE,
+  created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_account_code (code),
+  CONSTRAINT chk_account_type CHECK (type IN ('ASSET','LIABILITY','REVENUE','EXPENSE','EQUITY','CLEARING')),
+  CONSTRAINT chk_account_side CHECK (normal_side IN ('DEBIT','CREDIT'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE journal_entry (                       -- append-only
+  id                BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  entry_ref         CHAR(36)     NOT NULL,         -- unique business id
+  idempotency_key   VARCHAR(96)  NOT NULL,         -- e.g. <transaction_ref>:<event_type>
+  event_type        VARCHAR(40)  NOT NULL,         -- AFT_APPROVED/FX_CONVERSION/PREFUNDING_COMPLETED/SETTLEMENT_RECEIVED/REVERSAL/ADJUSTMENT/REFUND
+  transaction_ref   VARCHAR(48)  NULL,             -- business topup id
+  reverses_entry_id BIGINT UNSIGNED NULL,          -- correction → original entry
+  source            VARCHAR(40)  NOT NULL,         -- producing service
+  description       VARCHAR(255) NULL,
+  created_at        DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_je_ref  (entry_ref),
+  UNIQUE KEY uk_je_idem (idempotency_key),
+  KEY idx_je_txn (transaction_ref),
+  KEY idx_je_created (created_at),
+  CONSTRAINT fk_je_reverses FOREIGN KEY (reverses_entry_id) REFERENCES journal_entry(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE posting (
+  id               BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  journal_entry_id BIGINT UNSIGNED NOT NULL,
+  account_id       BIGINT UNSIGNED NOT NULL,
+  direction        VARCHAR(6)    NOT NULL,         -- DEBIT/CREDIT
+  amount           DECIMAL(23,4) NOT NULL,         -- positive; side given by direction
+  currency         CHAR(3)       NOT NULL,
+  reference        VARCHAR(64)   NULL,             -- sub-ledger key (customer/card/txn)
+  created_at       DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_posting_entry (journal_entry_id),
+  KEY idx_posting_account_ccy (account_id, currency),
+  KEY idx_posting_reference (reference),
+  CONSTRAINT fk_posting_entry   FOREIGN KEY (journal_entry_id) REFERENCES journal_entry(id),
+  CONSTRAINT fk_posting_account FOREIGN KEY (account_id) REFERENCES account(id),
+  CONSTRAINT chk_posting_dir CHECK (direction IN ('DEBIT','CREDIT')),
+  CONSTRAINT chk_posting_amt CHECK (amount > 0)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE account_balance (                     -- materialized; rebuildable from posting
+  account_id BIGINT UNSIGNED NOT NULL,
+  currency   CHAR(3)        NOT NULL,
+  balance    DECIMAL(23,4)  NOT NULL DEFAULT 0,    -- signed in the account's normal-side convention
+  updated_at DATETIME(3)    NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  version    INT            NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, currency),
+  CONSTRAINT fk_bal_account FOREIGN KEY (account_id) REFERENCES account(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE exposure (
+  currency           CHAR(3)       NOT NULL PRIMARY KEY,
+  outstanding_amount DECIMAL(23,4) NOT NULL DEFAULT 0,   -- prefunded-but-unsettled
+  ceiling_amount     DECIMAL(23,4) NULL,                 -- from limits.updated
+  updated_at         DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE outbox (
+  id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  event_id     CHAR(36)     NOT NULL,
+  event_type   VARCHAR(64)  NOT NULL,    -- prefunding.exposure.updated
+  aggregate_id VARCHAR(48)  NOT NULL,
+  payload      JSON         NOT NULL,
+  status       VARCHAR(20)  NOT NULL DEFAULT 'PENDING',
+  attempts     INT          NOT NULL DEFAULT 0,
+  available_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  published_at DATETIME(3)  NULL,
+  created_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_outbox_event (event_id),
+  KEY idx_outbox_dispatch (status, available_at),
+  CONSTRAINT chk_outbox_status CHECK (status IN ('PENDING','PUBLISHED','FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE processed_event (
+  event_id     CHAR(36)    NOT NULL PRIMARY KEY,   -- aft.*/prefunding.*/settlement.matched/limits.updated
+  event_type   VARCHAR(64) NOT NULL,
+  reference    VARCHAR(64) NULL,
+  processed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> **Balanced invariant.** MySQL can't `CHECK` across rows, so the "sum of signed postings
+> per `(entry, currency)` = 0" rule is enforced in the posting service and re-verified by the
+> trial-balance job. Seed `account` via Flyway with the [chart of accounts](#account-model-chart-of-accounts).
+
+### dbdiagram (DBML)
+
+Paste into [dbdiagram.io](https://dbdiagram.io):
+
+```
+// DBML for tc-ledger-service — paste into https://dbdiagram.io
+
+Enum account_type { ASSET LIABILITY REVENUE EXPENSE EQUITY CLEARING }
+Enum normal_side { DEBIT CREDIT }
+Enum posting_direction { DEBIT CREDIT }
+Enum outbox_status { PENDING PUBLISHED FAILED }
+
+Table account {
+  id bigint [pk, increment]
+  code varchar(64) [not null, unique]
+  name varchar(128) [not null]
+  type account_type [not null]
+  normal_side normal_side [not null]
+  active boolean [not null, default: true]
+  created_at datetime [not null, default: `now()`]
+}
+
+Table journal_entry {
+  id bigint [pk, increment]
+  entry_ref char(36) [not null, unique]
+  idempotency_key varchar(96) [not null, unique]
+  event_type varchar(40) [not null]
+  transaction_ref varchar(48)
+  reverses_entry_id bigint [note: 'correction → original entry']
+  source varchar(40) [not null]
+  description varchar(255)
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    transaction_ref [name: 'idx_je_txn']
+    created_at [name: 'idx_je_created']
+  }
+}
+
+Table posting {
+  id bigint [pk, increment]
+  journal_entry_id bigint [not null]
+  account_id bigint [not null]
+  direction posting_direction [not null]
+  amount decimal(23,4) [not null, note: 'positive; side given by direction']
+  currency char(3) [not null]
+  reference varchar(64) [note: 'sub-ledger key']
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    journal_entry_id [name: 'idx_posting_entry']
+    (account_id, currency) [name: 'idx_posting_account_ccy']
+    reference [name: 'idx_posting_reference']
+  }
+}
+
+Table account_balance {
+  account_id bigint
+  currency char(3)
+  balance decimal(23,4) [not null, default: 0]
+  updated_at datetime [not null, default: `now()`]
+  version int [not null, default: 0]
+
+  indexes {
+    (account_id, currency) [pk]
+  }
+}
+
+Table exposure {
+  currency char(3) [pk]
+  outstanding_amount decimal(23,4) [not null, default: 0]
+  ceiling_amount decimal(23,4)
+  updated_at datetime [not null, default: `now()`]
+}
+
+Table outbox {
+  id bigint [pk, increment]
+  event_id char(36) [not null, unique]
+  event_type varchar(64) [not null]
+  aggregate_id varchar(48) [not null]
+  payload json [not null]
+  status outbox_status [not null, default: 'PENDING']
+  attempts int [not null, default: 0]
+  available_at datetime [not null, default: `now()`]
+  published_at datetime
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    (status, available_at) [name: 'idx_outbox_dispatch']
+  }
+}
+
+Table processed_event {
+  event_id char(36) [pk]
+  event_type varchar(64) [not null]
+  reference varchar(64)
+  processed_at datetime [not null, default: `now()`]
+}
+
+Ref: posting.journal_entry_id > journal_entry.id
+Ref: posting.account_id > account.id
+Ref: account_balance.account_id > account.id
+Ref: journal_entry.reverses_entry_id > journal_entry.id
+```
+
 ## Consistency, integrity & period close
 
 - Balanced-entry invariant enforced per write; periodic **trial-balance** job verifies the

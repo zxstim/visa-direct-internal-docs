@@ -237,6 +237,384 @@ RECEIVED
    AFT_APPROVED ─ refund (>24h)      ─▶ OCT_SUBMITTED        ─▶ REFUNDED
 ```
 
+## Database schema
+
+**MySQL 8.4 LTS / InnoDB, `utf8mb4`.** Design decisions:
+
+- **`aft_transaction`** is the aggregate (optimistic-locked) — it holds the Visa request
+  identifiers (STAN, RRN), the 3DS data carried from cardload, and the Visa response
+  (`actionCode`, `transactionIdentifier`, `statusIdentifier`).
+- **Corrections share one table** (`aft_correction`, `type` = REVERSAL/ADJUSTMENT/REFUND)
+  since they all reference the original AFT and carry amount/status/Visa response.
+- **`visa_call`** is an audit row per VDP request/response — essential for the
+  [exactly-once](#idempotency--exactly-once-money-movement) GET-status-on-timeout reconciliation.
+- **No PAN** — only a TMS instrument id + masked fields; the PAN travels MLE-encrypted to
+  Visa and is never persisted.
+- **Idempotency:** unique `idempotency_key` per AFT/correction; an **outbox** (unique
+  `event_id`) for produced events; an **inbox** (`processed_event`) for consumed ones.
+- `limit_config` caches the **active authorization-limit thresholds** (from `limits.updated`
+  / config); the runtime **velocity/cumulative counters live in Redis**, not here.
+
+```
+                       ┌──────────────────────────┐
+                       │      aft_transaction      │  (aggregate, optimistic-locked)
+                       └──────────────────────────┘
+        1:N ┌───────────────┬───────────┴───────┬────────────────────┐
+      aft_correction     visa_call      aft_state_transition   (REVERSAL/ADJUSTMENT/REFUND)
+   (standalone): limit_config · outbox · processed_event
+```
+
+### `aft_transaction` — aggregate
+
+```sql
+CREATE TABLE aft_transaction (
+  id                         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  transaction_ref            VARCHAR(48)  NOT NULL,    -- business id (= cardload topup transactionId)
+  idempotency_key            VARCHAR(64)  NOT NULL,    -- from aft.requested / POST /v1/aft
+  correlation_id             VARCHAR(64)  NOT NULL,
+  status                     VARCHAR(40)  NOT NULL,    -- state machine (see CHECK)
+  amount                     DECIMAL(18,2) NOT NULL,
+  currency                   CHAR(3)      NOT NULL,
+  business_application_id    VARCHAR(4)   NULL,        -- BAI, e.g. 'AA'
+  merchant_category_code     VARCHAR(4)   NULL,        -- MCC
+  acquiring_bin              VARCHAR(11)  NULL,
+  -- card: tokenized, never PAN
+  card_instrument_id         VARCHAR(64)  NULL,        -- Cybersource TMS id
+  card_fingerprint           VARCHAR(128) NULL,
+  card_last4                 CHAR(4)      NULL,
+  card_exp_month             TINYINT UNSIGNED NULL,
+  card_exp_year              SMALLINT UNSIGNED NULL,
+  -- Visa request identifiers
+  systems_trace_audit_number INT UNSIGNED NULL,        -- STAN
+  retrieval_reference_number VARCHAR(12)  NULL,        -- RRN
+  local_transaction_datetime DATETIME(3)  NULL,
+  transmission_datetime      DATETIME(3)  NULL,
+  -- 3DS data carried from cardload
+  cavv                       VARCHAR(64)  NULL,
+  eci                        VARCHAR(4)   NULL,
+  xid                        VARCHAR(64)  NULL,
+  ds_transaction_id          VARCHAR(64)  NULL,
+  spec_version               VARCHAR(10)  NULL,
+  -- Visa response
+  action_code                VARCHAR(4)   NULL,        -- 00 = approved
+  approval_code              VARCHAR(10)  NULL,
+  transaction_identifier     VARCHAR(40)  NULL,        -- Visa transactionIdentifier
+  response_code              VARCHAR(4)   NULL,
+  status_identifier          VARCHAR(40)  NULL,        -- for the GET status query
+  settlement_date            DATE         NULL,
+  created_at                 DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at                 DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  version                    INT          NOT NULL DEFAULT 0,
+  UNIQUE KEY uk_aft_ref  (transaction_ref),
+  UNIQUE KEY uk_aft_idem (idempotency_key),
+  KEY idx_aft_status (status),
+  KEY idx_aft_txnid (transaction_identifier),
+  KEY idx_aft_status_id (status_identifier),
+  KEY idx_aft_stan (acquiring_bin, systems_trace_audit_number),
+  KEY idx_aft_created (created_at),
+  CONSTRAINT chk_aft_status CHECK (status IN (
+    'RECEIVED','LIMIT_CHECK','REJECTED_LIMIT','AFT_SUBMITTED','AFT_APPROVED','AFT_DECLINED',
+    'STATUS_QUERY','REVERSAL_SUBMITTED','REVERSED','ADJUSTMENT_SUBMITTED','ADJUSTED',
+    'OCT_SUBMITTED','REFUNDED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### `aft_correction` — reversal / adjustment / refund
+
+```sql
+CREATE TABLE aft_correction (
+  id                              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  aft_transaction_id              BIGINT UNSIGNED NOT NULL,
+  type                            VARCHAR(20)  NOT NULL,   -- REVERSAL/ADJUSTMENT/REFUND
+  idempotency_key                 VARCHAR(64)  NULL,
+  status                          VARCHAR(20)  NOT NULL,   -- SUBMITTED/COMPLETED/FAILED
+  amount                          DECIMAL(18,2) NULL,
+  currency                        CHAR(3)      NULL,
+  reason                          VARCHAR(255) NULL,
+  -- original-transaction reference (originalDataElements for a reversal)
+  original_stan                   INT UNSIGNED NULL,
+  original_transmission_datetime  DATETIME(3)  NULL,
+  original_approval_code          VARCHAR(10)  NULL,
+  original_transaction_identifier VARCHAR(40)  NULL,
+  -- this correction's own Visa identifiers/response
+  systems_trace_audit_number      INT UNSIGNED NULL,
+  action_code                     VARCHAR(4)   NULL,
+  visa_transaction_identifier     VARCHAR(40)  NULL,
+  status_identifier               VARCHAR(40)  NULL,
+  created_at                      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at                      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_corr_idem (idempotency_key),
+  KEY idx_corr_aft (aft_transaction_id),
+  CONSTRAINT fk_corr_aft FOREIGN KEY (aft_transaction_id) REFERENCES aft_transaction(id),
+  CONSTRAINT chk_corr_type   CHECK (type IN ('REVERSAL','ADJUSTMENT','REFUND')),
+  CONSTRAINT chk_corr_status CHECK (status IN ('SUBMITTED','COMPLETED','FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### `visa_call` — audit of every Visa Direct request/response
+
+```sql
+CREATE TABLE visa_call (
+  id                         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  aft_transaction_id         BIGINT UNSIGNED NULL,     -- null for standalone eligibility (PAAI) calls
+  operation                  VARCHAR(30)  NOT NULL,    -- AFT_PULL/REVERSE/ADJUST/OCT/STATUS_QUERY/PAAI
+  endpoint                   VARCHAR(120) NULL,
+  systems_trace_audit_number INT UNSIGNED NULL,
+  http_status                SMALLINT     NULL,
+  action_code                VARCHAR(4)   NULL,
+  transaction_identifier     VARCHAR(40)  NULL,
+  status_identifier          VARCHAR(40)  NULL,
+  request_json               JSON         NULL,        -- scrubbed; PAN is MLE-encrypted, never stored in clear
+  response_json              JSON         NULL,        -- scrubbed
+  latency_ms                 INT          NULL,
+  created_at                 DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_vc_aft (aft_transaction_id),
+  KEY idx_vc_op (operation),
+  CONSTRAINT fk_vc_aft FOREIGN KEY (aft_transaction_id) REFERENCES aft_transaction(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### `limit_config` — active authorization-limit thresholds (counters are in Redis)
+
+```sql
+CREATE TABLE limit_config (
+  id             BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  version        INT          NOT NULL,
+  config_json    JSON         NOT NULL,   -- perTxnMax, allowedCurrencies/Bai/Mcc, perCardDailyMax, perCardVelocity, perBinDailyMax, globalDailyCeiling
+  source         VARCHAR(40)  NOT NULL,   -- 'config' | 'admin:limits.updated'
+  effective_from DATETIME(3)  NOT NULL,
+  created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_limit_version (version)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### `aft_state_transition`, `outbox`, `processed_event`
+
+```sql
+CREATE TABLE aft_state_transition (
+  id                 BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  aft_transaction_id BIGINT UNSIGNED NOT NULL,
+  from_status        VARCHAR(40)  NULL,
+  to_status          VARCHAR(40)  NOT NULL,
+  reason             VARCHAR(255) NULL,
+  event_ref          VARCHAR(36)  NULL,
+  created_at         DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_aftst_txn (aft_transaction_id, created_at),
+  CONSTRAINT fk_aftst_txn FOREIGN KEY (aft_transaction_id) REFERENCES aft_transaction(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Transactional outbox (produced events) + inbox (consumed-event dedup)
+CREATE TABLE outbox (
+  id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  event_id     CHAR(36)     NOT NULL,    -- envelope.eventId
+  event_type   VARCHAR(64)  NOT NULL,    -- aft.completed/declined/reversed/adjusted/refunded
+  aggregate_id VARCHAR(48)  NOT NULL,    -- transaction_ref (partition/ordering key)
+  payload      JSON         NOT NULL,
+  status       VARCHAR(20)  NOT NULL DEFAULT 'PENDING',  -- PENDING/PUBLISHED/FAILED
+  attempts     INT          NOT NULL DEFAULT 0,
+  available_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  published_at DATETIME(3)  NULL,
+  created_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_outbox_event (event_id),
+  KEY idx_outbox_dispatch (status, available_at),
+  CONSTRAINT chk_outbox_status CHECK (status IN ('PENDING','PUBLISHED','FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE processed_event (
+  event_id     CHAR(36)    NOT NULL PRIMARY KEY,   -- consumed envelope.eventId (aft.requested / aft.reversal.requested / limits.updated)
+  event_type   VARCHAR(64) NOT NULL,
+  aft_ref      VARCHAR(48) NULL,
+  processed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> **Notes.** STAN must be unique per `(acquiring_bin, transmission_date)` — allocate it
+> deterministically from `idempotency_key` so a retry reuses the same trace (exactly-once).
+> JSON columns are scrubbed of PAN/PII; manage all DDL with Flyway.
+
+### dbdiagram (DBML)
+
+Paste into [dbdiagram.io](https://dbdiagram.io):
+
+```
+// DBML for tc-card-network-service — paste into https://dbdiagram.io
+
+Enum aft_status {
+  RECEIVED
+  LIMIT_CHECK
+  REJECTED_LIMIT
+  AFT_SUBMITTED
+  AFT_APPROVED
+  AFT_DECLINED
+  STATUS_QUERY
+  REVERSAL_SUBMITTED
+  REVERSED
+  ADJUSTMENT_SUBMITTED
+  ADJUSTED
+  OCT_SUBMITTED
+  REFUNDED
+}
+
+Enum correction_type {
+  REVERSAL
+  ADJUSTMENT
+  REFUND
+}
+
+Enum correction_status {
+  SUBMITTED
+  COMPLETED
+  FAILED
+}
+
+Enum outbox_status {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+Table aft_transaction {
+  id bigint [pk, increment]
+  transaction_ref varchar(48) [not null, unique, note: 'business id = cardload topup transactionId']
+  idempotency_key varchar(64) [not null, unique]
+  correlation_id varchar(64) [not null]
+  status aft_status [not null]
+  amount decimal(18,2) [not null]
+  currency char(3) [not null]
+  business_application_id varchar(4) [note: 'BAI, e.g. AA']
+  merchant_category_code varchar(4)
+  acquiring_bin varchar(11)
+  card_instrument_id varchar(64) [note: 'Cybersource TMS id — never PAN']
+  card_fingerprint varchar(128)
+  card_last4 char(4)
+  card_exp_month tinyint
+  card_exp_year smallint
+  systems_trace_audit_number int [note: 'STAN']
+  retrieval_reference_number varchar(12) [note: 'RRN']
+  local_transaction_datetime datetime
+  transmission_datetime datetime
+  cavv varchar(64)
+  eci varchar(4)
+  xid varchar(64)
+  ds_transaction_id varchar(64)
+  spec_version varchar(10)
+  action_code varchar(4) [note: '00 = approved']
+  approval_code varchar(10)
+  transaction_identifier varchar(40) [note: 'Visa transactionIdentifier']
+  response_code varchar(4)
+  status_identifier varchar(40) [note: 'for GET status query']
+  settlement_date date
+  created_at datetime [not null, default: `now()`]
+  updated_at datetime [not null, default: `now()`]
+  version int [not null, default: 0]
+
+  indexes {
+    status [name: 'idx_aft_status']
+    transaction_identifier [name: 'idx_aft_txnid']
+    status_identifier [name: 'idx_aft_status_id']
+    (acquiring_bin, systems_trace_audit_number) [name: 'idx_aft_stan']
+    created_at [name: 'idx_aft_created']
+  }
+}
+
+Table aft_correction {
+  id bigint [pk, increment]
+  aft_transaction_id bigint [not null]
+  type correction_type [not null]
+  idempotency_key varchar(64) [unique]
+  status correction_status [not null]
+  amount decimal(18,2)
+  currency char(3)
+  reason varchar(255)
+  original_stan int
+  original_transmission_datetime datetime
+  original_approval_code varchar(10)
+  original_transaction_identifier varchar(40)
+  systems_trace_audit_number int
+  action_code varchar(4)
+  visa_transaction_identifier varchar(40)
+  status_identifier varchar(40)
+  created_at datetime [not null, default: `now()`]
+  updated_at datetime [not null, default: `now()`]
+
+  indexes {
+    aft_transaction_id [name: 'idx_corr_aft']
+  }
+}
+
+Table visa_call {
+  id bigint [pk, increment]
+  aft_transaction_id bigint [note: 'null for standalone PAAI eligibility']
+  operation varchar(30) [not null, note: 'AFT_PULL/REVERSE/ADJUST/OCT/STATUS_QUERY/PAAI']
+  endpoint varchar(120)
+  systems_trace_audit_number int
+  http_status smallint
+  action_code varchar(4)
+  transaction_identifier varchar(40)
+  status_identifier varchar(40)
+  request_json json [note: 'scrubbed; PAN is MLE-encrypted, never in clear']
+  response_json json [note: 'scrubbed']
+  latency_ms int
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    aft_transaction_id [name: 'idx_vc_aft']
+    operation [name: 'idx_vc_op']
+  }
+}
+
+Table limit_config {
+  id bigint [pk, increment]
+  version int [not null, unique]
+  config_json json [not null]
+  source varchar(40) [not null, note: 'config | admin:limits.updated']
+  effective_from datetime [not null]
+  created_at datetime [not null, default: `now()`]
+}
+
+Table aft_state_transition {
+  id bigint [pk, increment]
+  aft_transaction_id bigint [not null]
+  from_status varchar(40)
+  to_status varchar(40) [not null]
+  reason varchar(255)
+  event_ref varchar(36)
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    (aft_transaction_id, created_at) [name: 'idx_aftst_txn']
+  }
+}
+
+Table outbox {
+  id bigint [pk, increment]
+  event_id char(36) [not null, unique]
+  event_type varchar(64) [not null]
+  aggregate_id varchar(48) [not null, note: 'transaction_ref / partition key']
+  payload json [not null]
+  status outbox_status [not null, default: 'PENDING']
+  attempts int [not null, default: 0]
+  available_at datetime [not null, default: `now()`]
+  published_at datetime
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    (status, available_at) [name: 'idx_outbox_dispatch']
+  }
+}
+
+Table processed_event {
+  event_id char(36) [pk]
+  event_type varchar(64) [not null]
+  aft_ref varchar(48)
+  processed_at datetime [not null, default: `now()`]
+}
+
+Ref: aft_correction.aft_transaction_id > aft_transaction.id
+Ref: visa_call.aft_transaction_id > aft_transaction.id
+Ref: aft_state_transition.aft_transaction_id > aft_transaction.id
+```
+
 ## Service API (inbound, from `tc-cardload-service`)
 
 | Method & path | Purpose |

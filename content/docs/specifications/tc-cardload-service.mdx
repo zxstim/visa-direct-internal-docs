@@ -404,6 +404,382 @@ Public documentation:
 - A late or duplicate 3DS callback for an already-resolved transaction is a no-op that
   returns the current state.
 
+## Database schema
+
+**MySQL 8.4 LTS / InnoDB, `utf8mb4`.** Design decisions:
+
+- **One saga aggregate (`topup`)** with child tables for each step's result. `topup` carries
+  **optimistic locking** (`version`) because the async event consumers and the 3DS callback
+  can update the same row concurrently.
+- **No PAN/CVV is stored** — only a Cybersource **TMS instrument id** plus masked display
+  fields and a **card fingerprint** (for correlation), matching
+  [Card data handling](#card-data-handling--pci).
+- **Idempotency on three edges:** a unique `idempotency_key` (create), an **inbox**
+  (`processed_event`) for consumed events, and a unique `event_id` in the **transactional
+  outbox** for produced events.
+- Money as `DECIMAL`; timestamps as `DATETIME(3)`; enums as `VARCHAR` + `CHECK` (enforced in
+  MySQL 8.0.16+); an append-only `topup_state_transition` log for audit/troubleshooting.
+
+```
+                         ┌───────────────────────────┐
+                         │           topup           │  (saga aggregate, optimistic-locked)
+                         └───────────────────────────┘
+            1:N  ┌──────────────┬──────────┴───────┬──────────────┬───────────────┐
+        fraud_screening  payer_authentication  aft_result   prefunding   topup_state_transition
+   (infra, not FK-linked):   outbox  ·  processed_event  (keyed by transaction_ref)
+```
+
+### `topup` — saga aggregate root
+
+```sql
+CREATE TABLE topup (
+  id                 BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  transaction_ref    VARCHAR(48)  NOT NULL,        -- business id (event envelope transactionId), e.g. topup-<uuidv7>
+  idempotency_key    VARCHAR(64)  NOT NULL,        -- from gateway/PVCB; dedupes the create
+  correlation_id     VARCHAR(64)  NOT NULL,        -- propagated from the gateway
+  pvcb_reference     VARCHAR(64)  NULL,            -- partner's own reference
+  status             VARCHAR(40)  NOT NULL,        -- state machine (see CHECK)
+  amount             DECIMAL(18,2) NOT NULL,
+  currency           CHAR(3)      NOT NULL,        -- 'USD'
+  -- card: tokenized, never PAN
+  card_instrument_id VARCHAR(64)  NULL,            -- Cybersource TMS instrument identifier
+  card_fingerprint   VARCHAR(128) NULL,            -- for correlation/limits, not PAN
+  card_last4         CHAR(4)      NULL,
+  card_brand         VARCHAR(20)  NULL,
+  card_exp_month     TINYINT UNSIGNED NULL,
+  card_exp_year      SMALLINT UNSIGNED NULL,
+  customer_ref       VARCHAR(64)  NULL,            -- merchantCustomerId / user id
+  -- denormalized outcome summary (authoritative detail in child tables)
+  fraud_enabled      BOOLEAN      NOT NULL DEFAULT TRUE,
+  fraud_decision     VARCHAR(20)  NULL,            -- ACCEPT/REJECT/REVIEW/SKIPPED
+  threeds_status     VARCHAR(40)  NULL,
+  aft_action_code    VARCHAR(4)   NULL,            -- Visa actionCode (00 = approved)
+  aft_txn_id         VARCHAR(40)  NULL,            -- Visa transactionIdentifier
+  reject_reason      VARCHAR(255) NULL,
+  challenge_expires_at DATETIME(3) NULL,           -- 3DS step-up timeout
+  created_at         DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at         DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  version            INT          NOT NULL DEFAULT 0,   -- JPA @Version
+  UNIQUE KEY uk_topup_ref  (transaction_ref),
+  UNIQUE KEY uk_topup_idem (idempotency_key),
+  KEY idx_topup_status (status),
+  KEY idx_topup_card_fp (card_fingerprint),
+  KEY idx_topup_created (created_at),
+  CONSTRAINT chk_topup_status CHECK (status IN (
+    'CREATED','AFT_ELIGIBILITY','FRAUD_SCREENING','IN_REVIEW',
+    'AUTH_SETUP','AUTH_ENROLLMENT','AWAITING_CHALLENGE','AUTH_VALIDATION',
+    'AFT_PULL','AFT_APPROVED','PREFUNDING','COMPLETED',
+    'REJECTED_INELIGIBLE','REJECTED_FRAUD','REJECTED_3DS','FAILED_AFT','FAILED_PREFUND'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### `fraud_screening` — Decision Manager result (1:N, allows retries)
+
+```sql
+CREATE TABLE fraud_screening (
+  id             BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id       BIGINT UNSIGNED NOT NULL,
+  provider       VARCHAR(40)  NOT NULL DEFAULT 'cybersource-decision-manager',
+  cs_decision_id VARCHAR(64)  NULL,               -- Cybersource decision response id
+  decision       VARCHAR(20)  NOT NULL,           -- ACCEPT/REJECT/REVIEW/ERROR
+  score          SMALLINT UNSIGNED NULL,          -- riskInformation.score.result (0-99)
+  profile_name   VARCHAR(64)  NULL,
+  rules_json     JSON         NULL,               -- triggered rules / infoCodes (no PAN/PII)
+  created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_fraud_topup (topup_id),
+  CONSTRAINT fk_fraud_topup FOREIGN KEY (topup_id) REFERENCES topup(id),
+  CONSTRAINT chk_fraud_decision CHECK (decision IN ('ACCEPT','REJECT','REVIEW','ERROR'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### `payer_authentication` — 3DS setup/enroll/validate (1:1, updated through the flow)
+
+```sql
+CREATE TABLE payer_authentication (
+  id                    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id              BIGINT UNSIGNED NOT NULL,
+  provider              VARCHAR(40)  NOT NULL DEFAULT 'cybersource-payer-authentication',
+  reference_id          VARCHAR(64)  NULL,        -- setup: consumerAuthenticationInformation.referenceId
+  authentication_txn_id VARCHAR(64)  NULL,        -- authenticationTransactionId
+  status                VARCHAR(40)  NULL,        -- PENDING_AUTHENTICATION / AUTHENTICATION_SUCCESSFUL / _FAILED
+  challenge_required    BOOLEAN      NULL,
+  -- results carried into the AFT authorization
+  cavv                  VARCHAR(64)  NULL,
+  eci                   VARCHAR(4)   NULL,
+  xid                   VARCHAR(64)  NULL,
+  ds_transaction_id     VARCHAR(64)  NULL,        -- directoryServerTransactionId
+  spec_version          VARCHAR(10)  NULL,        -- e.g. 2.2.0
+  pares_status          VARCHAR(4)   NULL,
+  created_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_pa_topup (topup_id),
+  CONSTRAINT fk_pa_topup FOREIGN KEY (topup_id) REFERENCES topup(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### `aft_result` & `prefunding` — outcomes consumed from downstream events
+
+```sql
+CREATE TABLE aft_result (
+  id                BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id          BIGINT UNSIGNED NOT NULL,
+  result            VARCHAR(20)  NOT NULL,        -- APPROVED/DECLINED/REVERSED
+  action_code       VARCHAR(4)   NULL,
+  approval_code     VARCHAR(10)  NULL,
+  visa_txn_id       VARCHAR(40)  NULL,            -- transactionIdentifier
+  status_identifier VARCHAR(40)  NULL,
+  created_at        DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_aft_topup (topup_id),
+  CONSTRAINT fk_aft_topup FOREIGN KEY (topup_id) REFERENCES topup(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE prefunding (
+  id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id        BIGINT UNSIGNED NOT NULL,
+  status          VARCHAR(20)  NOT NULL,          -- COMPLETED/FAILED
+  funded_amount   DECIMAL(20,2) NULL,             -- VND
+  funded_currency CHAR(3)      NULL,
+  fx_rate         DECIMAL(18,6) NULL,
+  reason          VARCHAR(255) NULL,
+  created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_pf_topup (topup_id),
+  CONSTRAINT fk_pf_topup FOREIGN KEY (topup_id) REFERENCES topup(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### `topup_state_transition` — append-only audit of the saga
+
+```sql
+CREATE TABLE topup_state_transition (
+  id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id    BIGINT UNSIGNED NOT NULL,
+  from_status VARCHAR(40)  NULL,
+  to_status   VARCHAR(40)  NOT NULL,
+  reason      VARCHAR(255) NULL,
+  event_ref   VARCHAR(36)  NULL,                  -- triggering event id, if any
+  created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_sttn_topup (topup_id, created_at),
+  CONSTRAINT fk_sttn_topup FOREIGN KEY (topup_id) REFERENCES topup(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+### `outbox` & `processed_event` — reliable, idempotent messaging
+
+```sql
+-- Transactional outbox: written in the same tx as the state change; a relay publishes it.
+CREATE TABLE outbox (
+  id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  event_id      CHAR(36)     NOT NULL,            -- envelope.eventId
+  event_type    VARCHAR(64)  NOT NULL,            -- aft.requested / prefunding.requested / partner.notification.requested / aft.reversal.requested
+  aggregate_id  VARCHAR(48)  NOT NULL,            -- transaction_ref (partition/ordering key)
+  payload       JSON         NOT NULL,            -- full event envelope
+  status        VARCHAR(20)  NOT NULL DEFAULT 'PENDING',  -- PENDING/PUBLISHED/FAILED
+  attempts      INT          NOT NULL DEFAULT 0,
+  available_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  published_at  DATETIME(3)  NULL,
+  created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_outbox_event (event_id),
+  KEY idx_outbox_dispatch (status, available_at),
+  CONSTRAINT chk_outbox_status CHECK (status IN ('PENDING','PUBLISHED','FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Inbox: dedupes consumed events so redelivery is a no-op (at-least-once delivery).
+CREATE TABLE processed_event (
+  event_id     CHAR(36)    NOT NULL PRIMARY KEY,  -- consumed envelope.eventId
+  event_type   VARCHAR(64) NOT NULL,
+  topup_ref    VARCHAR(48) NULL,
+  processed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> **Notes.** Partner webhooks are emitted as `partner.notification.requested` rows in
+> `outbox` (the gateway egress delivers them) — no separate table needed. JSON columns must
+> be **scrubbed of PAN/PII** before persisting. For high insert volume, prefer a time-ordered
+> id (UUIDv7/ULID) for `transaction_ref`/`event_id`; manage all DDL with Flyway.
+
+### dbdiagram (DBML)
+
+Paste into [dbdiagram.io](https://dbdiagram.io) to render the ER diagram:
+
+```
+// DBML for tc-cardload-service — paste into https://dbdiagram.io
+
+Enum topup_status {
+  CREATED
+  AFT_ELIGIBILITY
+  FRAUD_SCREENING
+  IN_REVIEW
+  AUTH_SETUP
+  AUTH_ENROLLMENT
+  AWAITING_CHALLENGE
+  AUTH_VALIDATION
+  AFT_PULL
+  AFT_APPROVED
+  PREFUNDING
+  COMPLETED
+  REJECTED_INELIGIBLE
+  REJECTED_FRAUD
+  REJECTED_3DS
+  FAILED_AFT
+  FAILED_PREFUND
+}
+
+Enum dm_decision {
+  ACCEPT
+  REJECT
+  REVIEW
+  ERROR
+}
+
+Enum outbox_status {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+Table topup {
+  id bigint [pk, increment]
+  transaction_ref varchar(48) [not null, unique, note: 'business id / event transactionId']
+  idempotency_key varchar(64) [not null, unique]
+  correlation_id varchar(64) [not null]
+  pvcb_reference varchar(64)
+  status topup_status [not null]
+  amount decimal(18,2) [not null]
+  currency char(3) [not null]
+  card_instrument_id varchar(64) [note: 'Cybersource TMS id — never PAN']
+  card_fingerprint varchar(128)
+  card_last4 char(4)
+  card_brand varchar(20)
+  card_exp_month tinyint
+  card_exp_year smallint
+  customer_ref varchar(64)
+  fraud_enabled boolean [not null, default: true]
+  fraud_decision varchar(20) [note: 'ACCEPT/REJECT/REVIEW/SKIPPED']
+  threeds_status varchar(40)
+  aft_action_code varchar(4)
+  aft_txn_id varchar(40)
+  reject_reason varchar(255)
+  challenge_expires_at datetime
+  created_at datetime [not null, default: `now()`]
+  updated_at datetime [not null, default: `now()`]
+  version int [not null, default: 0]
+
+  indexes {
+    status [name: 'idx_topup_status']
+    card_fingerprint [name: 'idx_topup_card_fp']
+    created_at [name: 'idx_topup_created']
+  }
+}
+
+Table fraud_screening {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
+  provider varchar(40) [not null, default: 'cybersource-decision-manager']
+  cs_decision_id varchar(64)
+  decision dm_decision [not null]
+  score smallint
+  profile_name varchar(64)
+  rules_json json
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    topup_id [name: 'idx_fraud_topup']
+  }
+}
+
+Table payer_authentication {
+  id bigint [pk, increment]
+  topup_id bigint [not null, unique]
+  provider varchar(40) [not null, default: 'cybersource-payer-authentication']
+  reference_id varchar(64)
+  authentication_txn_id varchar(64)
+  status varchar(40)
+  challenge_required boolean
+  cavv varchar(64)
+  eci varchar(4)
+  xid varchar(64)
+  ds_transaction_id varchar(64)
+  spec_version varchar(10)
+  pares_status varchar(4)
+  created_at datetime [not null, default: `now()`]
+  updated_at datetime [not null, default: `now()`]
+}
+
+Table aft_result {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
+  result varchar(20) [not null]
+  action_code varchar(4)
+  approval_code varchar(10)
+  visa_txn_id varchar(40)
+  status_identifier varchar(40)
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    topup_id [name: 'idx_aft_topup']
+  }
+}
+
+Table prefunding {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
+  status varchar(20) [not null]
+  funded_amount decimal(20,2)
+  funded_currency char(3)
+  fx_rate decimal(18,6)
+  reason varchar(255)
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    topup_id [name: 'idx_pf_topup']
+  }
+}
+
+Table topup_state_transition {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
+  from_status varchar(40)
+  to_status varchar(40) [not null]
+  reason varchar(255)
+  event_ref varchar(36)
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    (topup_id, created_at) [name: 'idx_sttn_topup']
+  }
+}
+
+Table outbox {
+  id bigint [pk, increment]
+  event_id char(36) [not null, unique]
+  event_type varchar(64) [not null]
+  aggregate_id varchar(48) [not null, note: 'transaction_ref / partition key']
+  payload json [not null]
+  status outbox_status [not null, default: 'PENDING']
+  attempts int [not null, default: 0]
+  available_at datetime [not null, default: `now()`]
+  published_at datetime
+  created_at datetime [not null, default: `now()`]
+
+  indexes {
+    (status, available_at) [name: 'idx_outbox_dispatch']
+  }
+}
+
+Table processed_event {
+  event_id char(36) [pk]
+  event_type varchar(64) [not null]
+  topup_ref varchar(48)
+  processed_at datetime [not null, default: `now()`]
+}
+
+Ref: fraud_screening.topup_id > topup.id
+Ref: payer_authentication.topup_id - topup.id
+Ref: aft_result.topup_id > topup.id
+Ref: prefunding.topup_id > topup.id
+Ref: topup_state_transition.topup_id > topup.id
+```
+
 ## Observability
 
 - Correlate on `txnId` end-to-end (propagate the gateway's `correlation-id`).
