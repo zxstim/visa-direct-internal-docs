@@ -1,0 +1,112 @@
+---
+title: Development Timeline
+description: Build plan for a 2 backend + 2 Flutter team — 5 backend services functional by Jul 15 (no hardening), tc-admin-service + portal integration by Jul 30, hardening after.
+---
+
+## Plan at a glance
+
+Team: **2 backend (BE-A, BE-B) + 2 Flutter (FE-A, FE-B)**, fully dedicated.
+
+- **Phase 1 — Jul 15:** `tc-api-gateway`, `tc-cardload-service`, `tc-card-network-service`,
+  `tc-ledger-service`, `tc-settlement-reconciliation-service` **functionally complete (no
+  hardening)** — the end-to-end top-up works in sandbox. Flutter builds the full portal UI
+  against mocks in parallel.
+- **Phase 2 — Jul 30:** `tc-admin-service` backend + **portal integration** (the portal
+  goes live against the real backend).
+- **Phase 3 — after Jul 30:** hardening (security/PCI, perf, gateway custom plugins, full
+  reversal/adjustment/refund, production cert).
+
+**Feasibility:** the 5 Phase-1 services are ~10 developer-weeks of *functional* work against
+~11 dev-weeks of backend capacity — achievable **only if "no hardening" is held strictly**
+and the external sandboxes are ready on day 1. There is little slack; **reconciliation is
+the long pole most likely to slip** (see [risks](#assumptions--risks)).
+
+Track split: **BE-A** = Visa rails + reconciliation; **BE-B** = gateway + orchestrator +
+ledger. Flutter works **contract-first** against mocks. Days 1–2 both backend devs pair on
+foundations, then split.
+
+## Phase 1 — Jun 9 → Jul 15 (5 services functional, no hardening)
+
+| Component | Task | Start | End | PIC |
+| --- | --- | --- | --- | --- |
+| Platform | Repos, CI/CD, Kafka + Redis + MySQL, shared libs (envelope/outbox/idempotency) | Jun 9 | Jun 13 | BE-A + BE-B |
+| tc-api-gateway | Kong deploy (DB-less, decK, TLS, routing, JWT auth, 3DS callback + forward) — minimal, no custom Lua | Jun 9 | Jun 13 | BE-B |
+| tc-card-network-service | Scaffold + Visa VDP sandbox connectivity (mTLS, MLE, x-pay-token) | Jun 15 | Jun 18 | BE-A |
+| tc-card-network-service | AFT pull (`pullfundstransactions`) + 3DS (cavv/eci) passthrough + actionCode | Jun 18 | Jun 23 | BE-A |
+| tc-card-network-service | Authorization limits (config-driven) + exactly-once (STAN, GET-on-timeout) + minimal reversal | Jun 24 | Jun 27 | BE-A |
+| tc-card-network-service | Events (consume aft.requested; produce aft.completed/declined/reversed) | Jun 29 | Jul 1 | BE-A |
+| tc-settlement-reconciliation-service | Scaffold + SFTP fetch + secure storage + file dedupe | Jul 2 | Jul 4 | BE-A |
+| tc-settlement-reconciliation-service | VSS/TC46 parser (pluggable) + control-total validation (sample files) | Jul 6 | Jul 9 | BE-A |
+| tc-settlement-reconciliation-service | Canonical model + read model (consume aft.*/prefunding.* events) | Jul 9 | Jul 11 | BE-A |
+| tc-settlement-reconciliation-service | 3-way matching engine + outcomes + settlement.matched/break events | Jul 13 | Jul 15 | BE-A |
+| tc-cardload-service | Scaffold + state machine + persistence (Flyway) | Jun 15 | Jun 18 | BE-B |
+| tc-cardload-service | Cybersource client (HTTP signature/JWT, MLE, sandbox) | Jun 18 | Jun 20 | BE-B |
+| tc-cardload-service | Fraud component — Decision Manager (`/risk/v1/decisions`) + toggle | Jun 22 | Jun 26 | BE-B |
+| tc-cardload-service | Payer-auth component — setup/enroll/validate (3DS 2.x) | Jun 29 | Jul 3 | BE-B |
+| tc-cardload-service | Orchestrator saga + events (aft.requested, prefunding.requested, partner.notification) | Jul 4 | Jul 8 | BE-B |
+| tc-ledger-service | Scaffold + double-entry schema + chart of accounts (Flyway) | Jul 9 | Jul 10 | BE-B |
+| tc-ledger-service | Posting engine + consumers (aft.*, prefunding.*, settlement.matched) + exposure limit | Jul 10 | Jul 14 | BE-B |
+| tc-ledger-service | Balance/exposure queries | Jul 14 | Jul 15 | BE-B |
+| Integration | E2E happy path (top-up → DM → 3DS → AFT sandbox → ledger/prefund) + recon w/ sample file | Jul 14 | Jul 15 | BE-A + BE-B |
+| tc-admin-portal | Scaffold (Flutter web, Riverpod, GoRouter, Dio) + mock API + design system | Jun 9 | Jun 13 | FE-A + FE-B |
+| tc-admin-portal | Auth: login + session/CSRF + TOTP screens (vs mock) | Jun 15 | Jun 24 | FE-A |
+| tc-admin-portal | Sign-up + pending-approval + account-admin screens (vs mock) | Jun 15 | Jun 24 | FE-B |
+| tc-admin-portal | Limits maker-checker UI (propose/approve/diff/history) | Jun 25 | Jul 3 | FE-A |
+| tc-admin-portal | Dashboards (live auth / settlement / exposure, charts) | Jun 25 | Jul 3 | FE-B |
+| tc-admin-portal | Audit viewer + activity telemetry (route observer, tracked widgets) | Jul 6 | Jul 11 | FE-A |
+| tc-admin-portal | Passkey WebAuthn interop + RBAC/tag-aware rendering | Jul 6 | Jul 11 | FE-B |
+| tc-admin-portal | UI polish + integration-prep | Jul 13 | Jul 15 | FE-A + FE-B |
+
+## Phase 2 — Jul 16 → Jul 30 (tc-admin-service + portal integration)
+
+Both backend devs are free after Jul 15; the portal wires to the real backend.
+
+| Component | Task | Start | End | PIC |
+| --- | --- | --- | --- | --- |
+| tc-admin-service | Spring Security session + email/password + sign-up + super-admin approval + RBAC/tags | Jul 16 | Jul 22 | BE-A |
+| tc-admin-service | TOTP factor + passkeys (WebAuthn) + MFA authorization | Jul 23 | Jul 28 | BE-A |
+| tc-admin-service | Authorization-limits CRUD (maker-checker) + `limits.updated` publish | Jul 16 | Jul 21 | BE-B |
+| tc-admin-service | Activity ingest API + audit trail (append-only, hash-chained) | Jul 22 | Jul 25 | BE-B |
+| tc-admin-service | Dashboard read models + ops APIs + `/api/auth/me` | Jul 26 | Jul 30 | BE-B |
+| tc-admin-portal | Integrate real `tc-admin-service` (auth/MFA/limits/dashboards/audit); finish passkeys; remove mocks | Jul 16 | Jul 30 | FE-A + FE-B |
+
+## Phase 3 — after Jul 30 (hardening, dates TBD)
+
+| Component | Deferred hardening |
+| --- | --- |
+| tc-api-gateway | Custom Lua plugins (`tc-jws-verify`, `tc-auth-limit`), signed webhook egress, full edge limits |
+| tc-card-network-service | Full reversal + adjustment + OCT refund suite; PAAI eligibility |
+| tc-settlement-reconciliation-service | Full VSS report set, break-resolution workflow, real settlement files |
+| All services | Security + PCI review, perf/load testing, fail-closed edge cases, idempotency soak |
+| Platform | Production cert (Visa/Cybersource), pilot prep |
+
+## Milestones
+
+| Milestone | Date | Exit criteria |
+| --- | --- | --- |
+| M1 — Foundations + skeletons | Jun 13 | Repos, CI, Kafka/Redis/MySQL, shared libs, Kong up; portal scaffold + mocks |
+| M2 — AFT + DM in sandbox | Jun 26 | Card pulled in Visa sandbox; Decision Manager screening; config limits enforced |
+| M3 — 3DS + orchestration | Jul 3 | Payer-auth 3DS round-trip; cardload saga driving the flow via events |
+| M4 — Rails integrated | Jul 11 | Ledger posts from events; recon parser + matching built (sample files) |
+| **M5 — 5 services functional** | **Jul 15** | E2E happy path + reconciliation (sample file) demonstrated in sandbox |
+| M6 — Admin + portal live | Jul 30 | `tc-admin-service` complete; portal integrated against the real backend |
+
+## Assumptions & risks
+
+1. **"No hardening" is load-bearing.** Phase 1 fits only as *functional happy path* — minimal
+   error handling, config-driven limits, no custom gateway plugins, no security/perf pass.
+   Treat outputs as sandbox-grade until Phase 3.
+2. **Reconciliation is the long pole.** It sits in BE-A's back half (Jul 2–15) and can only be
+   fully tested once card-network/cardload emit events (~Jul 8+). If anything upstream slips,
+   **recon is the first item to slide past Jul 15** — descope its matching depth before
+   sacrificing the rails.
+3. **External sandboxes on day 1 are the critical path.** Visa Developer (VDP) + test BIN and
+   Cybersource sandbox credentials must be live from Jun 9; the AFT/3DS tracks and the Jul 15
+   demo depend on them.
+4. **Limits via config until Phase 2.** Authorization limits are seeded/config-managed until
+   the admin CRUD UI ships Jul 16–30.
+5. **Portal integrates in Phase 2.** Through Jul 15 the portal is UI-complete on mocks; it
+   talks to a real `tc-admin-service` only from Jul 16.
+6. **Little slack.** With 2 backend devs this is near-full utilization — a sustained blocker
+   (env, sandbox, or a hard Visa/Cybersource integration bug) is the realistic threat to the
+   Jul 15 date, not coding speed.
