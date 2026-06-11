@@ -1,608 +1,899 @@
 ---
 title: tc-cardload-service
-description: Orchestration service for the Visa Direct top-up flow — Cybersource Decision Manager (fraud) and Payer Authentication (3DS) split into two independently configurable components.
+description: Synchronous top-up orchestrator — five modules (Cybersource Tokenization, Decision Manager, Payer Authentication, Visa Direct, Foreign Exchange). Every PVCB request returns a response; the 3DS break is bridged by a redirect + a /top-up-status poll, no webhook. Fault-tolerant by design — no combination of external-API outages or a crash of this service can lose money, double-charge, or leave PVCB without a definitive status.
 permission: member
 ---
 
 ## Purpose & scope
 
-`tc-cardload-service` is the **orchestrator** of a single top-up. It receives a verified
-top-up request from [`tc-api-gateway`](/docs/specifications/tc-api-gateway), runs the
-risk and authentication checks, drives the Visa Direct AFT pull (via
-`tc-card-network-service`), and reports every outcome back to PVCB through the gateway's
-signed webhook egress.
+`tc-cardload-service` orchestrates a single top-up **synchronously**. It receives a verified
+request from [`tc-api-gateway`](/docs/specifications/tc-api-gateway), screens and authenticates
+the card with Cybersource, executes the **Visa Direct AFT pull**, **records the Visa FX rate**,
+drives prefunding, **records the outcome**, and **returns the result in the response** — there is
+**no webhook push back to PVCB**.
 
-Risk and authentication are handled **entirely by Cybersource**:
+> **Why no webhook.** PVCB does not want an asynchronous push. Their concern: if this service
+> has an issue mid-flow, a pushed update could be lost and the top-up on PVCB's side would hang
+> **pending forever**. So the contract is: **every PVCB request gets a response**, and PVCB
+> **polls** [`/v1/top-up-status`](#interaction-model--synchronous-response--polling) for any
+> outcome that cannot complete inside that response.
 
-- **Fraud screening** → **Cybersource Decision Manager (DM)**.
-- **3-D Secure / SCA** → **Cybersource Payer Authentication**.
+It is built as **five modules** behind a synchronous orchestrator:
 
-Because Decision Manager must be able to be **turned off** (per environment, corridor, or
-incident), the two capabilities are built as **two distinct, independently configurable
-components** behind a common interface, sequenced by a small orchestrator. Turning DM off
-removes the fraud component from the pipeline without touching the authentication
-component or the rest of the flow.
+| Module | Responsibility | Cybersource / Visa |
+| --- | --- | --- |
+| **Tokenization** | exchange the Flex transient token → TMS id **+ network token (VTS)**; supply the right token to each leg (PAN never stored) | Cybersource Flex / TMS · VTS |
+| **Decision Manager** | fraud screening — **toggleable** | Cybersource Decision Manager |
+| **Payer Authentication** | 3-D Secure (setup → enrol → step-up → validate) | Cybersource Payer Authentication |
+| **Visa Direct** | **FTAI eligibility** (pre-screen, runs first), AFT pull, reversal, adjustment, OCT refund; authorization limits | Visa Direct / PAAI |
+| **Foreign Exchange** | fetch & cache Visa's daily FX rate; **snapshot it per transaction at authorization** as the settlement reference | Visa Foreign Exchange Rates |
 
-> This service handles card data and is in **PCI DSS scope**. The design below keeps the
-> raw PAN out of `tc-*` systems by using Cybersource tokenization — see
-> [Card data handling](#card-data-handling--pci).
+> Capture is **client-side (Flex)** and only **tokens** flow through `tc-*` — the Cybersource
+> token on the Cybersource legs, a **network token + cryptogram** on the Visa legs. The **raw PAN
+> never enters `tc-*`**, which **minimizes PCI scope**.
+
+## Resilience & fault tolerance
+
+This service moves money, so it is built to a hard standard:
+
+> **No combination of external-API outages — or a crash of this service itself — can lose
+> money, double-charge a card, or leave PVCB without a definitive answer.** The worst possible
+> outcome is a **delay**, never a loss or an ambiguity.
+
+That property is not luck; it falls out of a small set of deliberate design decisions:
+
+| Design decision | What it buys |
+| --- | --- |
+| **Persist-first, write-ahead status** — the `topup` row is written before any work, and the status is committed **before** each external call ([Status tracking](#status-tracking-persist-first)) | the exact stage is always on disk — the **database is the source of truth, not the call stack or the network** |
+| **Synchronous + polling, no push** | PVCB never waits on us to call them — they poll [`/top-up-status`](#interaction-model--synchronous-response--polling), which always returns a definitive state |
+| **One money-moving step** — only the Visa AFT pulls funds; everything before it is retry-safe | the blast radius of any failure before the AFT is **zero** |
+| **Exactly-once Visa** — unique STAN, GET-status-on-timeout, **never blind-resend**, reversal-to-cancel | an uncertain AFT is **resolved, never guessed** → no double pull, no stranded funds |
+| **Autonomous reaper** — recovery runs independently of the request thread/process | stuck transactions converge to a terminal state **even if the original request, thread, or process is gone** |
+| **Money state recorded only after the provider confirms** | a crash never records a phantom approval or advance — and there is no ledger to leave one in |
+| **Reconciliation backstop (T+n)** | the settlement file is the final proof that every settled transaction ties to a record |
+
+### Tolerance under cascading failure
+
+The guarantee holds under **any** of these failures — including all of them at once:
+
+| Failure | What happens | Money at risk? | PVCB sees |
+| --- | --- | --- | --- |
+| **Cybersource down** (tokenization / DM / 3DS) | pre-money failure, recorded with `error_code`, `retryable: true` | **none** — no money moved | `FAILED` (retryable) → retry as a new top-up |
+| **Visa Direct down** | AFT can't start (no money moved) → `FAILED`; or an in-flight AFT stays `AFT_PROCESSING` and is resolved by GET-status / reverse when Visa returns | **none** — never double-pulled or lost | `FAILED`, or `AFT_PROCESSING` (keep polling) |
+| **Both Cybersource *and* Visa down** | the transaction is parked at a **known non-terminal stage**; the reaper retries with backoff until a provider recovers, then resolves it | **none** | a non-terminal status — **never "pending forever"** |
+| **This service crashes** (any stage) | persisted status + STAN let the reaper resume exactly where it left off — `< AFT_SUBMITTED` → `FAILED`; `AFT_SUBMITTED` → GET-status/reverse; `AFT_APPROVED` → finish prefund or reverse | **none** — provably reversed or booked | the last committed status, then a terminal one |
+| **All of the above simultaneously** | the record survives (persist-first); no money moves without a confirmed AFT; the reaper resolves when providers recover; reconciliation catches any residual mismatch | **none unaccounted** | always a definitive status within a bounded time |
+
+The mechanics — error classification, in-call record-and-propagate, the AFT exactly-once path,
+the crash-recovery-by-stage table, and the guarantees summary — are in
+[Error handling & recovery](#error-handling--recovery-money-movement-safe).
 
 ## Technical stack
 
-JDK 25, Spring Boot 4.0+ (Maven), Spring Data JPA on MySQL 8.4 LTS; messaging via **Spring
-Cloud Stream** (broker-abstracted — Kafka/RabbitMQ/cloud). This service is the **saga
-orchestrator** for the top-up
-(see [Architecture & service interaction](/docs/specifications/architecture)). Calls to
-Cybersource are **synchronous HTTPS**; coordination with the other `tc-*` services is
-**asynchronous events over Spring Cloud Stream**.
+JDK 25, Spring Boot 4.0+ (Maven), Spring Data JPA on MySQL 8.4 LTS. **All integration is
+synchronous** via `RestClient`: the module clients (Cybersource Tokenization, DM, Payer Auth;
+Visa Direct + the **Visa Foreign Exchange Rates API** over mTLS + MLE) and PVCB Core Banking
+(prefunding). It does **not** call `tc-settlement-service` — the reconciler reads the legs from
+here. No messaging/broker. See [Architecture](/docs/specifications/architecture).
+
+## Getting started (provider APIs, SDKs & sandboxes)
+
+Before writing code, get sandbox access and skim the API references for the legs this service
+orchestrates. There are **two providers** — **Cybersource** (tokenization, fraud, 3DS) and
+**Visa** (FTAI eligibility, AFT, FX).
+
+### Cybersource
+
+- **API reference (all REST APIs):**
+  [developer.cybersource.com/api-reference-assets](https://developer.cybersource.com/api-reference-assets/index.html)
+  — the modules here use **Token Management / Flex**, **Decision Manager** (`/risk/v1/decisions`),
+  and **Payer Authentication** (`/risk/v1/authentication-*`).
+- **Java SDK + runnable samples:**
+  [github.com/CyberSource/cybersource-rest-samples-java](https://github.com/CyberSource/cybersource-rest-samples-java)
+  — **clone this first.** It has working auth (HTTP Signature / JWT), Flex, DM, and Payer-Auth
+  examples; use it to validate sandbox credentials before integrating.
+- **Sandbox / setup:** a Cybersource sandbox merchant + REST keys (HTTP Signature or JWT/P12).
+  Network tokenization needs Cybersource enabled as your **VTS token requestor** (with
+  **AFT cryptogram** support) — request this.
+
+### Visa (Visa Developer Platform / VDP)
+
+- **Visa Direct** (AFT / OCT / reversal):
+  [developer.visa.com/capabilities/visa_direct](https://developer.visa.com/capabilities/visa_direct)
+- **FTAI eligibility (PAAI):**
+  [developer.visa.com/capabilities/paai/reference](https://developer.visa.com/capabilities/paai/reference)
+- **Foreign Exchange Rates:**
+  [developer.visa.com/capabilities/foreign_exchange/reference](https://developer.visa.com/capabilities/foreign_exchange/reference)
+- **Sandbox / setup:** a VDP project with **Visa Direct**, **PAAI**, and **Foreign Exchange**
+  capabilities added; provision **mTLS** (Two-Way SSL) certs, the **`x-pay-token`** credentials,
+  and the **MLE** key pair. Confirm **AFT program** enrollment + the granted **BIN / TPS** with
+  your Visa rep.
+
+### Map — module → API
+
+| Module / step | Provider API | Reference |
+| --- | --- | --- |
+| Tokenization | Cybersource Flex / TMS (+ VTS network token) | [Cybersource API ref](https://developer.cybersource.com/api-reference-assets/index.html) |
+| FTAI eligibility | Visa PAAI — Funds Transfer Attributes Inquiry | [PAAI ref](https://developer.visa.com/capabilities/paai/reference) |
+| Decision Manager | Cybersource Risk — `/risk/v1/decisions` | [Cybersource API ref](https://developer.cybersource.com/api-reference-assets/index.html) |
+| Payer Authentication | Cybersource — `/risk/v1/authentication-*` | [Cybersource API ref](https://developer.cybersource.com/api-reference-assets/index.html) |
+| FX snapshot | Visa Foreign Exchange Rates | [FX ref](https://developer.visa.com/capabilities/foreign_exchange/reference) |
+| Visa Direct AFT | Visa Direct — `pullfundstransactions` | [Visa Direct](https://developer.visa.com/capabilities/visa_direct) |
+
+### Build order (recommended)
+
+Build the **integration layer before the orchestration.** The two providers are the hard, risky
+part (auth, mTLS, MLE, cryptograms, their latency and quirks) — and per
+[Scalability](#scalability--throughput) they're also the real throughput ceiling — so prove them
+in isolation first, then layer the flow on top:
+
+1. **Integrate the provider clients first.** Pull in the **Cybersource Java SDK** for the
+   Cybersource legs (clone the
+   [samples](https://github.com/CyberSource/cybersource-rest-samples-java) to validate sandbox
+   credentials), and **write a small Visa client** — a thin `RestClient` wrapper — for the Visa
+   legs (**FTAI**, **AFT**, **FX**), since those VDP APIs have no turnkey Java SDK. Get auth
+   working end to end (HTTP Signature / JWT for Cybersource; mTLS + `x-pay-token` + MLE for Visa).
+2. **Test the clients on their own.** Exercise each call against the sandbox — happy path, error
+   responses, timeouts — and capture the **latency baselines**
+   ([Testing § provider benchmarks](#testing-requirements)) *before* any flow logic exists. A
+   green, benchmarked client layer is the foundation everything else sits on.
+3. **Build the described flow on top.** Only then compose the
+   [orchestration](#orchestration--lifecycle) — **persist-first, exactly-once, fail-closed** — over
+   clients you already trust.
+
+## Interaction model — synchronous response + polling
+
+The whole design turns on one rule: **PVCB never waits on a push from us.** Two cases:
+
+**1. No 3DS challenge (frictionless, or an early reject).** `POST /v1/topups` runs the entire
+flow inline — tokenize → FTAI → DM → 3DS (frictionless) → limits → fees → FX snapshot → AFT →
+prefund → record — and returns the **final result** in the (possibly multi-second) response. PVCB has its answer; no polling
+needed.
+
+**2. 3DS challenge required.** A human must authenticate (OTP / in-app / biometric / passkey),
+which can take minutes — too long to hold a connection. `POST /v1/topups` returns immediately:
+
+```json
+{ "transactionRef": "topup-…", "status": "CHALLENGE_REQUIRED",
+  "redirectUrl": "https://3ds.tc.example/step-up/…", "expiresAt": "2026-06-11T10:07:00Z" }
+```
+
+PVCB renders the `redirectUrl`; the customer authenticates at the issuer; the frontend calls
+back `POST /v1/topups/{ref}/3ds-complete`, which **resumes the synchronous flow** (validate →
+limits → fees → FX snapshot → AFT → prefund → record). **PVCB learns the outcome by polling
+`GET /v1/top-up-status/{ref}`.**
+
+### `/v1/top-up-status` (the poll endpoint)
+
+PVCB polls this for any transaction; it **always returns a definitive state** covering both the
+3DS stage and the Visa stage:
+
+| `status` | Meaning | Terminal |
+| --- | --- | --- |
+| `PROCESSING` | initial inline processing (brief) | no |
+| `CHALLENGE_REQUIRED` | 3DS challenge issued; awaiting the customer | no |
+| `CHALLENGE_EXPIRED` | customer did not complete 3DS within the window | **yes** |
+| `REJECTED_FRAUD` | Decision Manager rejected | **yes** |
+| `REJECTED_3DS` | 3DS not authenticated | **yes** |
+| `REJECTED_LIMIT` | over an authorization limit | **yes** |
+| `AFT_PROCESSING` | Visa Direct AFT in flight | no |
+| `DECLINED` | Visa AFT declined | **yes** |
+| `APPROVED` | AFT approved, prefunded, booked | **yes** |
+| `FAILED` | unrecoverable system error | **yes** |
+
+> **Never "pending forever".** Because PVCB only polls (never depends on our push), and a
+> **reaper** job forces every stuck transaction to a terminal state on a TTL — a
+> `CHALLENGE_REQUIRED` past its window → `CHALLENGE_EXPIRED`; an AFT with an unknown result is
+> resolved via the Visa **GET-status / reversal** path → `APPROVED`/`DECLINED`/`FAILED` — every
+> poll converges to a terminal status within a bounded time, regardless of any fault here.
+
+## Status tracking (persist-first)
+
+The **very first thing** `POST /v1/topups` does — **before any module runs** — is persist a
+`topup` row with `status = CREATED` (plus `idempotency_key`, `correlation_id`, amount, and the
+tokenized card) in its own committed transaction. From that instant the transaction is
+queryable: a `/top-up-status` poll already returns `PROCESSING`. PVCB is therefore **never
+blind**, even if this service crashes a millisecond later.
+
+Thereafter **every stage transition is committed as it happens** — there is no in-memory-only
+state. At each step a module:
+
+1. Sets `topup.status` to the **in-progress** stage and appends a `topup_state_transition` row
+   **before** the external call — e.g. `FRAUD_SCREENING` before calling Decision Manager,
+   `AUTH_SETUP`/`AUTH_ENROLLMENT` before Payer Auth, `AFT_SUBMITTED` before the Visa AFT.
+2. Sets `topup.status` to the **result** stage after — e.g. `AFT_APPROVED` / `AFT_DECLINED`.
+
+So at any moment `topup.status` is exactly where the transaction is, and
+[`/top-up-status`](#interaction-model--synchronous-response--polling) is a **pure read** of it
+(mapped to the PVCB-facing value). The append-only `topup_state_transition` table keeps the
+**full ordered history** (from/to/reason/timestamp) for audit and support — every stage the
+transaction passed through, not just the current one.
+
+> **Why write the in-progress stage *before* the external call?** It is the money-movement
+> safety anchor: if the service dies while Visa is processing, the row already says
+> `AFT_SUBMITTED`, so the reaper resolves it via the Visa **GET-status / reversal** path rather
+> than guess. **The persisted status is the source of truth, not the call stack.**
+
+Example timeline (challenge path), each line a committed status:
+
+```
+t0  CREATED            ← persisted by POST /v1/topups, before any module
+t1  AFT_ELIGIBILITY → FRAUD_SCREENING → AUTH_SETUP → AUTH_ENROLLMENT
+t2  AWAITING_CHALLENGE ← POST returns redirectUrl;   /top-up-status = CHALLENGE_REQUIRED
+t3  AUTH_VALIDATION    ← 3ds-complete callback
+t4  LIMIT_CHECK → AFT_SUBMITTED                       /top-up-status = AFT_PROCESSING
+t5  AFT_APPROVED → PREFUNDING → COMPLETED             /top-up-status = APPROVED
+```
 
 ## Position in the flow
 
-The slice of the sequence diagram this service owns:
-
 ```
-gateway ──verified top-up──▶ tc-cardload-service
-                               │ 1. AFT eligibility  ──▶ tc-card-network-service ──▶ VISA Direct
-                               │ 2. Fraud screening  ──▶ Cybersource Decision Manager      (TOGGLEABLE)
-                               │ 3. Payer auth (3DS) ──▶ Cybersource Payer Authentication
-                               │      └─ challenge ──▶ (redirect URL back to PVCB → client)
-                               │ 4. (client 3DS done) ◀── gateway public callback
-                               │ 5. AFT pull         ──▶ tc-card-network-service ──▶ VISA Direct
-                               │ 6. Prefunding       ──▶ PVCB Core Banking
-                               └─ webhook outcome at each gate ──▶ gateway ──▶ PVCB
-```
-
-Note the ordering from the diagram: **fraud screening runs before payer authentication**,
-and the "redirect URL for 3DS" is the Payer Authentication step-up URL produced in step 3.
-
-## Component architecture (the two-component split)
-
-The headline requirement: fraud and authentication are **separate components** so DM can
-be configured on/off. The orchestrator owns the transaction state machine; each risk step
-is a pluggable component implementing one interface.
-
-```
-                       ┌──────────────────────────────────────────────┐
-   gateway ──▶  Orchestrator (transaction state machine, persistence)  │
-                       │   runs the ENABLED components, in order        │
-                       └───────┬───────────────────────┬───────────────┘
-                               │                        │
-                 ┌─────────────▼──────────┐   ┌─────────▼───────────────┐
-                 │ FraudScreeningComponent │   │ PayerAuthComponent       │
-                 │  (Decision Manager)     │   │  (Payer Authentication)  │
-                 │  ── toggleable ──       │   │                          │
-                 └─────────────┬──────────┘   └─────────┬───────────────┘
-                               └──────────┬─────────────┘
-                                ┌─────────▼──────────┐
-                                │ Cybersource adapter │  (auth, retries, mapping)
-                                └─────────────────────┘
+PVCB ──POST /v1/topups (sync)──▶ tc-cardload-service
+                                    │ Tokenization  (Flex token → TMS id)
+                                    │ FTAI elig.    ──▶ Visa (PAAI)         (pre-screen; fail fast)
+                                    │ Decision Mgr  ──▶ Cybersource         (TOGGLEABLE)
+                                    │ Payer Auth    ──▶ Cybersource
+                                    │   ├─ frictionless ─▶ continue inline ↓
+                                    │   └─ challenge ─▶ RETURN redirectUrl  ──▶ PVCB → customer
+                                    │                                              │ (OTP/app/passkey)
+       POST /v1/topups/{ref}/3ds-complete ◀── gateway public callback ◀───────────┘
+                                    │ Payer Auth validate ──▶ Cybersource
+                                    │ Limits (last gate)
+                                    │ Fee config      ──▶ tc-admin-service (fixed + dynamic) [TBD]
+                                    │ FX snapshot     ──▶ Visa FX rate (daily cache)
+                                    │ Visa Direct AFT ──▶ Visa Direct
+                                    │ Prefunding      ──▶ PVCB Core Banking
+                                    │ Record outcome  (local; settlement reads the legs)
+PVCB ──GET /v1/top-up-status/{ref} (poll)──▶ definitive status   (no webhook anywhere)
 ```
 
-### Common component contract
+## Module 1 — Tokenization (Cybersource Flex / TMS + network token)
 
-Both components implement the same contract, so the orchestrator treats them uniformly and
-a disabled component simply isn't in the pipeline:
+- PVCB's frontend captures the card with **Flex Microform**, producing a short-lived
+  **transient token (JWT)**; this is sent in `POST /v1/topups` — the **PAN never reaches
+  `tc-*`**.
+- The module exchanges the transient token for a **TMS instrument identifier** (durable,
+  storable) and a **card fingerprint** for limit logic.
+- **Network tokenization.** Cybersource TMS acts as a **Visa Token Service (VTS) token
+  requestor**: it provisions a **network token** (a token-PAN / DPAN that VisaNet recognizes) and,
+  per transaction, mints the **AFT cryptogram**. That — **not** the raw PAN, and **not** the
+  Cybersource vault token (which VisaNet doesn't understand) — is the credential for the **Visa**
+  legs.
+- **What each leg gets:** **Cybersource** legs (DM, Payer Auth) take the **Cybersource token**
+  (`tokenInformation` / TMS id); **Visa** legs (FTAI, AFT) take the **network token + cryptogram**.
+  The real PAN is held by Cybersource / VTS — never by `tc-*`.
+- Only the TMS id + **network-token reference** + masked `last4`/`brand`/`exp` + fingerprint are
+  persisted (no PAN, no cryptogram at rest).
 
-```ts
-interface RiskComponent {
-  readonly name: 'fraud-screening' | 'payer-authentication';
-  isEnabled(cfg: CardloadConfig): boolean;        // config-driven toggle
-  // Synchronous gates return PASS/FAIL/HOLD; async gates return CHALLENGE + a resume token.
-  execute(txn: Transaction): Promise<ComponentResult>;
-  // Only payer-auth implements this; called when the client 3DS callback arrives.
-  resume?(txn: Transaction, callback: CallbackPayload): Promise<ComponentResult>;
-}
+## Eligibility — Funds Transfer Attributes Inquiry (FTAI)
 
-type ComponentResult =
-  | { outcome: 'PASS';      data: Record<string, unknown> }     // proceed to next component
-  | { outcome: 'FAIL';      reason: string; code: string }      // terminal reject
-  | { outcome: 'HOLD';      reviewRef: string }                 // manual review (DM REVIEW)
-  | { outcome: 'CHALLENGE'; redirectUrl: string; resumeRef: string }; // await client callback
+**Before any Cybersource risk/auth step**, the orchestrator asks Visa whether the card can
+actually take an **AFT pull** — so we **fail fast** on an ineligible card instead of paying for a
+fraud screen and challenging the customer for nothing.
+
+**API — Visa Payment Account Attributes Inquiry (PAAI) · Funds Transfer Attributes Inquiry
+(FTAI).** `POST /paai/fundstransfer/v5/attributesinquiry` (VDP, mTLS + `x-pay-token`; the inquiry
+uses the **network token** — the same credential as the AFT, **not** the raw PAN). It returns the
+account's funds-transfer attributes; the ones that gate this flow:
+
+| Attribute | Use |
+| --- | --- |
+| **AFT Cross-Border / Domestic Participant** | **the gate** — can this card receive an Account Funding (pull)? a tourist's foreign card is the **cross-border** case |
+| **Card Type Code** (credit / debit / prepaid / …) | enforce allowed card types; risk / limit signal |
+| **Billing Currency Code** | sanity-check vs the top-up; feeds the [FX](#module-5--foreign-exchange-visa-fx-rates) pair |
+| **Issuer Name / Country Code** | corridor / BIN / geo policy |
+| **Fast Funds / OCT Participant** | relevant to the **refund** (OCT) path later, not the AFT |
+
+- **Position:** `tokenize → FTAI → DM → 3DS → limits → fees → FX → AFT`. It runs **after
+  tokenization** (so it has a usable card credential) and **before the Cybersource risk/auth
+  steps** — this is the [`AFT_ELIGIBILITY`](#orchestration--lifecycle) stage, going to
+  `REJECTED_INELIGIBLE` if the card can't take an AFT. (The PAN never reaches `tc-*`; the inquiry
+  uses the **network token**. Confirm PAAI accepts a network token with your Visa rep — some
+  inquiry APIs still key on the underlying PAN, in which case the lookup runs inside
+  Cybersource / VTS, not here.)
+- **Read-only, pre-money, retry-safe.** An FTAI failure moves no money; **fail closed** — if
+  eligibility can't be determined, reject (retryable) rather than authorize an unverified card.
+- **Not a throwaway call:** the returned attributes (card type, issuer country, billing currency)
+  are **persisted** (via `visa_call`, `operation = PAAI`) and **reused** downstream — by limits
+  (currency / BIN / card-type policy), FX (billing currency), and as a risk signal for DM.
+
+## Module 2 — Decision Manager (fraud, toggleable)
+
+Standalone screening via the Risk API.
+
+- **Endpoint:** `POST /risk/v1/decisions` — `ACCEPT` / `REJECT` / `REVIEW`.
+- Device fingerprint (`deviceInformation.fingerprintSessionId`) collected on the PVCB client.
+- `REVIEW` per `onReview` (default `HOLD` → no funds move); feedback via
+  `POST /risk/v1/decisions/{id}/marking`.
+- **Disabled** (`fraudScreening.enabled = false`) → no DM call.
+
+## Module 3 — Payer Authentication (3-D Secure 2.x)
+
+Three calls plus the customer step-up.
+
+| Step | Endpoint | Result |
+| --- | --- | --- |
+| Setup / device data collection | `POST /risk/v1/authentication-setups` | `referenceId` + DDC URL |
+| Check enrollment | `POST /risk/v1/authentications` | `AUTHENTICATION_SUCCESSFUL` (frictionless) / `PENDING_AUTHENTICATION` (challenge) / failed |
+| Validate results | `POST /risk/v1/authentication-results` | final `cavv`/`eci`/`xid`/`dsTransactionId` |
+
+### How the challenge works (verified against Cybersource)
+
+When enrollment returns `PENDING_AUTHENTICATION`, Cybersource returns a **step-up JWT** with a
+`stepUpUrl` and the **return URL baked in**. This service composes a **`redirectUrl`** to a
+**tc-hosted 3DS page** that runs the step-up (Cardinal iframe) and listens on the return URL.
+On completion the issuer ACS **POSTs the `TransactionId`** to that return URL; the page calls
+`POST /v1/topups/{ref}/3ds-complete`; this service calls **`/risk/v1/authentication-results`**
+with the `authenticationTransactionId` to get the authoritative outcome, and — if
+`AUTHENTICATION_SUCCESSFUL` — carries `cavv`/`eci`/`xid`/`dsTransactionId`/`specVersion` into
+the AFT. *(This matches the flow you described and the Cybersource Payer Authentication
+docs.)*
+
+### Issuer challenge methods — handled uniformly
+
+Issuers run several challenge methods today; **the merchant does not implement any of them** —
+the issuer's ACS runs the method inside the Cybersource step-up, and we only render the step-up
+and read the result:
+
+| Method | What the customer sees | Notes |
+| --- | --- | --- |
+| **OTP** (SMS/email) | enters a code in the ACS challenge UI | traditional; fast |
+| **OOB** (out-of-band) | **approves in their banking app**; the ACS shows a "waiting" screen | no code in our flow; can take longer |
+| **Biometric** | Face ID / fingerprint prompt in the issuer app | reduces OTP reliance |
+| **Passkey / FIDO (SPC)** | WebAuthn / Secure Payment Confirmation | EMV 3DS 2.3+; a two-AReq variant that Cybersource abstracts |
+
+Implications we **do** handle: the step-up window and the `/top-up-status` poll must tolerate
+**longer waits** (OOB/biometric/SPC can take a minute+), and the `CHALLENGE_REQUIRED` TTL
+(`expiresAt`) should be generous (e.g. 5–10 min) before the reaper expires it. Beyond that, all
+methods converge on the same `3ds-complete` → `authentication-results` path.
+
+## Module 4 — Visa Direct (AFT, limits, corrections)
+
+After 3DS passes, this module enforces limits and calls Visa Direct directly.
+
+- **Authorization limits** (authoritative gate): per-transaction max, currency/BAI/MCC
+  allowlists, per-card daily sum + velocity, per-BIN ceiling, global circuit breaker (Redis
+  counters); **fail closed** if unevaluable.
+- **AFT pull** — `POST /visadirect/fundstransfer/v1/pullfundstransactions` carrying STAN, RRN,
+  BAI, MCC, amount, the **network token + AFT cryptogram** (from Cybersource / VTS), and the 3DS
+  `cavv`/`eci`. `actionCode == "00"` →
+  approved (→ prefunding); else declined.
+- **Reversal** (`reversefundstransactions`, ≤ ~24h) — triggered by prefunding failure /
+  cancellation / uncertain timeout. **Adjustment** — amount correction. **Refund** (OCT,
+  ≤ ~30 days) — past the reversal window.
+- **Exactly-once:** unique **STAN** from the `Idempotency-Key`; **never blind-resend** on
+  timeout — `GET .../pullfundstransactions/{statusIdentifier}`, else reverse.
+- **VDP connectivity:** mTLS + `x-pay-token` + **MLE**. Card **eligibility** is checked up front by
+  [FTAI](#eligibility--funds-transfer-attributes-inquiry-ftai) — before Cybersource — not here.
+
+## Module 5 — Foreign Exchange (Visa FX Rates)
+
+The platform pulls in one currency (e.g. **USD**) and funds the local account in **VND**, so a
+**USD→VND conversion** sits in the middle. This module captures the **Visa exchange rate at
+authorization** and records it against the top-up, so settlement reconciliation later has the
+**exact rate we priced on** as its reference.
+
+**Source — Visa Foreign Exchange Rates API.** `POST /forexrates/v2/foreignexchangerates` (VDP,
+mTLS + `x-pay-token`) returns Visa's **daily** conversion rate for a currency pair, optionally
+applying a **markup** (our FX margin). The request carries the source/destination currency and a
+source amount; the response carries the **base conversion rate**, the **markup rate**, the
+**total conversion rate**, the **converted destination amount**, and the rate's **as-of
+date/timestamp**. (See the
+[Visa FX Rates reference](https://developer.visa.com/capabilities/foreign_exchange/reference).)
+
+**Daily cache, per-transaction snapshot.** Visa publishes the rate **once per day**, so we do
+**not** call Visa on the money hot-path:
+
+- A **scheduled job** fetches the daily rate for each configured pair (with the contracted
+  markup) and caches it in `fx_rate_daily` (and Redis). It refreshes on Visa's publication
+  cadence; a cache miss/staleness triggers an on-demand fetch.
+- At **authorization**, the orchestrator **snapshots** the applicable daily rate into an
+  `fx_quote` row bound to the `topup` — base rate, markup, total rate, source/destination
+  amounts, and Visa's as-of timestamp. **This snapshot is the settlement reference.**
+
+**Optional quote/lock for the customer.** PVCB can call
+[`POST /v1/fx-quotes`](#service-api) first to fetch a quote from the cache (`quoteId`, rate,
+converted amount, `expiresAt`), show the tourist the VND they'll receive, then pass `fxQuoteId`
+on `POST /v1/topups`. At authorization the **locked quote** becomes the recorded snapshot; if no
+quote was supplied (or it expired), the orchestrator snapshots the **current daily rate**. Either
+way the rate is **pinned before the AFT** (persist-first), so the value shown, used, and recorded
+are identical.
+
+**Resilience.** The snapshot reads from the **daily cache**, so a Visa-FX outage does **not**
+block top-ups while a same-day rate exists. **Fail closed** only if no valid rate is available
+(we cannot price the conversion) — recorded as a **retryable, pre-money** failure. The FX call is
+**read-only** and never moves money.
+
+**Settlement linkage.** The recorded rate is the **expected** basis: at T+n the settlement file
+reveals what Visa actually settled, and
+[`tc-settlement-service`](/docs/specifications/tc-settlement-service) reconciles settled-vs-expected
+within tolerance — the residual gap is **FX drift / gain-loss**. The funded VND on
+`prefunding.fx_rate` derives from this snapshot.
+
+## Fee configuration (pre-authorization)
+
+> **Placeholder — endpoint not yet designed.** This reserves the step and its position in the
+> flow. The `tc-admin-service` fee endpoint, the fee-rule schema, the cache/refresh mechanism, and
+> the persisted breakdown are **TBD** and get filled in when admin's fee module is specced.
+
+**Just before authorization**, the orchestrator queries
+[`tc-admin-service`](/docs/specifications/tc-admin-service) for the **current fee configuration**
+and applies it to price the top-up. Fees are a set of **fixed** and **dynamic** components:
+
+| Kind | Meaning | Examples |
+| --- | --- | --- |
+| **Fixed** | flat amounts that don't vary with the transaction | a per-top-up service fee, per currency |
+| **Dynamic** | computed at request time from the transaction | a percentage of the amount, tiered bands, per-BIN / corridor / card-type, an FX margin |
+
+- **Position in the flow:** `… → limits → fees → FX snapshot → AFT → …`. Fees are resolved with
+  the [FX snapshot](#module-5--foreign-exchange-visa-fx-rates) so the **authorized amount and the
+  customer's fee breakdown** reflect live config and the day's rate.
+- **Endpoint (placeholder):** `GET /api/config/fees` on `tc-admin-service` — **TBD**; the
+  request/response and the fee-rule model are not yet designed.
+- **Freshness (recommended, TBD):** fee config changes rarely (admin maker-checker), so — like
+  authorization limits — it should be **cached / pushed** rather than fetched from admin on every
+  top-up, keeping it off the money hot-path. Exact mechanism (push vs short-TTL pull) is decided
+  with the endpoint.
+- **Fail closed:** if the fee configuration can't be resolved, **reject** the top-up — we cannot
+  price it — recorded as a **retryable, pre-money** failure.
+- **Recorded:** the **applied fee breakdown** (which fixed + dynamic components, and the amounts)
+  is persisted against the `topup` for **audit and settlement reference** (schema TBD with the
+  endpoint).
+
+## Orchestration & lifecycle
+
+There are **two synchronous entry points** that run the money movement: `POST /v1/topups`
+(frictionless path) and `POST /v1/topups/{ref}/3ds-complete` (challenge path). Both end by
+updating the status that `/top-up-status` returns.
+
+```
+CREATED → AFT_ELIGIBILITY (FTAI) ──ineligible──▶ REJECTED_INELIGIBLE
+  └▶ FRAUD_SCREENING (skipped if DM off) ──REJECT──▶ REJECTED_FRAUD / ──REVIEW──▶ IN_REVIEW
+       └▶ AUTH_SETUP → AUTH_ENROLLMENT
+             ├─ frictionless ───────────────┐
+             ├─ challenge ─▶ AWAITING_CHALLENGE  (return redirectUrl; PVCB polls)
+             │      ├─(3ds-complete)─▶ AUTH_VALIDATION ─ fail ─▶ REJECTED_3DS
+             │      │                          └─ success ─┐
+             │      └─(TTL elapsed)──▶ CHALLENGE_EXPIRED   │
+             └─ failed ─────────────────────▶ REJECTED_3DS │
+       (frictionless success) ────────────────────────────┤
+                                                            ▼
+                                              LIMIT_CHECK ──over-limit──▶ REJECTED_LIMIT
+                                                  └▶ AFT_SUBMITTED ──declined──▶ AFT_DECLINED
+                                                        │  └ timeout ─▶ STATUS_QUERY ─▶ (approved|declined|reverse)
+                                                        └─ approved ─▶ AFT_APPROVED
+                                                              └▶ PREFUNDING ──failed──▶ REVERSAL_SUBMITTED ─▶ REVERSED → FAILED_PREFUND
+                                                                    └─ completed ─▶ COMPLETED
+   (post-completion) AFT_APPROVED ─ adjust ─▶ ADJUSTED · refund(>24h) ─▶ OCT_SUBMITTED ─▶ REFUNDED
 ```
 
-The orchestrator iterates `config.pipeline` (an ordered list of component names), skipping
-any whose `isEnabled()` is false. `PASS` advances; `FAIL`/`HOLD` are terminal (subject to
-review policy); `CHALLENGE` suspends the transaction until the gateway's public 3DS
-callback resumes it.
+Because the AFT runs **in-process**, the prefunding-failure compensation (reverse the AFT) is a
+direct synchronous call.
+
+### Frictionless vs challenge (Decision Manager ON)
+
+```
+frictionless:  POST /v1/topups → tokenize → FTAI → DM → 3DS(frictionless) → limits → fees → FX → AFT → prefund → record → FINAL RESPONSE
+challenge:     POST /v1/topups → tokenize → FTAI → DM → 3DS(enroll=challenge) → RESPONSE{redirectUrl}
+               … customer authenticates …
+               POST /3ds-complete → validate → limits → fees → FX → AFT → prefund → record → FINAL RESPONSE   (+ PVCB polls /top-up-status)
+```
+
+With `fraudScreening.enabled = false`, the DM step is simply absent.
 
 ## Configuration model
 
-A single config object controls which components run, in what order, and how each behaves.
-This is what makes Decision Manager switchable without code changes.
-
 ```yaml
 cardload:
-  pipeline: [fraud-screening, payer-authentication]   # order; remove/disable to skip
-
+  modules: [tokenization, fraud-screening, payer-authentication, visa-direct, foreign-exchange]
+  eligibility:                     # FTAI — queried before Cybersource (fail fast)
+    enabled: true
+    provider: visa-paai-ftai
+    endpoint: "POST /paai/fundstransfer/v5/attributesinquiry"
+    require: [aftCrossBorderParticipant]   # reject if the card can't take an AFT
+    allowedCardTypes: [credit, debit, prepaid]
+    failClosed: true
   fraudScreening:
-    enabled: true                  # ← the toggle: false removes DM from the flow entirely
+    enabled: true                  # ← toggle: false removes Decision Manager from the flow
     provider: cybersource-decision-manager
-    onReview: HOLD                 # HOLD | ACCEPT | REJECT  — how to treat a DM REVIEW
-    failClosed: true               # DM call errors while enabled → reject (money movement)
-
+    onReview: HOLD                 # HOLD | ACCEPT | REJECT
+    failClosed: true
   payerAuthentication:
     enabled: true
     provider: cybersource-payer-authentication
-    challengeIndicator: "04"       # 3DS requestor challenge indicator (04 = challenge requested)
-    allowFrictionless: true        # accept a frictionless AUTHENTICATION_SUCCESSFUL with no step-up
-    minEci: ["05", "02", "06", "01"]  # acceptable ECI values for AFT (authenticated/attempted)
+    challengeIndicator: "04"
+    allowFrictionless: true
+    challengeTtlMinutes: 8         # CHALLENGE_REQUIRED window before the reaper expires it
     failClosed: true
+  foreignExchange:
+    enabled: true
+    provider: visa-foreign-exchange-rates
+    pairs: [{ from: USD, to: VND }]
+    markUpRate: 0.025              # our FX margin, applied over Visa's base daily rate
+    refreshCron: "0 30 0 * * *"    # daily, after Visa publishes the day's rate
+    quoteTtlSeconds: 120           # how long a customer quote stays locked
+    failClosed: true               # no valid rate → reject (cannot price the conversion)
+  fees:                            # PLACEHOLDER — queried from tc-admin-service before authorization
+    source: tc-admin-service
+    endpoint: "GET /api/config/fees"  # TBD — fee-rule schema not yet designed
+    cacheTtlSeconds: 300           # cache rather than call admin per top-up (mechanism TBD)
+    failClosed: true               # cannot resolve fees → reject (cannot price)
+  limits:
+    perTxnMax:        { USD: 5000 }
+    allowedCurrencies: ["USD"]
+    allowedBai:        ["AA"]
+    allowedMcc:        ["6051"]
+    perCardDailyMax:   { USD: 10000 }
+    perCardVelocity:   { perHour: 5, perDay: 20 }
+    perBinDailyMax:    { USD: 2000000 }
+    globalDailyCeiling:{ USD: 5000000 }
+    failClosed:        true
 ```
-
-Behavioral rules:
-
-- `fraudScreening.enabled = false` → the orchestrator never calls Decision Manager; the
-  state machine transitions straight from eligibility to payer authentication. No synthetic
-  "accept" is sent to Cybersource; the component is simply absent.
-- A component's `failClosed: true` means: if its Cybersource call errors (and the component
-  is enabled), the transaction is **rejected**, never passed through unscreened. This
-  mirrors the gateway's [fail-closed posture](/docs/specifications/tc-api-gateway).
-- `pipeline` order is honored; today it is `fraud → payer-auth` to match the diagram.
-
-## Transaction lifecycle
-
-```
-CREATED
-  └▶ AFT_ELIGIBILITY ──ineligible──▶ REJECTED_INELIGIBLE
-        └▶ FRAUD_SCREENING (skipped if DM off)
-              ├─ REJECT ───────────▶ REJECTED_FRAUD
-              ├─ REVIEW ───────────▶ IN_REVIEW  (per onReview policy)
-              └─ ACCEPT
-                   └▶ AUTH_SETUP ▶ AUTH_ENROLLMENT
-                         ├─ frictionless success ─┐
-                         ├─ challenge required ─▶ AWAITING_CHALLENGE
-                         │      └─(client callback)─▶ AUTH_VALIDATION
-                         └─ failed ───────────────▶ REJECTED_3DS
-                   AUTH_VALIDATION ─ fail ─▶ REJECTED_3DS
-                         └─ success ─┘
-                              └▶ AFT_PULL ── fail ──▶ FAILED_AFT
-                                    └─ success ─▶ PREFUNDING ── fail ──▶ FAILED_PREFUND
-                                                      └─ done ─▶ COMPLETED
-```
-
-A webhook is emitted to PVCB (via the gateway) on entry to every terminal state and on
-`AWAITING_CHALLENGE` (carrying the redirect URL). State is persisted so the async 3DS
-callback can resume the exact transaction; see [Idempotency & resumption](#idempotency-error-handling--resumption).
-
-## Component 1 — Fraud screening (Cybersource Decision Manager)
-
-Standalone Decision Manager screening (no authorization) via the Cybersource Risk API.
-
-- **Endpoint:** `POST /risk/v1/decisions`
-- **Decisions returned:** `ACCEPT`, `REJECT`, `REVIEW` (mapped to `PASS` / `FAIL` / `HOLD`).
-- **Score:** `riskInformation.score.result` (0–99) plus triggered `riskInformation.rules`
-  and `infoCodes`; the active DM **profile** decides the outcome — keep rule logic in the
-  Cybersource profile, not in this service.
-- **Device fingerprint:** the PVCB client must load the DM device-fingerprint script (org
-  id + session id) when the top-up screen opens; pass that id as
-  `deviceInformation.fingerprintSessionId`. Collect it up front so it doesn't add latency.
-
-Request (abbreviated):
-
-```json
-{
-  "clientReferenceInformation": { "code": "topup-<txnId>" },
-  "paymentInformation": { "tokenInformation": { "transientTokenJwt": "<flex-token>" } },
-  "orderInformation": {
-    "amountDetails": { "currency": "USD", "totalAmount": "100.00" },
-    "billTo": { "firstName": "...", "lastName": "...", "country": "US", "email": "...", "address1": "...", "locality": "...", "postalCode": "..." }
-  },
-  "deviceInformation": { "fingerprintSessionId": "<dmSessionId>", "ipAddress": "...", "userAgentBrowserValue": "..." },
-  "buyerInformation": { "merchantCustomerId": "<userId>" }
-}
-```
-
-Response (abbreviated):
-
-```json
-{
-  "id": "6543210...",
-  "status": "ACCEPT",
-  "riskInformation": {
-    "score": { "result": "38", "factorCodes": ["..."], "modelUsed": "default" },
-    "rules": [ { "name": "high-velocity", "decision": "MONITOR" } ],
-    "profile": { "name": "topup-default", "selectorRule": "..." }
-  }
-}
-```
-
-Handling:
-
-- `ACCEPT` → `PASS`.
-- `REJECT` → `FAIL` (code `FRAUD_REJECTED`) → `REJECTED_FRAUD` → reject webhook to PVCB.
-- `REVIEW` → `HOLD` per `onReview`: **HOLD** queues to ops (`IN_REVIEW`, no funds move),
-  **REJECT** treats it as a decline, **ACCEPT** lets it proceed (use with care for money
-  movement). Default **HOLD**.
-- **Feedback loop:** report confirmed outcomes back to DM via `POST /risk/v1/decisions/{id}/marking`
-  (suspect / fraud / creditback) so the models learn. Wire this from chargeback/recon.
-- **Disabled:** when `fraudScreening.enabled = false`, none of the above runs.
-
-## Component 2 — Payer authentication (Cybersource Payer Authentication, 3DS 2.x)
-
-3-D Secure 2.x via the Cybersource Risk API, in three calls plus an async client step.
-
-### Step A — Setup (device data collection)
-
-- **Endpoint:** `POST /risk/v1/authentication-setups`
-- Returns `consumerAuthenticationInformation.accessToken` (JWT), `deviceDataCollectionUrl`,
-  and `referenceId`. The PVCB client runs the 3DS Method (hidden iframe) against the DDC
-  URL with the JWT. Like the DM fingerprint, **kick this off when the screen loads** so it
-  overlaps with fraud screening.
-
-```json
-// request
-{ "clientReferenceInformation": { "code": "topup-<txnId>" },
-  "paymentInformation": { "tokenInformation": { "transientTokenJwt": "<flex-token>" } } }
-// response
-{ "consumerAuthenticationInformation": {
-    "accessToken": "<jwt>",
-    "deviceDataCollectionUrl": "https://centinelapi.cardinalcommerce.com/V1/Cruise/Collect",
-    "referenceId": "<refId>" },
-  "status": "COMPLETED" }
-```
-
-### Step B — Enrollment check
-
-- **Endpoint:** `POST /risk/v1/authentications`
-- Pass the setup `referenceId`, the order amount, and the `returnUrl` (the gateway's public
-  3DS callback). The response branches:
-
-```json
-// request
-{ "clientReferenceInformation": { "code": "topup-<txnId>" },
-  "orderInformation": { "amountDetails": { "currency": "USD", "totalAmount": "100.00" } },
-  "paymentInformation": { "tokenInformation": { "transientTokenJwt": "<flex-token>" } },
-  "consumerAuthenticationInformation": {
-    "referenceId": "<refId>",
-    "returnUrl": "https://gw.tc.example/v1/public/3ds/callback",
-    "challengeCode": "04" } }
-```
-
-| Response `status` | Meaning | Component result |
-| --- | --- | --- |
-| `AUTHENTICATION_SUCCESSFUL` | frictionless — no challenge; `cavv`/`eci`/`xid` returned | `PASS` (skip step-up) |
-| `PENDING_AUTHENTICATION` | challenge required; `stepUpUrl` + step-up JWT + `authenticationTransactionId` returned | `CHALLENGE` |
-| `AUTHENTICATION_FAILED` / `_REJECTED` | not authenticated | `FAIL` (`THREEDS_FAILED`) |
-
-For a challenge, `tc-cardload-service` composes the **redirect URL** (the `stepUpUrl` +
-the JWT, typically wrapped in a small tc-hosted page) and returns it as the
-`CHALLENGE.redirectUrl`. The orchestrator emits the `AWAITING_CHALLENGE` webhook so PVCB
-can render it for the tourist.
-
-### Step C — Resume on client callback, then validate
-
-When the tourist finishes the issuer challenge, the ACS posts back and the client hits the
-gateway's **single public endpoint**, which forwards "3DS challenge completed" here. The
-callback is a **trigger only** — this service fetches the authoritative result:
-
-- **Endpoint:** `POST /risk/v1/authentication-results`
-- Request carries `consumerAuthenticationInformation.authenticationTransactionId`.
-
-```json
-// response
-{ "status": "AUTHENTICATION_SUCCESSFUL",
-  "consumerAuthenticationInformation": {
-    "cavv": "...", "eci": "05", "xid": "...", "paresStatus": "Y",
-    "directoryServerTransactionId": "...", "specificationVersion": "2.2.0" } }
-```
-
-- `AUTHENTICATION_SUCCESSFUL` with an acceptable `eci` (per `minEci`) → `PASS`. Carry
-  `cavv` / `eci` / `xid` / `directoryServerTransactionId` / `specificationVersion` forward —
-  `tc-card-network-service` puts them in the **AFT authorization** for SCA/liability.
-- Anything else → `FAIL` (`THREEDS_FAILED`) → `REJECTED_3DS`.
-
-> **Never trust the client's "3DS completed."** The state advances only on the
-> `authentication-results` response, exactly as the diagram's "Query 3DS result" step
-> shows. The gateway's one-time callback token only authorizes *triggering* the query.
-
-## Orchestration scenarios
-
-The same pipeline produces two flows depending on the DM toggle:
-
-**Decision Manager ON** (default):
-
-```
-eligibility → DM /risk/v1/decisions → ACCEPT
-            → 3DS setup → 3DS enroll → (frictionless | challenge→callback→validate)
-            → AFT pull → prefunding → COMPLETED
-```
-
-**Decision Manager OFF** (`fraudScreening.enabled = false`):
-
-```
-eligibility → 3DS setup → 3DS enroll → (frictionless | challenge→callback→validate)
-            → AFT pull → prefunding → COMPLETED
-```
-
-No other component, contract, or webhook changes — only the fraud step is absent.
 
 ## Service API
 
-### Inbound (called by `tc-api-gateway`)
+### Inbound (PVCB via `tc-api-gateway`)
 
-| Method & path | Purpose | Notes |
+| Method & path | Style | Purpose |
 | --- | --- | --- |
-| `POST /v1/topups` | Start a top-up; runs eligibility → enabled components | Requires `Idempotency-Key` (passed through from the gateway) |
-| `POST /v1/topups/{id}/3ds-complete` | Resume after client 3DS challenge | Target of the gateway's public callback forward |
-| `GET /v1/topups/{id}` | Status query | Read-only |
+| `POST /v1/fx-quotes` | sync | **Fetch a Visa FX quote** for a currency pair + source amount (from the cached daily rate). Returns `quoteId`, conversion rate, converted amount, and `expiresAt`; PVCB shows the tourist and passes `fxQuoteId` on `POST /v1/topups` |
+| `POST /v1/topups` | **sync, blocking** | Start a top-up (requires `Idempotency-Key`; optional `fxQuoteId`). Returns the **final result**, or `CHALLENGE_REQUIRED` + `redirectUrl` if 3DS challenge is needed |
+| `POST /v1/topups/{ref}/3ds-complete` | **sync, blocking** | Resume after the customer 3DS challenge — validate, then limits → fees → FX snapshot → AFT → prefund → record; returns the final result. Target of the gateway's **public** callback |
+| `POST /v1/topups/{ref}/prefunding-callback` | sync | **PVCB reports the prefunding outcome** (success/failed). This service **owns prefunding status** — it records it (`prefunding` table) and advances the top-up to `COMPLETED` (or reverses the AFT on failure). The settlement reconciler later **reads** this prefunding leg for matching |
+| `GET /v1/top-up-status/{ref}` | sync | **PVCB polls** this for the definitive status (3DS, Visa, **and prefunding** stages) |
+| `POST /v1/topups/{ref}/reversal` · `/adjustment` · `/refund` | sync | Corrective operations |
 
-### Outbound webhooks (to PVCB via gateway egress)
-
-Emitted on each terminal state and on `AWAITING_CHALLENGE`. Bodies are signed by the
-gateway's egress (tc private key) and carry the `Idempotency-Key` / a `Delivery-Id`:
-
-| Event | When |
-| --- | --- |
-| `topup.rejected` | ineligible / fraud reject / 3DS fail (with reason code) |
-| `topup.challenge_required` | challenge needed — includes the 3DS `redirectUrl` |
-| `topup.in_review` | DM `REVIEW` with `onReview: HOLD` |
-| `topup.failed` | AFT pull or prefunding failed |
-| `topup.succeeded` | AFT approved (and prefunding completed) |
+There are **no outbound webhooks**. Outbound calls this service makes are all synchronous:
+**Cybersource**, **Visa Direct**, the **Visa Foreign Exchange Rates API**, and **`tc-admin-service`**
+(fee configuration — placeholder). It does **not** call `tc-settlement-service` — instead the
+settlement reconciler **reads** the authorization and prefunding legs from this service for matching.
 
 ## Card data handling & PCI
 
-Keep the raw PAN out of `tc-*` systems:
+PAN captured client-side via **Flex Microform** → transient token → exchanged for a **TMS
+instrument id** + a **network token** (VTS); this service never sees or stores the PAN. Only a
+**card fingerprint** is shared with limits. Never log PAN/CVV/track data. The **Visa legs carry the
+network token + cryptogram** (MLE to Visa); the **raw PAN never leaves Cybersource / VTS**.
 
-- The PVCB client captures the card with **Cybersource Flex Microform v2**, producing a
-  **transient token (JWT)**. `tc-cardload-service` passes that token to every Cybersource
-  call via `paymentInformation.tokenInformation.transientTokenJwt` — it never sees the PAN.
-- For repeat use, exchange the transient token for a **Token Management Service (TMS)**
-  instrument identifier; pass that to AFT.
-- Only a **card fingerprint** (not the PAN) is shared with the gateway's amount/velocity
-  limits, consistent with the gateway spec.
-- Never log PAN/CVV/track data; mask everything. The service stays in scope but with
-  minimized cardholder-data footprint.
-
-## Cybersource connectivity
+## Cybersource & Visa connectivity
 
 | Concern | Detail |
 | --- | --- |
-| Base host | `apitest.cybersource.com` (sandbox) / `api.cybersource.com` (production) |
-| Auth | REST **HTTP Signature** (merchant id + key id + shared secret) or **JWT/P12 cert**; store secrets in KMS/Vault |
-| Correlation | set `clientReferenceInformation.code = topup-<txnId>` on every call |
-| Idempotency | dedupe on our side keyed by `txnId`/`Idempotency-Key`; do not blindly retry payer-auth/decision calls that may have side effects |
-| Timeouts/retries | bounded timeouts; retry only idempotent GET-style reads; on persistent error apply the component's `failClosed` rule |
-| Environments | DM profile, Payer Auth config, and org/device-fingerprint ids differ per environment — keep them in config |
+| Cybersource host | `apitest.cybersource.com` / `api.cybersource.com` |
+| Cybersource auth | HTTP Signature (key id + shared secret) or JWT/P12; secrets in KMS/Vault |
+| Visa host | `sandbox.api.visa.com` / `api.visa.com` |
+| Visa auth | Two-Way SSL (mTLS) + `x-pay-token`; **MLE** for the network-token credential |
+| Correlation | `clientReferenceInformation.code = topup-<ref>`; propagate `X-Correlation-Id` |
 
-### Verified Cybersource endpoints
+### Verified endpoints
 
-Confirmed against Cybersource's REST API reference and official REST SDK (checked June
-2026). The operation names in parentheses are the SDK method names.
-
-| Component | Operation | Method & path |
+| Module | Operation | Method & path |
 | --- | --- | --- |
-| Payer auth | Setup / device data collection (`payerAuthSetup`) | `POST /risk/v1/authentication-setups` |
-| Payer auth | Check enrollment (`checkPayerAuthEnrollment`) | `POST /risk/v1/authentications` |
-| Payer auth | Validate results (`validateAuthenticationResults`) | `POST /risk/v1/authentication-results` |
-| Decision Manager | Create decision / screen order (`createBundledDecisionManagerCase`) | `POST /risk/v1/decisions` |
-| Decision Manager | Mark transaction — fraud feedback (`fraudUpdate`) | `POST /risk/v1/decisions/{id}/marking` |
-| Decision Manager | Action a review case (`actionDecisionManagerCase`) | `POST /risk/v1/decisions/{id}/actions` |
-| Decision Manager | Comment on a case (`commentDecisionManagerCase`) | `POST /risk/v1/decisions/{id}/comments` |
-| Decision Manager | Add a list entry (`addNegative`) | `POST /risk/v1/lists/{type}/entries` |
+| Tokenization | exchange transient → instrument | Flex/TMS (`tokenInformation.transientTokenJwt` → TMS id) |
+| Decision Manager | create decision | `POST /risk/v1/decisions` |
+| Payer Auth | setup / enrol / validate | `POST /risk/v1/authentication-setups` · `/authentications` · `/authentication-results` |
+| Visa Direct | AFT / status / reversal / OCT | `POST .../pullfundstransactions` · `GET .../pullfundstransactions/{statusIdentifier}` · `POST .../reversefundstransactions` · `POST .../pushfundstransactions` |
 
-> The standalone fraud screen in [Component 1](#component-1--fraud-screening-cybersource-decision-manager)
-> is the **create-decision** call (`POST /risk/v1/decisions`); the SDK names it
-> `createBundledDecisionManagerCase`. Both components live under the same `/risk/v1/*`
-> Risk service.
+## Error handling & recovery (money-movement-safe)
 
-Public documentation:
+Money is involved, so the rule is: **nothing is unaccounted for.** Every failure is recorded
+on the transaction, surfaced to PVCB, and — if it touches money — resolved to a known terminal
+state.
 
-- [Cybersource REST API reference (interactive console)](https://developer.cybersource.com/api-reference-assets/index.html)
-- [Payer Authentication developer guide (REST)](https://developer.cybersource.com/docs/cybs/en-us/payer-authentication/developer/all/rest/payer-auth/pa-about-guide.html)
-- [Decision Manager developer guide](https://developer.cybersource.com/library/documentation/dev_guides/Decision_Manager_DG/html/index.html)
-- Endpoint paths (official REST SDK): [PayerAuthenticationApi](https://github.com/CyberSource/cybersource-rest-client-php/blob/master/docs/Api/PayerAuthenticationApi.md) · [DecisionManagerApi](https://github.com/CyberSource/cybersource-rest-client-php/blob/master/docs/Api/DecisionManagerApi.md)
+### The one line that moves money
 
-## Idempotency, error handling & resumption
+Only the **Visa AFT pull** pulls funds. Everything before it — tokenization, Decision Manager,
+3DS, limits, eligibility — **moves no money and is safe to fail and retry**. Everything from
+the AFT onward is the danger zone, governed by the exactly-once rules below. The **persisted
+status is the boundary marker**: anything `< AFT_SUBMITTED` is safe; `AFT_SUBMITTED` and beyond
+needs reconciliation with Visa before it can be called failed.
 
-- Every transaction is **persisted** with its state, the Cybersource ids (`decisionId`,
-  `referenceId`, `authenticationTransactionId`), and the `Idempotency-Key`. The async 3DS
-  callback resumes by `txnId` → exactly-once advancement.
-- Re-delivery of the same `POST /v1/topups` (same `Idempotency-Key`) returns the current
-  state, never a second top-up.
-- **Fail closed on money movement:** if an enabled component's Cybersource call cannot be
-  completed, the transaction is rejected — never advanced unscreened/unauthenticated.
-- A late or duplicate 3DS callback for an already-resolved transaction is a no-op that
-  returns the current state.
+### Error classification
+
+| Class | Examples | Handling |
+| --- | --- | --- |
+| **Transient** | timeout, 5xx, 429, connection reset | bounded retry-with-backoff **for pre-money steps only**; for the AFT → GET-status / reverse, **never blind-retry** |
+| **Permanent** | 4xx validation, issuer decline, auth rejected | record + return a decline/error; not retryable as-is |
+| **Uncertain** | no response / unknown outcome of the **AFT** | the money-movement recovery path (below) — the transaction stays `AFT_PROCESSING` and is resolved, never guessed |
+
+### Inside the synchronous call — record, then propagate to PVCB
+
+When a Cybersource or Visa call fails within the request:
+
+1. **Classify.** For transient **pre-money** errors, retry up to N with backoff inside the call.
+2. **Record the error state.** Set `topup.status` to the right terminal failure
+   (`FAILED` / `REJECTED_*` / `AFT_DECLINED`), write `error_code` + `reject_reason` + `retryable`,
+   append a `topup_state_transition` (with the reason), and log the call (`visa_call` for Visa;
+   the module tables for Cybersource). Nothing is in-memory-only.
+3. **Return a structured error** so PVCB can inform the customer:
+
+```json
+{ "transactionRef": "topup-…", "status": "FAILED",
+  "errorCode": "CYBERSOURCE_UNAVAILABLE", "retryable": true,
+  "message": "Temporary problem, please try again." }
+```
+
+- `retryable: true` ⇒ **no money moved** — the customer may retry (PVCB submits a **new** top-up
+  with a **new** `Idempotency-Key`).
+- `retryable: false` ⇒ a real decline / permanent error — do not retry.
+- For an **uncertain AFT**, the call does **not** return a terminal failure — it returns
+  `AFT_PROCESSING`, and PVCB **polls** `/top-up-status` (it must not retry, or it risks a second
+  pull).
+
+### The AFT — exactly-once on an uncertain outcome
+
+The status is already `AFT_SUBMITTED` (written **before** the call). On timeout / no response,
+**never blind-resend** (see [Module 4](#module-4--visa-direct-aft-limits-corrections)):
+
+1. **GET-status** by `statusIdentifier` (`GET .../pullfundstransactions/{statusIdentifier}`) →
+   `AFT_APPROVED` or `AFT_DECLINED`.
+2. If still indeterminate → submit a **reversal** (safe — reversing a non-existent pull is a
+   no-op at Visa) → `REVERSED` → `FAILED`. No funds are ever left pulled.
+
+### Recovery after a crash — by persisted stage
+
+Because we persist-first and write the in-progress status before each call, a crash leaves the
+DB at a known stage. A **reaper / recovery job** (independent of the request thread) scans
+non-terminal transactions past a threshold and resolves them:
+
+| Status at crash | Money moved? | Recovery |
+| --- | --- | --- |
+| `< AUTH_VALIDATION` / `LIMIT_CHECK` | no | → `FAILED` (`retryable`); customer retries as a new top-up |
+| `AWAITING_CHALLENGE` past TTL | no | → `CHALLENGE_EXPIRED` |
+| **`AFT_SUBMITTED`** | **unknown** | Visa **GET-status** → `AFT_APPROVED` / `AFT_DECLINED`; if indeterminate → **reversal** → `REVERSED` → `FAILED` |
+| `AFT_APPROVED` (no prefund yet) | **yes — funds pulled** | resume **prefunding**; if it fails → **reverse the AFT** → `FAILED_PREFUND` |
+| `PREFUNDING` (outcome unknown) | maybe | query PVCB Core Banking by `transaction_ref`; funded → `COMPLETED`, else retry prefund or reverse |
+| `REVERSAL_SUBMITTED` | reversing | re-drive the reversal (idempotent) until `REVERSED` |
+
+### Worst case — Cybersource *and* Visa down **and** the service crashes
+
+This is the scenario that must be airtight:
+
+- The record persists at its last committed stage (e.g. `AFT_SUBMITTED`); PVCB polling sees a
+  **non-terminal** `AFT_PROCESSING` — a known in-flight state, **not lost**, **not duplicated**.
+- The reaper retries Visa **GET-status with backoff until Visa recovers**, then resolves to a
+  terminal state. Because we **never blind-resend** and the record holds the STAN /
+  `statusIdentifier`, there is **no double pull** and **no dropped transaction**.
+- The top-up is marked `AFT_APPROVED` (and prefunding recorded) **only after the provider
+  confirms** — a crash never records a pull or advance that didn't happen; there is no separate
+  ledger to leave a phantom entry in.
+- **Reconciliation (T+n) is the final backstop:** the Visa settlement file is the ultimate
+  source of truth. [`tc-settlement-service`](/docs/specifications/tc-settlement-service)'s reconciliation
+  matches **every settled line** to a `topup` record; any mismatch (settled but we recorded
+  `FAILED`, or `APPROVED` with no settlement) surfaces as a **break** for manual resolution.
+  Nothing settles without being tied back to a transaction.
+
+### Idempotency & guarantees
+
+- Re-delivery of `POST /v1/topups` with the same `Idempotency-Key` returns the **current
+  state**, never a second top-up. A retry after a `retryable` failure uses a **new** key (new
+  transaction).
+- **Fail closed:** if an enabled control (DM, 3DS, limits, Visa) cannot be evaluated, the
+  transaction is **rejected**, never advanced.
+
+| Guarantee | Mechanism |
+| --- | --- |
+| The stage is always known | persist-first + write-ahead status |
+| No double pull | never blind-resend the AFT |
+| Uncertain AFT always resolved | GET-status → reversal |
+| No phantom money state | record `AFT_APPROVED` / advance only after the provider confirms |
+| Stuck transactions converge | reaper forces a terminal state on TTL |
+| End-of-day proof | reconciliation ties every settlement to a record |
 
 ## Database schema
 
-**MySQL 8.4 LTS / InnoDB, `utf8mb4`.** Design decisions:
-
-- **One saga aggregate (`topup`)** with child tables for each step's result. `topup` carries
-  **optimistic locking** (`version`) because the async event consumers and the 3DS callback
-  can update the same row concurrently.
-- **No PAN/CVV is stored** — only a Cybersource **TMS instrument id** plus masked display
-  fields and a **card fingerprint** (for correlation), matching
-  [Card data handling](#card-data-handling--pci).
-- **Idempotency on three edges:** a unique `idempotency_key` (create), an **inbox**
-  (`processed_event`) for consumed events, and a unique `event_id` in the **transactional
-  outbox** for produced events.
-- Money as `DECIMAL`; timestamps as `DATETIME(3)`; enums as `VARCHAR` + `CHECK` (enforced in
-  MySQL 8.0.16+); an append-only `topup_state_transition` log for audit/troubleshooting.
-
-```
-                         ┌───────────────────────────┐
-                         │           topup           │  (saga aggregate, optimistic-locked)
-                         └───────────────────────────┘
-            1:N  ┌──────────────┬──────────┴───────┬──────────────┬───────────────┐
-        fraud_screening  payer_authentication  aft_result   prefunding   topup_state_transition
-   (infra, not FK-linked):   outbox  ·  processed_event  (keyed by transaction_ref)
-```
-
-### `topup` — saga aggregate root
+**MySQL 8.4 LTS / InnoDB, `utf8mb4`.** The `topup` aggregate carries the Visa request/response
+fields (one AFT per top-up); `fraud_screening`, `payer_authentication`, `prefunding`,
+`aft_correction`, `visa_call`, `limit_config`, `fx_rate_daily` + `fx_quote` (the recorded Visa
+FX snapshot), and an append-only `topup_state_transition` support the modules. **No messaging
+tables.** Optimistic-locked; no PAN (TMS id + network-token ref + masked fields + fingerprint); unique
+`idempotency_key`.
 
 ```sql
 CREATE TABLE topup (
-  id                 BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  transaction_ref    VARCHAR(48)  NOT NULL,        -- business id (event envelope transactionId), e.g. topup-<uuidv7>
-  idempotency_key    VARCHAR(64)  NOT NULL,        -- from gateway/PVCB; dedupes the create
-  correlation_id     VARCHAR(64)  NOT NULL,        -- propagated from the gateway
-  pvcb_reference     VARCHAR(64)  NULL,            -- partner's own reference
-  status             VARCHAR(40)  NOT NULL,        -- state machine (see CHECK)
-  amount             DECIMAL(18,2) NOT NULL,
-  currency           CHAR(3)      NOT NULL,        -- 'USD'
-  -- card: tokenized, never PAN
-  card_instrument_id VARCHAR(64)  NULL,            -- Cybersource TMS instrument identifier
-  card_fingerprint   VARCHAR(128) NULL,            -- for correlation/limits, not PAN
-  card_last4         CHAR(4)      NULL,
-  card_brand         VARCHAR(20)  NULL,
-  card_exp_month     TINYINT UNSIGNED NULL,
-  card_exp_year      SMALLINT UNSIGNED NULL,
-  customer_ref       VARCHAR(64)  NULL,            -- merchantCustomerId / user id
-  -- denormalized outcome summary (authoritative detail in child tables)
-  fraud_enabled      BOOLEAN      NOT NULL DEFAULT TRUE,
-  fraud_decision     VARCHAR(20)  NULL,            -- ACCEPT/REJECT/REVIEW/SKIPPED
-  threeds_status     VARCHAR(40)  NULL,
-  aft_action_code    VARCHAR(4)   NULL,            -- Visa actionCode (00 = approved)
-  aft_txn_id         VARCHAR(40)  NULL,            -- Visa transactionIdentifier
-  reject_reason      VARCHAR(255) NULL,
-  challenge_expires_at DATETIME(3) NULL,           -- 3DS step-up timeout
-  created_at         DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  updated_at         DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-  version            INT          NOT NULL DEFAULT 0,   -- JPA @Version
+  id                         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  transaction_ref            VARCHAR(48)  NOT NULL,
+  idempotency_key            VARCHAR(64)  NOT NULL,
+  correlation_id             VARCHAR(64)  NOT NULL,
+  pvcb_reference             VARCHAR(64)  NULL,
+  status                     VARCHAR(40)  NOT NULL,
+  amount                     DECIMAL(18,2) NOT NULL,
+  currency                   CHAR(3)      NOT NULL,
+  card_instrument_id         VARCHAR(64)  NULL,        -- Cybersource TMS id (never PAN)
+  network_token_ref          VARCHAR(64)  NULL,        -- VTS network token reference (never PAN)
+  card_fingerprint           VARCHAR(128) NULL,
+  card_last4                 CHAR(4)      NULL,
+  card_exp_month             TINYINT UNSIGNED NULL,
+  card_exp_year              SMALLINT UNSIGNED NULL,
+  customer_ref               VARCHAR(64)  NULL,
+  fraud_enabled              BOOLEAN      NOT NULL DEFAULT TRUE,
+  fraud_decision             VARCHAR(20)  NULL,
+  threeds_status             VARCHAR(40)  NULL,
+  challenge_expires_at       DATETIME(3)  NULL,         -- CHALLENGE_REQUIRED TTL
+  business_application_id    VARCHAR(4)   NULL,
+  merchant_category_code     VARCHAR(4)   NULL,
+  acquiring_bin              VARCHAR(11)  NULL,
+  systems_trace_audit_number INT UNSIGNED NULL,
+  retrieval_reference_number VARCHAR(12)  NULL,
+  transmission_datetime      DATETIME(3)  NULL,
+  action_code                VARCHAR(4)   NULL,
+  approval_code              VARCHAR(10)  NULL,
+  transaction_identifier     VARCHAR(40)  NULL,
+  status_identifier          VARCHAR(40)  NULL,
+  settlement_date            DATE         NULL,
+  reject_reason              VARCHAR(255) NULL,
+  error_code                 VARCHAR(40)  NULL,        -- e.g. CYBERSOURCE_UNAVAILABLE, VISA_TIMEOUT
+  retryable                  BOOLEAN      NULL,        -- true → no money moved, customer may retry
+  created_at                 DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at                 DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  version                    INT          NOT NULL DEFAULT 0,
   UNIQUE KEY uk_topup_ref  (transaction_ref),
   UNIQUE KEY uk_topup_idem (idempotency_key),
   KEY idx_topup_status (status),
+  KEY idx_topup_corr (correlation_id),
+  KEY idx_topup_txnid (transaction_identifier),
   KEY idx_topup_card_fp (card_fingerprint),
-  KEY idx_topup_created (created_at),
   CONSTRAINT chk_topup_status CHECK (status IN (
-    'CREATED','AFT_ELIGIBILITY','FRAUD_SCREENING','IN_REVIEW',
-    'AUTH_SETUP','AUTH_ENROLLMENT','AWAITING_CHALLENGE','AUTH_VALIDATION',
-    'AFT_PULL','AFT_APPROVED','PREFUNDING','COMPLETED',
-    'REJECTED_INELIGIBLE','REJECTED_FRAUD','REJECTED_3DS','FAILED_AFT','FAILED_PREFUND'))
+    'CREATED','AFT_ELIGIBILITY','FRAUD_SCREENING','IN_REVIEW','AUTH_SETUP','AUTH_ENROLLMENT',
+    'AWAITING_CHALLENGE','CHALLENGE_EXPIRED','AUTH_VALIDATION','LIMIT_CHECK','AFT_SUBMITTED',
+    'AFT_APPROVED','AFT_DECLINED','STATUS_QUERY','REVERSAL_SUBMITTED','REVERSED','PREFUNDING',
+    'COMPLETED','ADJUSTMENT_SUBMITTED','ADJUSTED','OCT_SUBMITTED','REFUNDED',
+    'REJECTED_INELIGIBLE','REJECTED_FRAUD','REJECTED_3DS','REJECTED_LIMIT','FAILED_PREFUND','FAILED'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
 
-### `fraud_screening` — Decision Manager result (1:N, allows retries)
-
-```sql
 CREATE TABLE fraud_screening (
-  id             BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  topup_id       BIGINT UNSIGNED NOT NULL,
-  provider       VARCHAR(40)  NOT NULL DEFAULT 'cybersource-decision-manager',
-  cs_decision_id VARCHAR(64)  NULL,               -- Cybersource decision response id
-  decision       VARCHAR(20)  NOT NULL,           -- ACCEPT/REJECT/REVIEW/ERROR
-  score          SMALLINT UNSIGNED NULL,          -- riskInformation.score.result (0-99)
-  profile_name   VARCHAR(64)  NULL,
-  rules_json     JSON         NULL,               -- triggered rules / infoCodes (no PAN/PII)
-  created_at     DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id BIGINT UNSIGNED NOT NULL,
+  cs_decision_id VARCHAR(64) NULL,
+  decision VARCHAR(20) NOT NULL,
+  score SMALLINT UNSIGNED NULL,
+  rules_json JSON NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   KEY idx_fraud_topup (topup_id),
   CONSTRAINT fk_fraud_topup FOREIGN KEY (topup_id) REFERENCES topup(id),
   CONSTRAINT chk_fraud_decision CHECK (decision IN ('ACCEPT','REJECT','REVIEW','ERROR'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
 
-### `payer_authentication` — 3DS setup/enroll/validate (1:1, updated through the flow)
-
-```sql
 CREATE TABLE payer_authentication (
-  id                    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  topup_id              BIGINT UNSIGNED NOT NULL,
-  provider              VARCHAR(40)  NOT NULL DEFAULT 'cybersource-payer-authentication',
-  reference_id          VARCHAR(64)  NULL,        -- setup: consumerAuthenticationInformation.referenceId
-  authentication_txn_id VARCHAR(64)  NULL,        -- authenticationTransactionId
-  status                VARCHAR(40)  NULL,        -- PENDING_AUTHENTICATION / AUTHENTICATION_SUCCESSFUL / _FAILED
-  challenge_required    BOOLEAN      NULL,
-  -- results carried into the AFT authorization
-  cavv                  VARCHAR(64)  NULL,
-  eci                   VARCHAR(4)   NULL,
-  xid                   VARCHAR(64)  NULL,
-  ds_transaction_id     VARCHAR(64)  NULL,        -- directoryServerTransactionId
-  spec_version          VARCHAR(10)  NULL,        -- e.g. 2.2.0
-  pares_status          VARCHAR(4)   NULL,
-  created_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  updated_at            DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id BIGINT UNSIGNED NOT NULL,
+  reference_id VARCHAR(64) NULL,
+  authentication_txn_id VARCHAR(64) NULL,
+  status VARCHAR(40) NULL,
+  challenge_required BOOLEAN NULL,
+  step_up_url VARCHAR(512) NULL,
+  cavv VARCHAR(64) NULL,
+  eci VARCHAR(4) NULL,
+  xid VARCHAR(64) NULL,
+  ds_transaction_id VARCHAR(64) NULL,
+  spec_version VARCHAR(10) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   UNIQUE KEY uk_pa_topup (topup_id),
   CONSTRAINT fk_pa_topup FOREIGN KEY (topup_id) REFERENCES topup(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
-
-### `aft_result` & `prefunding` — outcomes consumed from downstream events
-
-```sql
-CREATE TABLE aft_result (
-  id                BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  topup_id          BIGINT UNSIGNED NOT NULL,
-  result            VARCHAR(20)  NOT NULL,        -- APPROVED/DECLINED/REVERSED
-  action_code       VARCHAR(4)   NULL,
-  approval_code     VARCHAR(10)  NULL,
-  visa_txn_id       VARCHAR(40)  NULL,            -- transactionIdentifier
-  status_identifier VARCHAR(40)  NULL,
-  created_at        DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  KEY idx_aft_topup (topup_id),
-  CONSTRAINT fk_aft_topup FOREIGN KEY (topup_id) REFERENCES topup(id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE prefunding (
-  id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  topup_id        BIGINT UNSIGNED NOT NULL,
-  status          VARCHAR(20)  NOT NULL,          -- COMPLETED/FAILED
-  funded_amount   DECIMAL(20,2) NULL,             -- VND
-  funded_currency CHAR(3)      NULL,
-  fx_rate         DECIMAL(18,6) NULL,
-  reason          VARCHAR(255) NULL,
-  created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id BIGINT UNSIGNED NOT NULL,
+  status VARCHAR(20) NOT NULL,
+  funded_amount DECIMAL(20,2) NULL,
+  funded_currency CHAR(3) NULL,
+  fx_rate DECIMAL(18,6) NULL,
+  reason VARCHAR(255) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   KEY idx_pf_topup (topup_id),
   CONSTRAINT fk_pf_topup FOREIGN KEY (topup_id) REFERENCES topup(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
 
-### `topup_state_transition` — append-only audit of the saga
+CREATE TABLE aft_correction (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id BIGINT UNSIGNED NOT NULL,
+  type VARCHAR(20) NOT NULL,
+  idempotency_key VARCHAR(64) NULL,
+  status VARCHAR(20) NOT NULL,
+  amount DECIMAL(18,2) NULL,
+  reason VARCHAR(255) NULL,
+  original_transaction_identifier VARCHAR(40) NULL,
+  systems_trace_audit_number INT UNSIGNED NULL,
+  action_code VARCHAR(4) NULL,
+  visa_transaction_identifier VARCHAR(40) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_corr_idem (idempotency_key),
+  KEY idx_corr_topup (topup_id),
+  CONSTRAINT fk_corr_topup FOREIGN KEY (topup_id) REFERENCES topup(id),
+  CONSTRAINT chk_corr_type CHECK (type IN ('REVERSAL','ADJUSTMENT','REFUND')),
+  CONSTRAINT chk_corr_status CHECK (status IN ('SUBMITTED','COMPLETED','FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-```sql
+CREATE TABLE visa_call (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id BIGINT UNSIGNED NULL,
+  operation VARCHAR(30) NOT NULL,
+  systems_trace_audit_number INT UNSIGNED NULL,
+  http_status SMALLINT NULL,
+  action_code VARCHAR(4) NULL,
+  transaction_identifier VARCHAR(40) NULL,
+  status_identifier VARCHAR(40) NULL,
+  request_json JSON NULL,
+  response_json JSON NULL,
+  latency_ms INT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_vc_topup (topup_id),
+  CONSTRAINT fk_vc_topup FOREIGN KEY (topup_id) REFERENCES topup(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE limit_config (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  version INT NOT NULL,
+  config_json JSON NOT NULL,
+  source VARCHAR(40) NOT NULL,
+  effective_from DATETIME(3) NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_limit_version (version)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Cached Visa daily FX rate per currency pair (refreshed by a scheduled job; no hot-path call).
+CREATE TABLE fx_rate_daily (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  source_currency       CHAR(3)       NOT NULL,
+  destination_currency  CHAR(3)       NOT NULL,
+  base_conversion_rate  DECIMAL(18,8) NOT NULL,        -- Visa base daily rate
+  markup_rate           DECIMAL(9,6)  NULL,            -- our contracted FX margin
+  conversion_rate       DECIMAL(18,8) NOT NULL,        -- base + markup (total)
+  as_of_date            DATE          NOT NULL,        -- Visa rate date
+  visa_rate_timestamp   DATETIME(3)   NULL,            -- Visa lastUpdated
+  fetched_at            DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_fxdaily_pair_date (source_currency, destination_currency, as_of_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Per-transaction FX snapshot/quote — the rate recorded at authorization (settlement reference).
+CREATE TABLE fx_quote (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  quote_id              CHAR(36)      NOT NULL,
+  topup_id              BIGINT UNSIGNED NULL,          -- bound at authorization
+  transaction_ref       VARCHAR(48)   NULL,
+  source_currency       CHAR(3)       NOT NULL,
+  destination_currency  CHAR(3)       NOT NULL,
+  source_amount         DECIMAL(18,2) NOT NULL,
+  destination_amount    DECIMAL(20,2) NOT NULL,
+  base_conversion_rate  DECIMAL(18,8) NOT NULL,
+  markup_rate           DECIMAL(9,6)  NULL,
+  conversion_rate       DECIMAL(18,8) NOT NULL,        -- recorded settlement reference
+  as_of_date            DATE          NULL,
+  visa_rate_timestamp   DATETIME(3)   NULL,
+  status                VARCHAR(20)   NOT NULL,        -- QUOTED / LOCKED / EXPIRED
+  expires_at            DATETIME(3)   NULL,
+  created_at            DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_fxquote_qid (quote_id),
+  KEY idx_fxquote_topup (topup_id), KEY idx_fxquote_txn (transaction_ref),
+  CONSTRAINT fk_fxquote_topup FOREIGN KEY (topup_id) REFERENCES topup(id),
+  CONSTRAINT chk_fxquote_status CHECK (status IN ('QUOTED','LOCKED','EXPIRED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE topup_state_transition (
-  id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  topup_id    BIGINT UNSIGNED NOT NULL,
-  from_status VARCHAR(40)  NULL,
-  to_status   VARCHAR(40)  NOT NULL,
-  reason      VARCHAR(255) NULL,
-  event_ref   VARCHAR(36)  NULL,                  -- triggering event id, if any
-  created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  topup_id BIGINT UNSIGNED NOT NULL,
+  from_status VARCHAR(40) NULL,
+  to_status VARCHAR(40) NOT NULL,
+  reason VARCHAR(255) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   KEY idx_sttn_topup (topup_id, created_at),
   CONSTRAINT fk_sttn_topup FOREIGN KEY (topup_id) REFERENCES topup(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
-### `outbox` & `processed_event` — reliable, idempotent messaging
-
-```sql
--- Transactional outbox: written in the same tx as the state change; a relay publishes it.
-CREATE TABLE outbox (
-  id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  event_id      CHAR(36)     NOT NULL,            -- envelope.eventId
-  event_type    VARCHAR(64)  NOT NULL,            -- aft.requested / prefunding.requested / partner.notification.requested / aft.reversal.requested
-  aggregate_id  VARCHAR(48)  NOT NULL,            -- transaction_ref (partition/ordering key)
-  payload       JSON         NOT NULL,            -- full event envelope
-  status        VARCHAR(20)  NOT NULL DEFAULT 'PENDING',  -- PENDING/PUBLISHED/FAILED
-  attempts      INT          NOT NULL DEFAULT 0,
-  available_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  published_at  DATETIME(3)  NULL,
-  created_at    DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  UNIQUE KEY uk_outbox_event (event_id),
-  KEY idx_outbox_dispatch (status, available_at),
-  CONSTRAINT chk_outbox_status CHECK (status IN ('PENDING','PUBLISHED','FAILED'))
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
--- Inbox: dedupes consumed events so redelivery is a no-op (at-least-once delivery).
-CREATE TABLE processed_event (
-  event_id     CHAR(36)    NOT NULL PRIMARY KEY,  -- consumed envelope.eventId
-  event_type   VARCHAR(64) NOT NULL,
-  topup_ref    VARCHAR(48) NULL,
-  processed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-```
-
-> **Notes.** Partner webhooks are emitted as `partner.notification.requested` rows in
-> `outbox` (the gateway egress delivers them) — no separate table needed. JSON columns must
-> be **scrubbed of PAN/PII** before persisting. For high insert volume, prefer a time-ordered
-> id (UUIDv7/ULID) for `transaction_ref`/`event_id`; manage all DDL with Flyway.
+> **Notes.** STAN unique per `(acquiring_bin, transmission_date)`, allocated from
+> `idempotency_key`. Runtime velocity counters in **Redis**. The transient Flex token is
+> **never persisted** (short-lived); only the TMS id is. Manage DDL with Flyway.
 
 ### dbdiagram (DBML)
 
-Paste into [dbdiagram.io](https://dbdiagram.io) to render the ER diagram:
+Paste into [dbdiagram.io](https://dbdiagram.io):
 
 ```
-// DBML for tc-cardload-service — paste into https://dbdiagram.io
+// DBML for tc-cardload-service (5 modules, synchronous) — paste into https://dbdiagram.io
 
 Enum topup_status {
   CREATED
@@ -612,112 +903,105 @@ Enum topup_status {
   AUTH_SETUP
   AUTH_ENROLLMENT
   AWAITING_CHALLENGE
+  CHALLENGE_EXPIRED
   AUTH_VALIDATION
-  AFT_PULL
+  LIMIT_CHECK
+  AFT_SUBMITTED
   AFT_APPROVED
+  AFT_DECLINED
+  STATUS_QUERY
+  REVERSAL_SUBMITTED
+  REVERSED
   PREFUNDING
   COMPLETED
+  ADJUSTMENT_SUBMITTED
+  ADJUSTED
+  OCT_SUBMITTED
+  REFUNDED
   REJECTED_INELIGIBLE
   REJECTED_FRAUD
   REJECTED_3DS
-  FAILED_AFT
+  REJECTED_LIMIT
   FAILED_PREFUND
-}
-
-Enum dm_decision {
-  ACCEPT
-  REJECT
-  REVIEW
-  ERROR
-}
-
-Enum outbox_status {
-  PENDING
-  PUBLISHED
   FAILED
 }
+Enum dm_decision { ACCEPT REJECT REVIEW ERROR }
+Enum correction_type { REVERSAL ADJUSTMENT REFUND }
+Enum correction_status { SUBMITTED COMPLETED FAILED }
+Enum fx_quote_status { QUOTED LOCKED EXPIRED }
 
 Table topup {
   id bigint [pk, increment]
-  transaction_ref varchar(48) [not null, unique, note: 'business id / event transactionId']
+  transaction_ref varchar(48) [not null, unique, note: 'business id']
   idempotency_key varchar(64) [not null, unique]
-  correlation_id varchar(64) [not null]
+  correlation_id varchar(64) [not null, note: 'trace id']
   pvcb_reference varchar(64)
   status topup_status [not null]
   amount decimal(18,2) [not null]
   currency char(3) [not null]
-  card_instrument_id varchar(64) [note: 'Cybersource TMS id — never PAN']
+  card_instrument_id varchar(64) [note: 'TMS id — never PAN']
+  network_token_ref varchar(64) [note: 'VTS network token ref — never PAN']
   card_fingerprint varchar(128)
   card_last4 char(4)
-  card_brand varchar(20)
   card_exp_month tinyint
   card_exp_year smallint
   customer_ref varchar(64)
   fraud_enabled boolean [not null, default: true]
-  fraud_decision varchar(20) [note: 'ACCEPT/REJECT/REVIEW/SKIPPED']
+  fraud_decision varchar(20)
   threeds_status varchar(40)
-  aft_action_code varchar(4)
-  aft_txn_id varchar(40)
+  challenge_expires_at datetime [note: 'CHALLENGE_REQUIRED TTL']
+  business_application_id varchar(4)
+  merchant_category_code varchar(4)
+  acquiring_bin varchar(11)
+  systems_trace_audit_number int [note: 'STAN']
+  retrieval_reference_number varchar(12)
+  transmission_datetime datetime
+  action_code varchar(4) [note: '00 = approved']
+  approval_code varchar(10)
+  transaction_identifier varchar(40) [note: 'Visa txn id']
+  status_identifier varchar(40)
+  settlement_date date
   reject_reason varchar(255)
-  challenge_expires_at datetime
+  error_code varchar(40) [note: 'failure code, e.g. VISA_TIMEOUT']
+  retryable boolean [note: 'true → safe to retry (no money moved)']
   created_at datetime [not null, default: `now()`]
   updated_at datetime [not null, default: `now()`]
   version int [not null, default: 0]
 
   indexes {
     status [name: 'idx_topup_status']
+    correlation_id [name: 'idx_topup_corr']
+    transaction_identifier [name: 'idx_topup_txnid']
     card_fingerprint [name: 'idx_topup_card_fp']
-    created_at [name: 'idx_topup_created']
   }
 }
 
 Table fraud_screening {
   id bigint [pk, increment]
   topup_id bigint [not null]
-  provider varchar(40) [not null, default: 'cybersource-decision-manager']
   cs_decision_id varchar(64)
   decision dm_decision [not null]
   score smallint
-  profile_name varchar(64)
   rules_json json
   created_at datetime [not null, default: `now()`]
-
-  indexes {
-    topup_id [name: 'idx_fraud_topup']
-  }
+  indexes { topup_id [name: 'idx_fraud_topup'] }
 }
 
 Table payer_authentication {
   id bigint [pk, increment]
   topup_id bigint [not null, unique]
-  provider varchar(40) [not null, default: 'cybersource-payer-authentication']
   reference_id varchar(64)
   authentication_txn_id varchar(64)
   status varchar(40)
   challenge_required boolean
+  step_up_url varchar(512)
   cavv varchar(64)
   eci varchar(4)
   xid varchar(64)
   ds_transaction_id varchar(64)
   spec_version varchar(10)
-  pares_status varchar(4)
   created_at datetime [not null, default: `now()`]
   updated_at datetime [not null, default: `now()`]
-}
-
-Table aft_result {
-  id bigint [pk, increment]
-  topup_id bigint [not null]
-  result varchar(20) [not null]
-  action_code varchar(4)
-  approval_code varchar(10)
-  visa_txn_id varchar(40)
-  status_identifier varchar(40)
-  created_at datetime [not null, default: `now()`]
-
-  indexes {
-    topup_id [name: 'idx_aft_topup']
-  }
 }
 
 Table prefunding {
@@ -729,10 +1013,82 @@ Table prefunding {
   fx_rate decimal(18,6)
   reason varchar(255)
   created_at datetime [not null, default: `now()`]
+  indexes { topup_id [name: 'idx_pf_topup'] }
+}
 
-  indexes {
-    topup_id [name: 'idx_pf_topup']
-  }
+Table aft_correction {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
+  type correction_type [not null]
+  idempotency_key varchar(64) [unique]
+  status correction_status [not null]
+  amount decimal(18,2)
+  reason varchar(255)
+  original_transaction_identifier varchar(40)
+  systems_trace_audit_number int
+  action_code varchar(4)
+  visa_transaction_identifier varchar(40)
+  created_at datetime [not null, default: `now()`]
+  updated_at datetime [not null, default: `now()`]
+  indexes { topup_id [name: 'idx_corr_topup'] }
+}
+
+Table visa_call {
+  id bigint [pk, increment]
+  topup_id bigint
+  operation varchar(30) [not null, note: 'AFT_PULL/REVERSE/ADJUST/OCT/STATUS_QUERY/PAAI']
+  systems_trace_audit_number int
+  http_status smallint
+  action_code varchar(4)
+  transaction_identifier varchar(40)
+  status_identifier varchar(40)
+  request_json json [note: 'scrubbed; network token, no PAN']
+  response_json json
+  latency_ms int
+  created_at datetime [not null, default: `now()`]
+  indexes { topup_id [name: 'idx_vc_topup'] }
+}
+
+Table limit_config {
+  id bigint [pk, increment]
+  version int [not null, unique]
+  config_json json [not null]
+  source varchar(40) [not null]
+  effective_from datetime [not null]
+  created_at datetime [not null, default: `now()`]
+}
+
+Table fx_rate_daily {
+  id bigint [pk, increment]
+  source_currency char(3) [not null]
+  destination_currency char(3) [not null]
+  base_conversion_rate decimal(18,8) [not null, note: 'Visa base daily rate']
+  markup_rate decimal(9,6) [note: 'our FX margin']
+  conversion_rate decimal(18,8) [not null, note: 'base + markup']
+  as_of_date date [not null]
+  visa_rate_timestamp datetime
+  fetched_at datetime [not null, default: `now()`]
+  indexes { (source_currency, destination_currency, as_of_date) [unique, name: 'uk_fxdaily_pair_date'] }
+}
+
+Table fx_quote {
+  id bigint [pk, increment]
+  quote_id char(36) [not null, unique]
+  topup_id bigint [note: 'bound at authorization']
+  transaction_ref varchar(48)
+  source_currency char(3) [not null]
+  destination_currency char(3) [not null]
+  source_amount decimal(18,2) [not null]
+  destination_amount decimal(20,2) [not null]
+  base_conversion_rate decimal(18,8) [not null]
+  markup_rate decimal(9,6)
+  conversion_rate decimal(18,8) [not null, note: 'recorded settlement reference']
+  as_of_date date
+  visa_rate_timestamp datetime
+  status fx_quote_status [not null]
+  expires_at datetime
+  created_at datetime [not null, default: `now()`]
+  indexes { topup_id [name: 'idx_fxquote_topup'] transaction_ref [name: 'idx_fxquote_txn'] }
 }
 
 Table topup_state_transition {
@@ -741,85 +1097,328 @@ Table topup_state_transition {
   from_status varchar(40)
   to_status varchar(40) [not null]
   reason varchar(255)
-  event_ref varchar(36)
   created_at datetime [not null, default: `now()`]
-
-  indexes {
-    (topup_id, created_at) [name: 'idx_sttn_topup']
-  }
-}
-
-Table outbox {
-  id bigint [pk, increment]
-  event_id char(36) [not null, unique]
-  event_type varchar(64) [not null]
-  aggregate_id varchar(48) [not null, note: 'transaction_ref / partition key']
-  payload json [not null]
-  status outbox_status [not null, default: 'PENDING']
-  attempts int [not null, default: 0]
-  available_at datetime [not null, default: `now()`]
-  published_at datetime
-  created_at datetime [not null, default: `now()`]
-
-  indexes {
-    (status, available_at) [name: 'idx_outbox_dispatch']
-  }
-}
-
-Table processed_event {
-  event_id char(36) [pk]
-  event_type varchar(64) [not null]
-  topup_ref varchar(48)
-  processed_at datetime [not null, default: `now()`]
+  indexes { (topup_id, created_at) [name: 'idx_sttn_topup'] }
 }
 
 Ref: fraud_screening.topup_id > topup.id
 Ref: payer_authentication.topup_id - topup.id
-Ref: aft_result.topup_id > topup.id
 Ref: prefunding.topup_id > topup.id
+Ref: aft_correction.topup_id > topup.id
+Ref: visa_call.topup_id > topup.id
 Ref: topup_state_transition.topup_id > topup.id
+Ref: fx_quote.topup_id > topup.id
 ```
+
+## Scalability & throughput
+
+The workload is **almost entirely I/O-bound** — a request spends its time waiting on
+Cybersource, Visa Direct, and short DB writes, with negligible CPU. That shapes the whole
+scaling strategy: **keep the simple, correct blocking code and let virtual threads provide the
+concurrency**, then **scale horizontally**, while accepting that the real ceiling is the
+external providers, not this service.
+
+### Virtual threads (JDK 25)
+
+The service is synchronous by design (for correctness — [persist-first](#status-tracking-persist-first),
+exactly-once). On platform threads that would cap in-flight requests at the pool size (a few
+hundred), and with multi-second Visa calls the throughput would be tiny. **Virtual threads**
+remove that cap:
+
+- Enable with `spring.threads.virtual.enabled=true` (Spring Boot 4): Tomcat serves **each
+  request on a virtual thread**, and every blocking `RestClient` / JDBC call **parks** the
+  virtual thread instead of holding a carrier (OS) thread. Tens of thousands of in-flight
+  blocking top-ups run on a handful of carriers.
+- **No reactive rewrite** — the blocking code stays readable and matches the error/recovery
+  design.
+- **Pinning is no longer the footgun it was:** JDK 24's **JEP 491** stopped virtual threads
+  pinning on `synchronized`, so on **JDK 25** the main hazard is gone. Still, avoid blocking
+  inside `synchronized`/native frames — prefer `ReentrantLock` around any I/O.
+- **Optional latency win:** use **structured concurrency** (`StructuredTaskScope`, JDK 25) to
+  fan out genuinely independent provider calls on virtual threads — e.g. run **Decision Manager
+  and the 3DS device-data-collection setup in parallel** — and join, shaving per-request
+  latency without extra threads.
+
+### The real ceiling is Cybersource + Visa Direct
+
+Virtual threads let us **fully use** whatever concurrency the providers permit; they cannot
+exceed it. So the service is built to respect and protect those limits, per provider:
+
+- **Client-side rate limiting** (token bucket) sized to the **Visa Direct TPS granted for the
+  BIN/program** and to Cybersource's limits — so we never get throttled or blocked upstream.
+- **Bounded HTTP connection pools** to each provider (sized to its allowed concurrency), with
+  **bounded timeouts**.
+- **Bulkheads** (separate pools/limiters per provider) so a slow Visa doesn't starve
+  Cybersource calls, and **circuit breakers** that fail fast when a provider degrades (Resilience4j).
+- **Backpressure, not unbounded queueing:** when we hit a provider's ceiling or a breaker is
+  open, return **`429`/`503`** to the gateway so load is shed/retried, rather than piling up
+  millions of parked virtual threads behind a saturated provider.
+
+### Don't hold scarce resources across an external call
+
+Virtual threads are cheap; **DB connections and provider slots are not**.
+
+- **Never hold a JDBC connection or an open transaction across a Cybersource/Visa call.** The
+  persist-first model already enforces this: commit the status → release the connection → make
+  the external call → commit the result. **HikariCP** is sized for the *DB's* concurrency, not
+  the request concurrency.
+- Keep transactions short and single-row where possible; the **DB pool and Redis (counters)**
+  are the shared limits to watch — not thread count.
+
+### The 3DS challenge consumes nothing
+
+A major scaling property of the [redirect + poll](#interaction-model--synchronous-response--polling)
+model: during the (possibly minutes-long) human 3DS challenge, **no thread and no connection
+are held** — the `POST` already returned the redirect and closed. The transaction sits in the
+DB as `AWAITING_CHALLENGE`. Customer think-time therefore **does not consume server
+concurrency** (unlike holding a connection open for the challenge).
+
+### Horizontal scaling
+
+- Each request's state lives in MySQL, so instances are **stateless** — scale out behind the
+  gateway/load balancer.
+- **Autoscale on in-flight request count, latency, and provider-saturation** — **not CPU**
+  (CPU stays low on an I/O-bound, virtual-threaded service).
+- Shared state is **MySQL** (primary + standby; add a **read replica for `/top-up-status`** at
+  high poll volume) and **Redis** (limit/velocity counters).
+
+### Status-poll load
+
+High top-up volume implies high `/top-up-status` poll volume. Keep it cheap: a **single-row
+indexed read** on `transaction_ref` (optionally cached in Redis or served from a read replica),
+a sane PVCB **poll cadence** (~2–3 s while in-flight), and `ETag`/conditional responses so an
+unchanged status is a near-free `304`.
+
+### Reaper at scale
+
+The recovery [reaper](#error-handling--recovery-money-movement-safe) must scale too: scan
+non-terminal transactions in **batches** on an index (`status`, `updated_at`), and **lease/claim**
+rows so multiple instances don't double-process the same transaction.
+
+### Knobs & signals
+
+| Tune | Watch |
+| --- | --- |
+| `spring.threads.virtual.enabled=true`; per-provider rate limit / pool / breaker; HikariCP size; reaper batch & lease | in-flight requests, provider latency / error / **throttle (429)** rate, HikariCP saturation, Redis latency, virtual-thread **pinning** (`-Djdk.tracePinnedThreads` in non-prod), `/top-up-status` QPS, autoscaler triggers |
+
+> **Bottom line.** Virtual threads make this service scale to the providers' limits on simple
+> blocking code; rate limiting + backpressure keep it *within* those limits; horizontal scaling
+> and a read replica absorb the rest. Beyond that, throughput is a **Cybersource/Visa capacity
+> conversation** (TPS quotas), not a code change here.
+
+## Failover & high availability
+
+Two **independent** failure domains: the **stateless instances** and the **stateful database**.
+A failure in either degrades to a **delay**, never a lost or double top-up — because the
+[persisted status is the source of truth](#status-tracking-persist-first), PVCB **polls** (never
+waits on a push), and money movement is
+[exactly-once](#error-handling--recovery-money-movement-safe).
+
+### Instance failover — active-active, not hot-standby
+
+There is **no designated backup instance to boot up** (too slow for a money path). Capacity is
+**already running**:
+
+- **N ≥ 2 instances across ≥ 2 AZs**, all active behind the gateway/load balancer. Stateless, so
+  any instance serves any request.
+- **Health-gated routing.** Liveness + **readiness** probes; the LB drops an instance the instant
+  it fails health or **can't reach MySQL/Redis** (readiness = fail-closed at the edge). The
+  orchestrator (k8s / ASG / Nomad) restarts or reschedules it.
+- **The dead instance's in-flight work is recovered, not lost:**
+  - its last stage is already **committed** — the DB, not the dying process, holds the truth;
+  - PVCB's next **`/top-up-status`** poll is answered by a **surviving** instance from the DB;
+  - the **[reaper](#reaper-at-scale)** — running on every instance, claiming rows by **lease /
+    `SELECT … FOR UPDATE SKIP LOCKED`** — reclaims the orphaned non-terminal transaction and drives
+    it to terminal (GET-status → approve / decline / reverse). The dead instance's lease simply
+    **expires** and a survivor takes over. *This is the "backup springing into action" — a peer,
+    not a cold standby.*
+  - a PVCB retry with the same **`Idempotency-Key`** lands on a survivor and returns current
+    state — **never a second top-up**.
+- **No sticky state:** the `/3ds-complete` callback and every poll are DB-backed, so they don't
+  care which instance the original `POST` hit.
+- **Graceful drain (planned loss / deploy):** SIGTERM → stop taking new work → finish in-flight
+  (bounded) → deregister → exit. Rolling deploys keep **N-1** serving; no maintenance window.
+
+> A crashed instance therefore needs **no failover action**: the load balancer stops routing to
+> it, peers keep serving, and the leased reaper finishes whatever it had mid-flight.
+
+### Database failover — primary → standby
+
+The stateful half — the **real** "main DB + backup DB" question. See the system-wide
+[data-durability policy](/docs/specifications/architecture#data-durability--primary--standby-hadr);
+for this service specifically:
+
+- **Topology:** primary **MySQL 8.4** + **standby replica** with **semi-synchronous** replication
+  (or a managed Multi-AZ equivalent), in **separate AZs**. Semi-sync means the standby holds every
+  **acknowledged** commit before the app sees success → **RPO ≈ 0**: a top-up PVCB was told
+  `APPROVED` **cannot vanish** on failover.
+- **Promotion is automatic, via a stable endpoint** (apps never hardcode the host):
+  - **Managed** (RDS/Aurora Multi-AZ, Cloud SQL HA): provider auto-failover flips the endpoint —
+    **RTO minutes** (Aurora ~30 s).
+  - **Self-managed (cloud-agnostic):** **MySQL InnoDB Cluster (Group Replication) + MySQL Router**,
+    or Orchestrator/MHA — promote the standby and keep traffic on the **Router / VIP / DNS** endpoint.
+- **App behavior during the (seconds–minutes) failover window:**
+  - **HikariCP** with connection validation + short timeouts detects the drop and reconnects to the
+    new primary through the stable endpoint;
+  - **fail closed** — while the DB is unreachable, reject new money movement with `503` (no
+    persist-first → no safe money movement). `/top-up-status` **reads** may serve **degraded** from a
+    **read replica** / last-known, clearly marked;
+  - once the new primary is live, in-flight transactions **resume from their last committed stage**
+    and the reaper mops up anything caught mid-call.
+- **After failover:** rebuild the old primary as the new standby (restore HA). **Binlog PITR +
+  snapshots** + periodic **restore drills** cover catastrophic loss beyond the standby.
+- **Redis** (limit/velocity counters, idempotency cache) runs **HA** too; if unreachable, limits
+  can't be evaluated → **fail closed**. It is a recovery dependency, not a system of record.
+
+### Both at once
+
+Even an instance crash **and** a primary-DB failover together degrade only to delay: persist-first
++ semi-sync = no acknowledged state lost; exactly-once Visa (STAN, GET-status, never blind-resend,
+reverse) = no double pull; PVCB polling + `Idempotency-Key` = safe retries; the **leased reaper**
+guarantees every non-terminal transaction reaches a terminal state once the platform recovers.
+
+| Failure | Detection | Recovery | PVCB sees |
+| --- | --- | --- | --- |
+| **Instance crash** | LB health check | LB drops it; peers serve; reaper reclaims its in-flight rows | uninterrupted (polls a peer) |
+| **Instance unhealthy** (DB/Redis unreachable) | readiness probe | pulled from rotation; fails closed | `503` on writes; status reads OK |
+| **Primary DB down** | replication monitor / managed HA | promote standby; apps reconnect via stable endpoint | brief `503` on writes, then resumes |
+| **AZ loss** | multi-AZ health | survivors in another AZ serve; DB promotes cross-AZ | bounded delay |
 
 ## Observability
 
-- Correlate on `txnId` end-to-end (propagate the gateway's `correlation-id`).
-- Metrics: fraud `ACCEPT/REJECT/REVIEW` rates and score distribution, 3DS
-  frictionless-vs-challenge ratio, challenge abandonment, AFT approval rate, and component
-  error / fail-closed counts.
-- Structured logs to SIEM with all card data masked; record Cybersource request ids for
-  support.
-- Alert on: fraud-reject spikes, 3DS failure spikes, Cybersource error-rate / latency, and
-  fail-closed counts.
+- Correlate on `transaction_ref` / `correlation_id` (`X-Correlation-Id`).
+- Metrics: 3DS frictionless-vs-challenge ratio, **challenge-completion vs expiry rate**,
+  `/top-up-status` poll volume, fraud accept/reject, limit rejections, AFT approval/decline by
+  `actionCode`, reaper actions, fail-closed counts.
+- Structured logs to SIEM with card data masked; record Cybersource + Visa request ids.
+- Alert on: challenge-expiry spikes, 3DS/AFT-decline spikes, reaper firing frequently, any
+  fail-closed event.
 
-## Events
+## Testing requirements
 
-Internal coordination is event-driven (see
-[Architecture](/docs/specifications/architecture)). The HTTP endpoints in
-[Service API](#service-api) are the **synchronous edge ingress + 3DS callback**; the AFT,
-prefunding, reversal, and partner-webhook interactions are **async events**. As the
-orchestrator, this service drives the saga and its compensation.
+This service moves money on **virtual threads** across **two external providers**, so the suite
+must prove the **non-functional guarantees** — not just happy-path correctness. Every property in
+[Resilience](#resilience--fault-tolerance), [Error handling](#error-handling--recovery-money-movement-safe),
+and [Failover](#failover--high-availability) needs a test that actively tries to break it.
+**P0** = must pass before any money flows in production.
 
-| Direction | Event | Counterpart |
+> **How we test.**
+> - **Fully automated, in code.** Every requirement below is proven by **automated tests committed
+>   to the repo** and run in CI with a single command — *not* by hand. **Manual tools (MySQL
+>   Workbench, Insomnia) are for exploration only**, never the evidence; anything verified manually
+>   must be **back-filled as an automated test** before it counts as done.
+> - **Reports — commit a summary, archive the rest.** Each suite writes a **rolling summary**
+>   (`reports/<suite>/summary.md`) — latest **pass/fail counts** + the **latency p50/p95/p99**
+>   table — that is **committed and overwritten each run**, so progress is trackable in **small
+>   diffs**. The **full per-run output** (verbose logs, JFR/pinning traces, coverage) goes to
+>   `reports/<suite>/runs/<run-id>/`, which is **git-ignored** and kept as **CI artifacts** only.
+
+### 1. Concurrency & non-blocking — the focus
+
+Prove the blocking `RestClient` / JDBC calls **park** virtual threads instead of pinning carriers.
+
+| Test | How | Pass criteria |
 | --- | --- | --- |
-| produces | `aft.requested` | card-network |
-| consumes | `aft.completed` / `aft.declined` | card-network |
-| produces | `prefunding.requested` | core-banking adapter |
-| consumes | `prefunding.completed` / `prefunding.failed` | core-banking adapter |
-| produces | `aft.reversal.requested` (compensation, on `prefunding.failed`) | card-network |
-| produces | `partner.notification.requested` (reject / challenge / success) | gateway webhook egress |
+| **No-block under load** (P0) | N = 10k concurrent in-flight top-ups against a **mock provider with injected latency** (e.g. 2 s) | throughput ≈ N ÷ latency; **carrier (platform) threads ≤ ~#cores**; added p99 latency negligible (requests **park**, not queue) |
+| **Zero pinning** (P0) | run the load with `-Djdk.tracePinnedThreads=full` + JFR `jdk.VirtualThreadPinned` | **0 pinning events**; fix any `synchronized` around I/O (use `ReentrantLock`) |
+| **No scarce-resource hold** (P0) | high concurrency with a small HikariCP pool | **no JDBC connection / provider slot held across an external call**; pool never exhausted ([persist-first](#dont-hold-scarce-resources-across-an-external-call) contract) |
+| **Backpressure, not OOM** | drive past a provider's rate limit / open the breaker | returns **`429`/`503`** (load shed); no unbounded parked threads, no heap blow-up |
 
-The outbound webhooks in [Service API](#service-api) are emitted as
-`partner.notification.requested` events (at-least-once, DLQ) rather than direct calls.
+### 2. Provider latency & timeout benchmarks — the focus
+
+Know what Cybersource and Visa actually cost, and derive timeouts from data, not guesses.
+
+- **Benchmark each call against sandbox** and record **p50 / p95 / p99**: tokenization, DM,
+  Payer-Auth setup/enrol/validate, **AFT pull**, **GET-status**, reversal, and **FX rate**.
+- **Timeouts are derived** (≈ p99 × 1.5–2) and **documented per call**; per-provider pool and
+  rate-limiter sizes are set to *measured latency × granted TPS*.
+- **Regression gate (CI):** fail the build if any call's **p95 regresses** beyond a threshold vs
+  the recorded baseline.
+- **Slow-provider sweep:** inject 1 s / 3 s / 10 s / hard-timeout and assert the *right* branch
+  fires at each (continue → GET-status → reverse → fail-closed).
+
+### 3. Persistence & traceability — "always recorded" (the focus)
+
+| Invariant | Test | Pass criteria |
+| --- | --- | --- |
+| **Persist-first** (P0) | for every accepted request, inspect the DB before the first provider call | a `topup` row exists with a **committed status** + `correlation_id` *before* any external call |
+| **Crash-durable** (P0) | kill `-9` the process **before/after each boundary** (tokenize, DM, AFT submit, AFT response, prefund, FX) | the `topup` + `topup_state_transition` history survive; the [reaper](#reaper-at-scale) drives it to a **terminal** state |
+| **No orphan** | exercise every path | every provider call has a `visa_call`/audit row; every transition recorded; **no in-memory-only state** |
+| **No lost update** | concurrent writes to one `topup` | optimistic-lock (`version`) conflict handled — no silently dropped write |
+| **Reconstructable** | terminal transactions | queryable by `transaction_ref` **and** `correlation_id`, with the **FX snapshot** present |
+
+### 4. Exactly-once money movement (P0)
+
+- **AFT timeout → never blind-resend:** mock Visa counts pulls; on timeout the service does
+  **GET-status**, then reverses if uncertain. Assert **pull count ≤ 1**, ever.
+- **Idempotency:** same `Idempotency-Key` → identical result, **one** top-up; fire **concurrent
+  duplicate POSTs** → exactly one AFT.
+- **Prefunding failure → AFT auto-reversed:** assert `REVERSED`/`FAILED_PREFUND` and **no stranded
+  funds**.
+- **STAN uniqueness** per `(acquiring_bin, transmission_date)`.
+
+### 5. Failure injection & fail-closed (P0)
+
+- Walk the [cascading-failure table](#tolerance-under-cascading-failure): each dependency down
+  (Cybersource, Visa, **FX**, DB, Redis) and the combinations — assert correct
+  `error_code`/`retryable`, **no money moved**, a **definitive** status, **never "pending forever"**.
+- **Fail-closed:** when DM / 3DS / limits / FX / DB / Redis **can't be evaluated** → **REJECT**,
+  never advance.
+- Malformed / garbage provider responses, HTTP 5xx, connection resets, mid-write kills.
+
+### 6. Reaper, limits, 3DS & FX
+
+- **Reaper:** a stuck transaction at **each** non-terminal stage converges to terminal on TTL;
+  **leased** reaper across multiple instances → **no double-processing** (`SKIP LOCKED`);
+  `CHALLENGE_EXPIRED` fires on TTL.
+- **Limits:** per-txn (**the $10 M guard**), per-card daily, velocity, per-BIN, global ceiling,
+  currency allowlist; **concurrent race** on a limit → Redis counter stays correct (no overshoot).
+- **3DS:** frictionless vs challenge; methods (OTP / OOB / biometric / passkey); the
+  `/3ds-complete` callback lands on **any** instance; **callback-token replay rejected**; expiry.
+- **FX:** daily-cache refresh; per-txn snapshot **recorded & immutable**; quote TTL/lock honored;
+  **fail-closed when no rate**; the recorded rate is the basis of the funded amount.
+
+### 7. Security / PCI (P0)
+
+- **Automated log + payload scan:** assert **no PAN / CVV / track data / transient token / secret**
+  appears in any log line or persisted column; **PAN is never stored**; the payload to Visa is
+  **MLE-encrypted**; secrets come from the vault, never config.
+
+### 8. HA / failover & load (pre-prod)
+
+- **DB failover:** kill the primary mid-flight → **RPO ≈ 0** (an acked `APPROVED` survives), writes
+  **fail-closed** during the window, transactions **resume** after promotion
+  ([Failover](#failover--high-availability)).
+- **Instance crash:** a peer + the leased reaper complete the in-flight work; PVCB's poll is
+  uninterrupted.
+- **Load / soak / spike:** sustained run at the **granted Visa/Cybersource TPS** (throughput holds,
+  breakers behave); **multi-hour soak** for leaks; **spike** for autoscale + backpressure.
+
+### Tooling & CI gates
+
+- **Tools:** JUnit 5, **Testcontainers** (MySQL + Redis), **WireMock** for provider mocks with
+  **latency/fault injection**, **Toxiproxy** for network chaos, **k6/Gatling** for load, **JFR**
+  for pinning, **Pact** (or sandbox contract tests) against Cybersource + Visa.
+- **Gates:** the **P0 suite blocks deploy**; the **latency-regression** gate and the **log-leak
+  scan** run every build; require coverage on the **orchestrator + state machine** (no illegal
+  state transitions).
 
 ## Assumptions & open questions
 
-1. **REVIEW policy.** Default is `HOLD` (queue, no funds move). Confirm whether the business
-   wants auto-reject instead, and the ops SLA for clearing the review queue.
-2. **3DS mandatory?** Spec assumes payer authentication is always on for cross-border AFT
-   (SCA / liability). Confirm whether any low-value/low-risk corridor may skip it — if so,
-   it becomes a second toggle like DM.
-3. **Frictionless acceptance.** `allowFrictionless` lets a frictionless
-   `AUTHENTICATION_SUCCESSFUL` proceed with no step-up; confirm acceptable ECI set with
-   risk/Visa.
-4. **AFT eligibility source.** Modeled as a pre-gate via `tc-card-network-service` to Visa
-   Direct (card attributes / funds-transfer eligibility), not Cybersource.
+1. **Challenge TTL.** Default 8 min before `CHALLENGE_EXPIRED`; confirm a value that
+   comfortably covers OOB/in-app/passkey methods (which run longer than OTP).
+2. **PVCB poll cadence.** Recommend PVCB poll `/top-up-status` every ~2–3 s while
+   `CHALLENGE_REQUIRED`/`AFT_PROCESSING`; confirm acceptable.
+3. **Who hosts the 3DS step-up page.** Assumed a tc-hosted page wraps the Cardinal iframe +
+   return-URL listener; confirm vs PVCB hosting it directly with the JWT.
+4. **REVIEW policy** default `HOLD`; confirm.
+
+## References
+
+- [Cybersource — Payer Authentication (REST)](https://developer.cybersource.com/docs/cybs/en-us/payer-authentication/developer/all/rest/payer-auth/pa-about-guide.html) ·
+  [Step-up flow & receiving results](https://developer.cybersource.com/docs/cybs/en-us/payer-authentication/developer/all/so/payer-auth/pa2-ccdc-stepup-frame-intro.html) ·
+  [Decision Manager](https://developer.cybersource.com/library/documentation/dev_guides/Decision_Manager_DG/html/index.html)
+- [Visa Direct API reference](https://developer.visa.com/capabilities/visa_direct/reference) ·
+  [Payment Account Attributes Inquiry (PAAI) — Funds Transfer Attributes Inquiry](https://developer.visa.com/capabilities/paai/reference)
+- 3DS challenge methods: [EMV 3DS ACS — Passkeys, FIDO & SPC (Corbado)](https://www.corbado.com/blog/emv-3ds-acs-passkeys-fido-and-spc) ·
+  [EMV 3DS 2.3 fraud prevention (GPayments)](https://blog.gpayments.com/article/emv-3ds-2-3-and-the-enhancement-of-fraud-prevention)

@@ -1,0 +1,452 @@
+---
+title: tc-settlement-service
+description: Visa settlement reconciler — ingests the Visa settlement file, parses the fixed-width records into clean rows, and matches each settled transaction to its authorization and prefunding legs (read from tc-cardload-service) on the Visa transaction identifier; reports breaks. No ledger — PVCB is the book of record and owns liquidity.
+permission: member
+---
+
+## Purpose & scope
+
+`tc-settlement-service` does **one job: reconcile**. It ingests the Visa settlement file,
+stages it **as-is**, parses the ugly fixed-width records into clean typed rows, and **matches
+each settled transaction** against its authorization and prefunding legs — then reports matches
+and breaks.
+
+It is **not** a ledger. tc keeps **no general ledger**: **PVCB (the bank) is the book of
+record** and owns liquidity/exposure. This service holds no account balances and moves no money.
+Its value is proof — that every dollar Visa settled ties back to a real **authorized + prefunded**
+top-up, and that anything which doesn't is surfaced as a **break**.
+
+> **Architecture note.** This service began as a merge of the former `tc-ledger-service`
+> (double-entry book) and `tc-settlement-reconciliation-service`. The **double-entry book has
+> since been removed** — PVCB is the book of record and handles liquidity — leaving a **pure
+> reconciler**. Services still communicate over **synchronous REST**; there is no broker. See
+> [Architecture & service interaction](/docs/specifications/architecture).
+
+> **Single focus: matching.** The engine does exactly one thing — match each settled line to its
+> authorization and prefunding leg, and report the outcome. It does not book money, hold
+> balances, or own prefunding status (that's [`tc-cardload-service`](/docs/specifications/tc-cardload-service)).
+> Keep it that way.
+
+## Technical stack
+
+JDK 25, Spring Boot 4.0+ (Maven), Spring Data JPA on **MySQL 8.4 LTS (InnoDB)** with `DECIMAL`
+money columns and strict SQL mode; `RestClient` (reads the **authorization + prefunding legs**
+from `tc-cardload-service`) and an **SFTP client** (settlement file). Reconciliation is a
+**scheduled batch**; the match itself is **set-based SQL**, not a row-by-row loop. No
+messaging/broker. See [Architecture](/docs/specifications/architecture).
+
+## Position in the flow
+
+```
+PVCB Acquiring host ──POST /v1/settlement-files (ingest, T+n)──▶ tc-settlement-service
+Visa SFTP ───────────(poller fetches the file)────────────────▶   raw-stage → parse → MATCH → report
+   read authorization + prefunding legs (sync) ◀──────────────── tc-cardload-service
+   reconciliation summary / breaks ─────────────────────────────▶ tc-admin-service (sync reads)
+```
+
+There is **no `POST /v1/postings`** and no clearing entry — `tc-cardload-service` never calls
+this service. The data flow is one-directional into reconciliation: the file comes in, the legs
+are **read** from cardload, and the output is match results + breaks.
+
+## The matching problem — what do we match on?
+
+This is the crux, and it's worth stating plainly because the obvious key is the wrong one.
+
+- **Your internal `transaction_ref` never reaches Visa.** It's a `topup-<uuid>` you mint; Visa
+  has never seen it, so it **cannot** appear in the settlement file. Matching on it is impossible.
+- **The bridge is the Visa Transaction Identifier (TID)** — `transactionIdentifier`. Visa assigns
+  it (a numeric value up to **15 digits**), returns it to the acquirer **in the AFT
+  authorization response**, and deliberately carries it through the **entire lifecycle**
+  (reversals, adjustments, chargebacks) into **clearing and settlement** as its audit-trail key.
+  You capture it at auth time and it reappears, unchanged, on the settlement record. It is the
+  **one identifier that crosses the boundary** into Visa's settlement world.
+
+So the "three-way match" is really **two joins on two different keys**:
+
+```
+settlement_record ──TID (Visa's key)──▶ auth_leg ──transaction_ref (your key)──▶ prefunding_leg
+   (from the file)                     (from cardload)                          (from cardload)
+```
+
+- **settlement ↔ authorization** → join on the **TID** (`visa_transaction_identifier`). The only
+  shared key, because it's Visa's, not ours.
+- **authorization ↔ prefunding** → join on **our `transaction_ref`**. Both rows are ours, so this
+  join is trivially reliable.
+
+The first join is the hard one; the second is free.
+
+## Matching method — set-based, deterministic-then-fallback
+
+**Don't loop row-by-row.** A `for` loop issuing one query per settlement line is N round-trips.
+Instead, parse the file into `settlement_record` with a **normalized, indexed** TID; keep
+`auth_leg`/`prefunding_leg` as **local read-model tables** (synced from cardload) indexed on
+TID/`transaction_ref`; then let the **database** match in a few **set passes**:
+
+```sql
+-- Pass 1: MATCHED — inner join on Visa's key, then chain to prefunding on our key
+SELECT s.id AS settlement_record_id, a.transaction_ref, p.transaction_ref AS prefund_ref
+FROM   settlement_record s
+JOIN   auth_leg a       ON a.visa_transaction_identifier = s.transaction_identifier
+LEFT   JOIN prefunding_leg p ON p.transaction_ref = a.transaction_ref
+WHERE  s.settlement_file_id = :fileId;
+
+-- Pass 2: ORPHAN_SETTLEMENT — settlement line with no authorization (anti-join)
+SELECT s.id FROM settlement_record s
+LEFT JOIN auth_leg a ON a.visa_transaction_identifier = s.transaction_identifier
+WHERE s.settlement_file_id = :fileId AND a.transaction_ref IS NULL;
+
+-- Pass 3: UNSETTLED — an authorization that never appeared in the file (anti-join, scoped to the cycle)
+SELECT a.transaction_ref FROM auth_leg a
+LEFT JOIN settlement_record s ON s.transaction_identifier = a.visa_transaction_identifier
+WHERE a.auth_status = 'APPROVED' AND a.auth_date < :cycleCutoff AND s.id IS NULL;
+```
+
+One indexed pass the optimizer handles, vs. thousands of round-trips — seconds instead of
+minutes, and **restartable**. Four rules make it correct:
+
+1. **Waterfall: exact first, fallback only on the residue.** Pass 1 matches on the **exact TID**
+   and auto-clears (after the amount check). Some acquirer/processor settlement variants drop or
+   reformat the TID — for *only those* leftover rows, **propose** a match on a composite fallback
+   key and flag it `match_method = FALLBACK` (**never auto-clear**):
+   - `retrieval_reference_number (RRN) + acquiring_bin + settlement_date`, or
+   - `auth_code + settled_amount + settlement_date`, or
+   - `acquirer_reference_number (ARN)` if the file carries it.
+2. **Never match on amount.** Settled **≠** authorized — interchange, scheme fees, and FX move the
+   number. Amount is a **tolerance check *after*** you've matched on the TID, never a key. The
+   **expected** value uses the **Visa FX rate recorded at authorization** (cardload's `fx_quote`,
+   surfaced on `prefunding_leg.fx_rate`); the residual gap is **FX drift / gain-loss**. (Matching
+   on amount is the #1 reconciliation mistake.)
+3. **Normalize the key at transform time.** Strip leading zeros, trim, upper-case — store the
+   **canonical** TID in `settlement_record` so the index join is exact. Mismatched zero-padding is
+   the silent killer.
+4. **One TID → several lines over time.** Original + reversal + adjustment all share the TID.
+   Group settlement lines by TID and **net by record type** — it is not strictly 1:1.
+
+## Outcomes & breaks
+
+For each settled line (or unmatched authorization), the engine writes one `reconciliation_result`:
+
+| Outcome | Condition | Action |
+| --- | --- | --- |
+| `MATCHED` | all legs present and amounts reconcile within tolerance | **record the match** (no posting — there is no ledger) |
+| `AMOUNT_MISMATCH` | settled ≠ expected beyond tolerance | break → exception for ops |
+| `UNSETTLED` | auth + prefund, no settlement line | outstanding; escalate if past the expected T+n window |
+| `ORPHAN_SETTLEMENT` | settlement line, no authorization | break → exception |
+| `MISSING_PREFUND` | auth + settlement, no prefunding | **high-priority break** — pulled and settled but never funded |
+| `REVERSAL` / `ADJUSTMENT` | the settled line is an AFTR/adjustment | match against the reversal/adjustment record (also from cardload) and **net** |
+| `DUPLICATE_SETTLEMENT` | a second settlement line for one transaction | ignore the duplicate; alert |
+
+**Breaks never auto-clear** — they go to an **exception queue** surfaced in
+[`tc-admin-service`](/docs/specifications/tc-admin-service); only a `MATCHED` (or an ops-approved
+resolution) closes a result.
+
+## Ingestion & validation
+
+- A settlement file enters via the **ingestion API `POST /v1/settlement-files`** (the PVCB
+  Acquiring host or ops uploads/triggers it), or an **SFTP poller** fetches it from secure
+  storage. Files **dedupe on name + hash**.
+- Visa settlement reporting is the **VisaNet Settlement Service (VSS)** — **TC46**
+  (machine-readable) / **TC47** (human-readable), fixed-width **TCR** layouts with header/trailer
+  control records. **Validate control totals + sequence**; a file failing validation is
+  **rejected whole**, never partially applied. The parser is **pluggable** (the exact VSS report
+  set/layout is config — confirm with Visa).
+
+## Stage-then-process (the as-is table)
+
+```
+Visa file ─▶ settlement_file ─▶ settlement_raw_record (AS-IS)  ──transform──▶ settlement_record (clean rows)
+                                                                                     │
+authorization + prefunding legs (sync from cardload) ─▶ MATCH ─▶ reconciliation_result
+```
+
+- **`settlement_raw_record` is the as-is landing table:** every record is written **verbatim**
+  (`raw_line` + positional fields as untyped strings) before any interpretation, so the ugly
+  fixed-width file can be re-parsed/audited without re-fetching.
+- **`settlement_record` is the transformed output** — clean, typed, queryable rows derived from
+  the raw lines (linking back to `raw_record_id`), with the **canonical TID** and the fallback
+  keys (RRN, ARN, auth code) populated. This is the "ugly file → easy DB rows" step.
+
+## The leg read-model (from cardload)
+
+`auth_leg` and `prefunding_leg` are **local copies** of the authorization and prefunding facts,
+read **synchronously** from `tc-cardload-service` (`GET` read API) at — or shortly before — match
+time. They exist so matching is a **local indexed join**, not a per-row network call. cardload
+remains the **owner** of both facts (including prefunding status); this service only reads and
+matches.
+
+## Scheduling & idempotency
+
+- Run a **daily cycle** aligned to Visa's delivery window; a poller catches late files.
+- Each run: fetch → validate → stage → normalize → read legs → **match** → write results →
+  report. **Restartable**; a mid-run failure leaves results partially written but **never
+  inconsistent** (each result is idempotent).
+- Matching is **deterministic and replayable** — idempotent on `settlement_record_id`. An
+  `UNSETTLED` flips to `MATCHED` when its settlement line finally arrives in a later cycle.
+
+## Service API
+
+### Inbound (synchronous REST)
+
+| Method & path | Purpose | Caller |
+| --- | --- | --- |
+| `POST /v1/settlement-files` | Ingest/trigger a settlement file → stage, parse, **reconcile** | PVCB Acquiring host / ops |
+| `GET /v1/reconciliation` | Reconciliation summary — match rate, breaks by outcome, aging | admin |
+| `GET /v1/transactions/{ref}` | The reconciliation outcome(s) for one `transaction_ref` | admin |
+| `GET /v1/breaks` · `/breaks/{id}` | Open breaks for the exception queue; resolve a break | admin / ops |
+| `GET /v1/reports/settlement` | Per-file summary (control totals, record count, match rate) | admin / finance |
+
+Reconciliation runs when a settlement file is ingested (API or SFTP). It **reads** the
+authorization and prefunding legs from `tc-cardload-service` and the settlement from the parsed
+file, matches, and writes results. **No money is posted anywhere.**
+
+## Idempotency, immutability & consistency
+
+- **File dedupe** on `file_hash`; **record dedupe** on `settlement_id`; **result idempotency** on
+  `settlement_record_id`.
+- **Append-only results:** a `reconciliation_result` is written once; a re-run updates only its
+  `status`/`resolver` on resolution, never rewrites the match. Full audit trail (`transaction_ref`,
+  `correlation_id`, `visa_transaction_identifier`).
+- **Fail closed on uncertainty:** if the legs can't be read from cardload, a line stays
+  **un-matched/pending** and is retried next cycle — the engine **never guesses** a match.
+
+## Database schema
+
+**MySQL 8.4 LTS / InnoDB, `utf8mb4`.** Reconciliation-only — no ledger tables:
+
+- **Ingestion:** `settlement_file`, `settlement_raw_record` (as-is), `settlement_record`
+  (transformed).
+- **Read-model:** `auth_leg`, `prefunding_leg` (authorization + prefunding, read from cardload).
+- **Output:** `reconciliation_result`.
+
+```sql
+CREATE TABLE settlement_file (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  file_name VARCHAR(255) NOT NULL, file_hash CHAR(64) NOT NULL,
+  sequence_number BIGINT NULL, format VARCHAR(20) NULL,
+  status VARCHAR(20) NOT NULL,                      -- RECEIVED/VALIDATED/PARSED/MATCHED/FAILED
+  record_count INT NULL, control_total_amount DECIMAL(23,2) NULL, control_total_currency CHAR(3) NULL,
+  validation_error VARCHAR(255) NULL,
+  received_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), processed_at DATETIME(3) NULL,
+  UNIQUE KEY uk_file_hash (file_hash), KEY idx_file_status (status),
+  CONSTRAINT chk_file_status CHECK (status IN ('RECEIVED','VALIDATED','PARSED','MATCHED','FAILED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- AS-IS staging: each Visa record stored verbatim before normalization.
+CREATE TABLE settlement_raw_record (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  settlement_file_id BIGINT UNSIGNED NOT NULL, line_number INT NOT NULL,
+  record_type VARCHAR(10) NULL, raw_line TEXT NOT NULL, raw_fields JSON NULL,
+  parsed BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_raw_file (settlement_file_id, line_number),
+  CONSTRAINT fk_raw_file FOREIGN KEY (settlement_file_id) REFERENCES settlement_file(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE settlement_record (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  settlement_file_id BIGINT UNSIGNED NOT NULL, raw_record_id BIGINT UNSIGNED NULL,
+  settlement_id VARCHAR(64) NOT NULL,
+  transaction_identifier VARCHAR(40) NULL,          -- canonical (normalized) Visa TID — primary match key
+  retrieval_reference_number VARCHAR(12) NULL,       -- RRN  ┐
+  acquirer_reference_number VARCHAR(23) NULL,        -- ARN  ├ fallback keys
+  auth_code VARCHAR(6) NULL,                          --      ┘
+  settled_amount DECIMAL(18,2) NULL, settlement_currency CHAR(3) NULL,
+  interchange_fee DECIMAL(18,4) NULL, scheme_fees DECIMAL(18,4) NULL,
+  transaction_type VARCHAR(20) NULL,                 -- AFT / AFTR / ADJUSTMENT
+  settlement_date DATE NULL, funds_type VARCHAR(20) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_srec_settlement (settlement_id),
+  KEY idx_srec_txnid (transaction_identifier),
+  KEY idx_srec_fallback (retrieval_reference_number, settlement_date),
+  CONSTRAINT fk_srec_file FOREIGN KEY (settlement_file_id) REFERENCES settlement_file(id),
+  CONSTRAINT fk_srec_raw FOREIGN KEY (raw_record_id) REFERENCES settlement_raw_record(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Local copy of the authorization leg, read synchronously from tc-cardload-service.
+CREATE TABLE auth_leg (
+  transaction_ref VARCHAR(48) NOT NULL PRIMARY KEY, correlation_id VARCHAR(64) NULL,
+  visa_transaction_identifier VARCHAR(40) NULL, retrieval_reference_number VARCHAR(12) NULL,
+  stan INT UNSIGNED NULL, acquiring_bin VARCHAR(11) NULL,
+  authorized_amount DECIMAL(18,2) NULL, currency CHAR(3) NULL,
+  approval_code VARCHAR(10) NULL, auth_status VARCHAR(20) NULL, auth_date DATETIME(3) NULL,
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  KEY idx_authleg_txnid (visa_transaction_identifier),
+  KEY idx_authleg_fallback (retrieval_reference_number, auth_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Prefunding leg, read synchronously from tc-cardload-service for matching (local copy).
+CREATE TABLE prefunding_leg (
+  transaction_ref VARCHAR(48) NOT NULL PRIMARY KEY, correlation_id VARCHAR(64) NULL,
+  funded_amount DECIMAL(20,2) NULL, funded_currency CHAR(3) NULL, fx_rate DECIMAL(18,6) NULL,
+  status VARCHAR(20) NULL, prefund_at DATETIME(3) NULL,
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE reconciliation_result (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  settlement_record_id BIGINT UNSIGNED NULL,
+  transaction_ref VARCHAR(48) NULL, correlation_id VARCHAR(64) NULL,
+  visa_transaction_identifier VARCHAR(40) NULL,
+  outcome VARCHAR(30) NOT NULL,
+  match_method VARCHAR(20) NULL,                      -- EXACT_TID / FALLBACK / MANUAL
+  status VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+  discrepancy_json JSON NULL,                         -- expected vs settled amounts, fees, fallback evidence
+  resolver VARCHAR(64) NULL, resolved_at DATETIME(3) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uk_recon_srec (settlement_record_id),
+  KEY idx_recon_outcome (outcome, status), KEY idx_recon_txn (transaction_ref),
+  CONSTRAINT fk_recon_srec FOREIGN KEY (settlement_record_id) REFERENCES settlement_record(id),
+  CONSTRAINT chk_recon_outcome CHECK (outcome IN (
+    'MATCHED','AMOUNT_MISMATCH','UNSETTLED','ORPHAN_SETTLEMENT','MISSING_PREFUND',
+    'REVERSAL','ADJUSTMENT','DUPLICATE_SETTLEMENT')),
+  CONSTRAINT chk_recon_method CHECK (match_method IS NULL OR match_method IN ('EXACT_TID','FALLBACK','MANUAL')),
+  CONSTRAINT chk_recon_status CHECK (status IN ('OPEN','RESOLVED'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+> The `auth_leg`/`prefunding_leg` tables are a **read model** kept current from cardload; cardload
+> is the system of owner. Manage DDL with **Flyway**.
+
+### dbdiagram (DBML)
+
+Paste into [dbdiagram.io](https://dbdiagram.io):
+
+```
+// DBML for tc-settlement-service (reconciliation only) — paste into https://dbdiagram.io
+
+Enum file_status { RECEIVED VALIDATED PARSED MATCHED FAILED }
+Enum recon_outcome { MATCHED AMOUNT_MISMATCH UNSETTLED ORPHAN_SETTLEMENT MISSING_PREFUND REVERSAL ADJUSTMENT DUPLICATE_SETTLEMENT }
+Enum match_method { EXACT_TID FALLBACK MANUAL }
+Enum recon_status { OPEN RESOLVED }
+
+Table settlement_file {
+  id bigint [pk, increment]
+  file_name varchar(255) [not null]
+  file_hash char(64) [not null, unique]
+  sequence_number bigint
+  format varchar(20)
+  status file_status [not null]
+  record_count int
+  control_total_amount decimal(23,2)
+  control_total_currency char(3)
+  validation_error varchar(255)
+  received_at datetime [not null, default: `now()`]
+  processed_at datetime
+}
+Table settlement_raw_record {
+  id bigint [pk, increment]
+  settlement_file_id bigint [not null]
+  line_number int [not null]
+  record_type varchar(10)
+  raw_line text [not null, note: 'as-is verbatim']
+  raw_fields json
+  parsed boolean [not null, default: false]
+  created_at datetime [not null, default: `now()`]
+  indexes { (settlement_file_id, line_number) [name: 'idx_raw_file'] }
+}
+Table settlement_record {
+  id bigint [pk, increment]
+  settlement_file_id bigint [not null]
+  raw_record_id bigint
+  settlement_id varchar(64) [not null, unique]
+  transaction_identifier varchar(40) [note: 'canonical Visa TID — primary key']
+  retrieval_reference_number varchar(12) [note: 'RRN — fallback']
+  acquirer_reference_number varchar(23) [note: 'ARN — fallback']
+  auth_code varchar(6) [note: 'fallback']
+  settled_amount decimal(18,2)
+  settlement_currency char(3)
+  interchange_fee decimal(18,4)
+  scheme_fees decimal(18,4)
+  transaction_type varchar(20) [note: 'AFT / AFTR / ADJUSTMENT']
+  settlement_date date
+  funds_type varchar(20)
+  created_at datetime [not null, default: `now()`]
+  indexes {
+    transaction_identifier [name: 'idx_srec_txnid']
+    (retrieval_reference_number, settlement_date) [name: 'idx_srec_fallback']
+  }
+}
+Table auth_leg {
+  transaction_ref varchar(48) [pk]
+  correlation_id varchar(64)
+  visa_transaction_identifier varchar(40)
+  retrieval_reference_number varchar(12)
+  stan int
+  acquiring_bin varchar(11)
+  authorized_amount decimal(18,2)
+  currency char(3)
+  approval_code varchar(10)
+  auth_status varchar(20)
+  auth_date datetime
+  updated_at datetime [not null, default: `now()`]
+  indexes { visa_transaction_identifier [name: 'idx_authleg_txnid'] }
+}
+Table prefunding_leg {
+  transaction_ref varchar(48) [pk]
+  correlation_id varchar(64)
+  funded_amount decimal(20,2)
+  funded_currency char(3)
+  fx_rate decimal(18,6)
+  status varchar(20)
+  prefund_at datetime
+  updated_at datetime [not null, default: `now()`]
+}
+Table reconciliation_result {
+  id bigint [pk, increment]
+  settlement_record_id bigint [unique]
+  transaction_ref varchar(48)
+  correlation_id varchar(64)
+  visa_transaction_identifier varchar(40)
+  outcome recon_outcome [not null]
+  match_method match_method
+  status recon_status [not null, default: 'OPEN']
+  discrepancy_json json
+  resolver varchar(64)
+  resolved_at datetime
+  created_at datetime [not null, default: `now()`]
+  indexes { (outcome, status) [name: 'idx_recon_outcome'] transaction_ref [name: 'idx_recon_txn'] }
+}
+
+Ref: settlement_raw_record.settlement_file_id > settlement_file.id
+Ref: settlement_record.settlement_file_id > settlement_file.id
+Ref: settlement_record.raw_record_id > settlement_raw_record.id
+Ref: reconciliation_result.settlement_record_id > settlement_record.id
+
+// the two match joins (logical — read model synced from cardload):
+//   settlement_record.transaction_identifier  ──▶ auth_leg.visa_transaction_identifier   (Visa's key)
+//   auth_leg.transaction_ref                   ──▶ prefunding_leg.transaction_ref         (our key)
+Ref: auth_leg.transaction_ref - prefunding_leg.transaction_ref
+```
+
+## Observability
+
+- Metrics: **match rate**, **fallback-match proportion** (a high share means upstream TID capture
+  is failing — investigate), break counts by outcome, break aging, unsettled-authorization age,
+  missing/late settlement file, control-total failures.
+- Alert on: `MISSING_PREFUND` breaks (highest priority — settled but never funded), match-rate
+  drop, rising fallback proportion, growing break backlog, control-total mismatch, settlement
+  file not received in its window.
+- Correlate on business `transaction_ref` / `correlation_id` and Visa `transaction_identifier`.
+
+## Assumptions & open questions
+
+1. **No ledger here.** **PVCB is the book of record** and owns liquidity/exposure; this service
+   maintains no accounts, balances, or postings — it only reconciles and reports.
+2. **TID in the file.** Matching assumes the Visa **`transactionIdentifier`** is present on the
+   settlement record (it is Visa's lifecycle key). **Confirm the exact field/position** in your
+   VSS report with Visa; the fallback waterfall (RRN/ARN/auth-code) covers gaps, but a **high
+   fallback rate is a defect to chase**, not a steady state.
+3. **Leg sourcing.** The authorization (`auth_leg`) and prefunding (`prefunding_leg`) are read
+   synchronously from `tc-cardload-service`; the settlement is parsed from the file.
+4. **File format/report set.** Assumed VSS **TC46/TC47**; confirm exact reports/layout with Visa.
+   Parser is pluggable.
+5. **Tolerances** for amount matching (interchange/fee/FX) are set with finance.
+6. **Break-resolution workflow & SLAs** are owned by ops; this service surfaces breaks, it does
+   not auto-resolve.
+
+## References
+
+- VisaNet Settlement Service (VSS) User's Guide, Vols 1 & 2 (TC46/TC47) — via your Visa rep.
+- [Visa Settlement Reports & Reconciliation (Visa Business School)](https://www.visabusinessschool.com/en/course/6bb8872b-3de8-4879-8d6d-aea6fef1934b)
+- [Matching AFTs and OCTs — Visa Developer Community](https://community.developer.visa.com/t5/Implementation-API-Sample-Code/Matching-AFTs-and-OCTs/td-p/6777)
+- [Visa Direct API reference](https://developer.visa.com/capabilities/visa_direct/reference)

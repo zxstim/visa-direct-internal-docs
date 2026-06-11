@@ -1,12 +1,13 @@
 ---
 title: Overview
 description: Overview of the system specifications — the Visa Direct tourist top-up platform, its components, and how they fit together.
+permission: member
 ---
 
 These specifications describe the **Visa Direct tourist top-up platform** — the backend that
 lets a tourist fund a local (VND) account by pulling funds from their foreign Visa card via
 a Visa Direct **Account Funding Transaction (AFT)**, with fraud screening, 3-D Secure,
-prefunding, ledgering, and settlement reconciliation. See the
+prefunding, and settlement reconciliation. See the
 [program overview](/docs) for the business context and Visa program plan.
 
 ## End-to-end flow
@@ -14,28 +15,29 @@ prefunding, ledgering, and settlement reconciliation. See the
 1. A tourist initiates a USD top-up; **PVCB Top up service** runs AML and calls in.
 2. [`tc-api-gateway`](/docs/specifications/tc-api-gateway) authenticates the partner request
    and enforces edge limits.
-3. [`tc-cardload-service`](/docs/specifications/tc-cardload-service) orchestrates the flow —
-   **Cybersource Decision Manager** (fraud) then **Payer Authentication** (3DS).
-4. [`tc-card-network-service`](/docs/specifications/tc-card-network-service) executes the
-   **AFT pull** against Visa Direct (carrying the 3DS result), enforcing authorization limits.
-5. **PVCB Core Banking** prefunds the tourist's account;
-   [`tc-ledger-service`](/docs/specifications/tc-ledger-service) books every leg.
-6. T+n, Visa sends a settlement file;
-   [`tc-settlement-reconciliation-service`](/docs/specifications/tc-settlement-reconciliation-service)
-   matches it against the authorization and prefunding records and clears the ledger.
-7. [`tc-admin-service`](/docs/specifications/tc-admin-service) +
+3. [`tc-cardload-service`](/docs/specifications/tc-cardload-service) orchestrates the flow,
+   synchronously — **Cybersource Decision Manager** (fraud), **Payer Authentication** (3DS),
+   then the **Visa Direct AFT pull** (carrying the 3DS result), enforcing authorization limits
+   and **recording the Visa FX rate** at authorization for settlement reference.
+4. **PVCB Core Banking** prefunds the tourist's account;
+   [`tc-cardload-service`](/docs/specifications/tc-cardload-service) records the prefunding
+   outcome and completes the top-up.
+5. T+n, Visa sends a settlement file; [`tc-settlement-service`](/docs/specifications/tc-settlement-service)
+   ingests it, parses it, and **matches it line-by-line** against the authorization and
+   prefunding records, surfacing any break.
+6. [`tc-admin-service`](/docs/specifications/tc-admin-service) +
    [`tc-admin-portal`](/docs/specifications/tc-admin-portal) give operators auth, limits
    config, audit, and dashboards.
 
 ```
 tourist → PVCB Top up → tc-api-gateway → tc-cardload-service ──fraud(DM)──▶ Cybersource
                                               │ 3DS(Payer Auth) ──────────▶ Cybersource
+                                              │ AFT pull ─────────────────▶ Visa Direct
                                               ▼
-                                   tc-card-network-service ──AFT──▶ Visa Direct
-                                              ▼
-                          PVCB Core Banking (prefund) ─▶ tc-ledger-service ◀─ settlement
-                                                                  ▲                │
-                              tc-settlement-reconciliation-service ┘ ◀── Visa settlement file
+                          PVCB Core Banking (prefund) ─▶ tc-cardload-service (records prefunding)
+
+   Visa settlement file ─▶ tc-settlement-service (parse + match → breaks)
+                                   └─ reads auth + prefunding legs ◀── tc-cardload-service
    operators ─▶ tc-admin-portal (Flutter) ─▶ tc-admin-service
 ```
 
@@ -43,12 +45,10 @@ tourist → PVCB Top up → tc-api-gateway → tc-cardload-service ──fraud(D
 
 | Spec | What it is | Key responsibilities |
 | --- | --- | --- |
-| [Architecture & service interaction](/docs/specifications/architecture) | Platform contract | Tech stack, microservices + **event-driven** model (Spring Cloud Stream), event catalog, the top-up saga |
+| [Architecture & service interaction](/docs/specifications/architecture) | Platform contract | Tech stack, microservices, **synchronous REST** interaction, the top-up flow, the system-wide data map |
 | [tc-api-gateway](/docs/specifications/tc-api-gateway) | Kong edge | Partner auth (mTLS + JWS), authorization limits, single public 3DS callback, admin forwarding |
-| [tc-cardload-service](/docs/specifications/tc-cardload-service) | Orchestrator | Cybersource **Decision Manager** (toggleable fraud) + **Payer Authentication** (3DS); drives the saga |
-| [tc-card-network-service](/docs/specifications/tc-card-network-service) | Visa Direct integration | AFT pull, configurable authorization limits, reversal/adjustment, exactly-once money movement |
-| [tc-ledger-service](/docs/specifications/tc-ledger-service) | System of record | Double-entry ledger: AFT receivable, prefunding advance, settlement clearing, exposure limits |
-| [tc-settlement-reconciliation-service](/docs/specifications/tc-settlement-reconciliation-service) | Reconciliation | Ingests the Visa settlement file (VSS/TC46), 3-way matches auth ↔ prefunding ↔ settlement |
+| [tc-cardload-service](/docs/specifications/tc-cardload-service) | Orchestrator (+ Visa Direct) | Cybersource **Decision Manager** (toggleable fraud) + **Payer Authentication** (3DS) + **Visa Direct AFT/reversal/adjustment** + **Visa FX rate capture** + authorization limits |
+| [tc-settlement-service](/docs/specifications/tc-settlement-service) | Settlement reconciler | Ingest the Visa settlement file (VSS/TC46), parse it, and **match each line to the authorization + prefunding legs** on the Visa `transactionIdentifier`; report breaks. **No ledger — PVCB is the book of record.** |
 | [tc-admin-service](/docs/specifications/tc-admin-service) | Admin backend | Spring Security (session, password, TOTP, passkeys), RBAC/tags, audit trail, limits config, dashboards |
 | [tc-admin-portal](/docs/specifications/tc-admin-portal) | Admin front-end | Flutter UI for tc-admin-service — auth, account approval, limits maker-checker, dashboards, audit |
 
@@ -57,14 +57,14 @@ tourist → PVCB Top up → tc-api-gateway → tc-cardload-service ──fraud(D
 - **Stack:** Java/Spring Boot microservices on MySQL, behind a Kong edge, with a Flutter
   admin portal. Exact versions and rationale are in
   [Architecture](/docs/specifications/architecture).
-- **Event-driven:** services communicate asynchronously via **Spring Cloud Stream**
-  (broker-abstracted — no cloud lock-in); synchronous HTTP only at the edge and to external
-  providers (Cybersource, Visa, PVCB).
-- **Defense-in-depth limits:** authorization limits are enforced at multiple layers (gateway,
-  card-network, ledger) so a single breach cannot trigger an outsized auth.
+- **Synchronous:** services communicate over **synchronous REST** (`RestClient`); there is
+  no message broker. The edge and external-provider calls (Cybersource, Visa, PVCB) are
+  synchronous too.
+- **Defense-in-depth limits:** authorization limits are enforced at multiple layers (gateway
+  and cardload) so a single breach cannot trigger an outsized auth.
 - **Fail-closed & exactly-once:** money-movement paths reject when a control can't be
-  evaluated, and use idempotency + a transactional outbox so events are never lost or
-  double-applied.
+  evaluated, and use idempotency keys + the Visa exactly-once pattern (unique STAN,
+  GET-status-on-timeout) so money is never lost or double-applied.
 - **PCI-aware:** the PAN is tokenized early (Cybersource Flex/TMS) and kept out of `tc-*`
   systems where possible.
 

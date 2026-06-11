@@ -74,7 +74,6 @@ Every screen maps to a `tc-admin-service` endpoint (1:1 with its
 | Audit trail viewer | `GET /api/audit` |
 | Dashboard — live authorizations | `GET /api/ops/authorizations` |
 | Dashboard — settlement reports / breaks | `GET /api/ops/settlement` |
-| Dashboard — exposure | `GET /api/ops/exposure` |
 | **Activity telemetry (emit)** | `POST /api/activity` |
 
 ## Authentication & session in Flutter
@@ -214,8 +213,8 @@ server-side.
 
 - **Live authorizations** — recent AFTs, status, decline reasons, velocity; auto-refresh by
   polling `GET /api/ops/authorizations` (or a server stream if added — see open questions).
-- **Settlement** — reconciliation summary, breaks by outcome, aging, unsettled receivables.
-- **Exposure** — prefunding exposure vs ceiling, balances, with `fl_chart` visuals.
+- **Settlement** — reconciliation summary, breaks by outcome, aging, match rate, with `fl_chart`
+  visuals.
 - All views are **permission- and tag-scoped**, matching the backend.
 
 ## Architecture

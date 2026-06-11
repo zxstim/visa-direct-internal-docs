@@ -4,9 +4,7 @@
     "architecture",
     "tc-api-gateway",
     "tc-cardload-service",
-    "tc-card-network-service",
-    "tc-ledger-service",
-    "tc-settlement-reconciliation-service",
+    "tc-settlement-service",
     "tc-admin-service",
     "tc-admin-portal"
   ],

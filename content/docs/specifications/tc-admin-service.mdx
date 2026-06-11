@@ -21,11 +21,11 @@ It does four things:
    button clicks, as an immutable audit trail.
 3. **System configuration** — manage configurable system limits/parameters; **authorization
    limits only for now**, designed to extend later.
-4. **Operational views** — live authorizations, settlement reports, exposure, breaks.
+4. **Operational views** — live authorizations, settlement reports, breaks.
 
 > **Stack:** JDK 25, Spring Boot 4.0+ (Maven) / **Spring Security 7** (native passkeys +
-> multi-factor authorization), Spring Data JPA on MySQL 8.4 LTS, Redis-backed Spring Session, and
-> messaging via Spring Cloud Stream (broker-abstracted) for events. See
+> multi-factor authorization), Spring Data JPA on MySQL 8.4 LTS, Redis-backed Spring Session,
+> and `RestClient` for **synchronous** reads/config-push to the other services. See
 > [Architecture & service interaction](/docs/specifications/architecture).
 
 ## Position in the system
@@ -35,11 +35,10 @@ admin user ──▶ tc-api-gateway (admin route: internal listener + IP allowli
                      │  forward-only
                      ▼
               tc-admin-service  ── Spring Security (session, password, TOTP, passkey, RBAC)
-                     │  read-only aggregation
-   live auth ◀───────┼───────── tc-card-network-service
-   settlement ◀──────┼───────── tc-settlement-reconciliation-service
-   exposure ◀────────┼───────── tc-ledger-service
-   limits ───────────┴────────▶ propagated to gateway / card-network / ledger
+                     │  read-only aggregation (synchronous REST)
+   live auth ◀───────┼───────── tc-cardload-service
+   settlement ◀──────┴───────── tc-settlement-service
+   limits ────────────────────▶ pushed (sync) to gateway / cardload
 ```
 
 The gateway handles perimeter security; do **not** rely on it for user identity — that is
@@ -206,7 +205,7 @@ only).
 - **Permissions** are fine-grained authorities, e.g. `LIMITS_READ`, `LIMITS_WRITE`,
   `ACCOUNTS_APPROVE`, `AUTH_LIVE_READ`, `SETTLEMENT_READ`, `AUDIT_READ`.
 - **Roles** group permissions, e.g. `SUPER_ADMIN` (all), `OPS` (live auth + settlement +
-  approve breaks), `FINANCE` (settlement + exposure), `AUDITOR` (audit + read-only),
+  approve breaks), `FINANCE` (settlement reconciliation), `AUDITOR` (audit + read-only),
   `READ_ONLY`.
 - **Tags** are labels on users (and resources) for organization **and access scoping** —
   e.g. a user tagged `corridor:VN` only sees VN transactions; `env:prod` gates prod data.
@@ -305,18 +304,17 @@ limits** are in scope now; the store is generic so more parameter groups are add
 
 ### Authorization limits managed here
 
-These are the limits enforced across the platform — they map to the gateway,
-`tc-card-network-service`, and `tc-ledger-service`:
+These are the limits enforced across the platform — they map to the gateway and
+`tc-cardload-service`:
 
 | Parameter | Consumer(s) |
 | --- | --- |
-| per-transaction max (per currency) | gateway, card-network |
-| currency allowlist | gateway, card-network |
-| BAI / MCC allowlist | card-network |
-| per-card daily sum & velocity | gateway, card-network |
-| per-BIN daily ceiling | card-network |
-| global daily ceiling (circuit breaker) | gateway, card-network |
-| prefunding exposure ceiling | ledger |
+| per-transaction max (per currency) | gateway, cardload |
+| currency allowlist | gateway, cardload |
+| BAI / MCC allowlist | cardload |
+| per-card daily sum & velocity | gateway, cardload |
+| per-BIN daily ceiling | cardload |
+| global daily ceiling (circuit breaker) | gateway, cardload |
 
 ### How changes work
 
@@ -325,9 +323,10 @@ These are the limits enforced across the platform — they map to the gateway,
 - **Maker-checker (4-eyes):** one admin proposes a limit change, a second (with
   `LIMITS_WRITE`) approves it. Both steps require step-up re-auth and are audited with
   before/after.
-- **Propagation:** consuming services read limits from a config API (pull with cache + TTL)
-  or subscribe to a published change event. A change is only "live" once all enforcement
-  layers have it; show propagation status in the UI.
+- **Propagation:** on approval, the admin service **pushes the new config synchronously**
+  (`RestClient`) to each enforcement service (gateway via decK, cardload), or they
+  pull it from a config API with a short TTL. A change is only "live" once all layers have
+  it; show propagation status in the UI.
 - **Validation & guardrails:** sane bounds (e.g. per-txn ≤ per-card-daily ≤ ceiling),
   currency must be ISO 4217, no destructive change without confirmation.
 
@@ -343,9 +342,8 @@ data.
 
 | View | Source | Content |
 | --- | --- | --- |
-| **Live authorizations** | `tc-card-network-service` (read API / event stream) | recent AFTs: status, amount, `actionCode`/decline reasons, velocity, reversals |
-| **Settlement reports** | `tc-settlement-reconciliation-service` | reconciliation summary, breaks by outcome, aging, unsettled receivables |
-| **Exposure** | `tc-ledger-service` | prefunding exposure vs ceiling, balances, trial-balance health |
+| **Live authorizations** | `tc-cardload-service` (read API) | recent AFTs: status, amount, `actionCode`/decline reasons, velocity, reversals |
+| **Settlement reports** | `tc-settlement-service` | reconciliation summary, breaks by outcome, aging, unsettled authorizations, match rate |
 | **Fraud / 3DS** (optional) | `tc-cardload-service` | DM accept/reject/review, 3DS frictionless-vs-challenge |
 
 - All views are **permission- and tag-scoped** (`AUTH_LIVE_READ`, `SETTLEMENT_READ`, …).
@@ -361,7 +359,7 @@ data.
 | Sign-up / approval | `POST /api/signup`, `GET /api/admin/pending`, `POST /api/admin/users/{id}/approve`, `/suspend`, `/roles`, `/tags` |
 | Activity | `POST /api/activity` (ingest), `GET /api/audit` (`AUDIT_READ`) |
 | Limits | `GET /api/limits`, `POST /api/limits/proposals`, `POST /api/limits/proposals/{id}/approve` |
-| Dashboards | `GET /api/ops/authorizations`, `GET /api/ops/settlement`, `GET /api/ops/exposure` |
+| Dashboards | `GET /api/ops/authorizations`, `GET /api/ops/settlement` |
 
 ## Data model
 
@@ -384,13 +382,13 @@ data.
   WebAuthn JDBC schema — `webauthn_user_entity` / `webauthn_credential` below approximate it;
   align column names to your Spring Security version.
 - **Limits = parameters, with maker-checker:** `parameter` (current) + `parameter_version`
-  (history) + `parameter_proposal` (propose → approve). Changes publish `limits.updated` via
-  the `outbox`.
+  (history) + `parameter_proposal` (propose → approve). On approval the new config is
+  **pushed synchronously** to the enforcement services.
 - **Audit trail is append-only + hash-chained:** each `activity_log` row stores `prev_hash`
   and `hash` so tampering is detectable.
-- **Sessions live in Redis** (Spring Session), not MySQL. Dashboard read models are CQRS
-  projections from events (consumed via `processed_event`); the projection tables follow the
-  same pattern as [reconciliation's read models](/docs/specifications/tc-settlement-reconciliation-service#database-schema) and are omitted here for brevity.
+- **Sessions live in Redis** (Spring Session), not MySQL. Dashboards **read live** from the
+  other services via synchronous REST (with short-TTL caching) — there are no event-fed
+  projection tables.
 
 ```sql
 CREATE TABLE admin_user (
@@ -550,29 +548,6 @@ CREATE TABLE activity_log (
   CONSTRAINT fk_act_actor FOREIGN KEY (actor_id) REFERENCES admin_user(id),
   CONSTRAINT chk_act_type CHECK (type IN ('NAVIGATE','CLICK','SUBMIT','VIEW','ACTION','AUTH'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE outbox (
-  id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-  event_id     CHAR(36)     NOT NULL,
-  event_type   VARCHAR(64)  NOT NULL,          -- limits.updated
-  aggregate_id VARCHAR(64)  NOT NULL,
-  payload      JSON         NOT NULL,
-  status       VARCHAR(20)  NOT NULL DEFAULT 'PENDING',
-  attempts     INT          NOT NULL DEFAULT 0,
-  available_at DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  published_at DATETIME(3)  NULL,
-  created_at   DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-  UNIQUE KEY uk_outbox_event (event_id),
-  KEY idx_outbox_dispatch (status, available_at),
-  CONSTRAINT chk_outbox_status CHECK (status IN ('PENDING','PUBLISHED','FAILED'))
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE processed_event (
-  event_id     CHAR(36)    NOT NULL PRIMARY KEY,   -- consumed events for dashboard read models
-  event_type   VARCHAR(64) NOT NULL,
-  reference    VARCHAR(64) NULL,
-  processed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ```
 
 > **Notes.** The single super admin is seeded via Flyway (cannot self-register). Enforce the
@@ -589,7 +564,6 @@ Paste into [dbdiagram.io](https://dbdiagram.io):
 Enum user_status { PENDING_APPROVAL ACTIVE SUSPENDED DISABLED }
 Enum proposal_status { PENDING APPROVED REJECTED }
 Enum activity_type { NAVIGATE CLICK SUBMIT VIEW ACTION AUTH }
-Enum outbox_status { PENDING PUBLISHED FAILED }
 
 Table admin_user {
   id bigint [pk, increment]
@@ -747,30 +721,6 @@ Table activity_log {
   }
 }
 
-Table outbox {
-  id bigint [pk, increment]
-  event_id char(36) [not null, unique]
-  event_type varchar(64) [not null]
-  aggregate_id varchar(64) [not null]
-  payload json [not null]
-  status outbox_status [not null, default: 'PENDING']
-  attempts int [not null, default: 0]
-  available_at datetime [not null, default: `now()`]
-  published_at datetime
-  created_at datetime [not null, default: `now()`]
-
-  indexes {
-    (status, available_at) [name: 'idx_outbox_dispatch']
-  }
-}
-
-Table processed_event {
-  event_id char(36) [pk]
-  event_type varchar(64) [not null]
-  reference varchar(64)
-  processed_at datetime [not null, default: `now()`]
-}
-
 Ref: admin_user.approved_by > admin_user.id
 Ref: role_permission.role_id > role.id
 Ref: role_permission.permission_id > permission.id
@@ -804,22 +754,17 @@ Ref: activity_log.actor_id > admin_user.id
 - Alert on: failed-login spikes, super-admin actions, limit changes, audit hash-chain
   verification failure.
 
-## Events
+## Service interaction (synchronous)
 
-Dashboards are **CQRS read models** built from events; limit changes are **published** as
-events (see [Architecture](/docs/specifications/architecture)). Consumers are idempotent on
-`eventId`.
+There is no messaging layer. The admin service interacts over **synchronous REST**:
 
-| Direction | Event | Counterpart |
+| Direction | Interaction | Counterpart |
 | --- | --- | --- |
-| consumes | `aft.completed` / `aft.declined` / `aft.reversed` / `aft.adjusted` / `aft.refunded` | card-network (live-auth view) |
-| consumes | `prefunding.completed` / `prefunding.failed` | core-banking adapter |
-| consumes | `settlement.matched` / `settlement.break` | reconciliation (settlement + breaks views) |
-| consumes | `prefunding.exposure.updated` | ledger (exposure view) |
-| produces | `limits.updated` | card-network, ledger (+ Kong via decK relay) |
+| reads | live authorizations, fraud/3DS | `tc-cardload-service` |
+| reads | settlement summary + breaks | `tc-settlement-service` |
+| pushes | approved limit config | gateway (decK), `tc-cardload-service` |
 
-> The dashboard data sources in [section 4](#4-operational-dashboards) are populated by
-> these event consumers, not by live queries against the owning services.
+Dashboards read live (with short-TTL caching); see [section 4](#4-operational-dashboards).
 
 ## Assumptions & open questions
 
@@ -830,8 +775,8 @@ events (see [Architecture](/docs/specifications/architecture)). Consumers are id
    plan the ~yearly Spring upgrade per the [version policy](/docs/specifications/architecture).
 3. **Front-end telemetry granularity.** "Every click/navigation" can be high-volume —
    confirm sampling/retention and that no field content is captured.
-4. **Limit propagation transport.** Pull-with-cache vs published events to the enforcement
-   services — pick per the platform's eventing choice.
+4. **Limit propagation transport.** Synchronous push vs pull-with-cache to the enforcement
+   services — pick per ops preference.
 
 ## References
 

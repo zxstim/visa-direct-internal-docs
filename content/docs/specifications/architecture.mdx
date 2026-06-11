@@ -1,366 +1,169 @@
 ---
 title: Architecture & service interaction
-description: Platform architecture — Java/Spring Boot microservices communicating asynchronously via Spring Cloud Stream (broker-abstracted — Kafka/RabbitMQ or any cloud), synchronous HTTP only at the edge and to external providers. Tech stack, sync-vs-async methodology, event catalog, the top-up saga, and the messaging patterns every service must follow.
+description: Platform architecture — Java/Spring Boot microservices communicating synchronously over REST (no messaging layer), behind a Kong edge, with a Flutter admin portal. Tech stack, the synchronous top-up flow, traceability, durability, and the system-wide data map.
 permission: member
 ---
 
 ## Technical stack
 
 The platform is built as **independently deployable microservices**, each owning its own
-datastore and publishing/consuming events. This page is the contract every `tc-*` service
-spec refers to.
+database and communicating **synchronously over REST**. This page is the contract every
+`tc-*` service spec refers to.
 
 | Concern | Choice |
 | --- | --- |
 | Language / framework | **JDK 25 LTS, Spring Boot 4.0+** (Spring Security 7, Spring Data JPA) |
 | Service model | microservices — one bounded context per service, private datastore, no shared DB |
-| Messaging | **Spring Cloud Stream** (functional model) — **broker is a deployment choice**: Kafka or RabbitMQ (portable, recommended), or a cloud-native binder (AWS SNS/Kinesis, Azure Service Bus/Event Hubs, GCP Pub/Sub). No broker-specific code. |
-| Edge | **Kong** API gateway (`tc-api-gateway`) — synchronous HTTP at the perimeter only |
+| Inter-service comms | **synchronous REST** via `RestClient` — no broker, no message bus |
+| Edge | **Kong** API gateway (`tc-api-gateway`) |
 | External providers | Cybersource, Visa Direct, PVCB — synchronous HTTPS / SFTP |
-| Build & tooling | **Maven**, IntelliJ IDEA, MySQL Workbench, Flyway (migrations), Insomnia (HTTP APIs), Testcontainers / docker-compose (local broker: Kafka, Redpanda, or RabbitMQ) |
-| Datastore | per-service **MySQL 8.4 LTS** (InnoDB; `DECIMAL` for money; strict SQL mode); Redis for sessions/counters where noted |
+| Build & tooling | **Maven**, IntelliJ IDEA, MySQL Workbench, Flyway (migrations), Insomnia, Testcontainers |
+| Datastore | per-service **MySQL 8.4 LTS** (+ standby — see [durability](#data-durability--primary--standby-hadr)); Redis for sessions/counters |
 
-The services: `tc-api-gateway` (Kong edge), `tc-cardload-service` (orchestrator),
-`tc-card-network-service` (Visa Direct), `tc-ledger-service` (system of record),
-`tc-settlement-reconciliation-service`, `tc-admin-service`.
+> **Version policy.** Use **JDK 25 LTS** (Spring Framework 7 / Boot 4 recommend JDK 25+ for
+> production), **Spring Boot 4.0+ / Spring Security 7**, and **MySQL 8.4 LTS** (8.0 reaches
+> EOL April 2026; 9.x is short-support Innovation). Spring releases get ~13 months of OSS
+> support — budget a yearly upgrade.
 
-> **Data ownership.** Each service owns its data. A service never reads another's database;
-> it learns about other contexts only through **events** and builds its own local read model
-> (CQRS). Cross-service consistency is **eventual**.
+> **Data ownership.** Each service owns its data and exposes it only through its REST API; a
+> service never reads another's database. Consistency is **synchronous within a call**;
+> reconciliation is the safety net for the T+n settlement.
 
-> **Tooling note.** Insomnia covers the synchronous HTTP APIs and provider calls but **not**
-> the event flows — run the broker locally with **docker-compose** (Kafka/Redpanda or
-> RabbitMQ) and use **Testcontainers** (MySQL + the broker) for integration tests of the
-> event-driven paths.
-> **Version policy (production-ready, not EOL).** Use **JDK 25 LTS** — Spring Framework 7 /
-> Spring Boot 4 recommend **JDK 25+ for production** (and require 25+ for GraalVM native
-> images); you get compact object headers (~10–22% less heap) and the virtual-thread pinning
-> fix. JDK 21 LTS is still supported (Boot 4 retains a Java 17 baseline) but 25 is the aligned
-> choice; avoid JDK 17 for a new build. Use **Spring Boot 4.0+**
-> with **Spring Security 7** — Spring Boot 3.4 is already EOL (Dec 2025) and 3.5 OSS support
-> ends June 2026. Spring releases get ~13 months of OSS support, so **track the latest minor
-> and budget a yearly upgrade**; the final 4.x minor gets a 5-year enterprise extension.
-> Use **MySQL 8.4 LTS** (support to ~2032) — MySQL 8.0 reaches EOL April 2026, and the 9.x
-> "Innovation" releases are short-support (next LTS is 9.7).
+## Services
 
-## When synchronous, when asynchronous
-
-| Interaction | Style | Why |
+| Service | Role | DB |
 | --- | --- | --- |
-| PVCB → Kong → `tc-cardload-service` (start a top-up) | **sync HTTP** (returns `202`, results via webhook) | the caller needs an immediate accept/reject |
-| `tc-cardload-service` → Cybersource (DM, Payer Auth) | **sync HTTPS** | request/response provider API |
-| `tc-card-network-service` → Visa Direct / PAAI | **sync HTTPS (mTLS)** | request/response provider API |
-| `tc-settlement-reconciliation-service` ← settlement file | **SFTP fetch** | batch file |
-| admin queries / dashboards on demand | **sync HTTP** | interactive reads |
-| **everything between `tc-*` services** | **async events (Spring Cloud Stream)** | decoupling, resilience, retries, fan-out |
+| `tc-api-gateway` | Kong edge — partner auth, edge limits, single public 3DS callback, admin forwarding | — |
+| `tc-cardload-service` | **Orchestrator** — fraud (Cybersource DM) + 3DS (Payer Auth) + **Visa Direct AFT/reversal/adjustment** + authorization limits. *(Merged from the former cardload + card-network.)* | `cardload` |
+| `tc-settlement-service` | **Visa settlement reconciler** — ingest the file, parse it, and match each line to the authorization + prefunding legs; report breaks (scheduled batch). **No ledger — PVCB is the book of record.** | `settlement` |
+| `tc-admin-service` | Admin backend — Spring Security, RBAC, limits config, audit, dashboards | `admin` |
+| `tc-admin-portal` | Flutter admin front-end | — |
 
-**Rule of thumb:** the edge and external-provider calls are synchronous; **all internal
-state propagation and the money-movement lifecycle are event-driven over the broker.** This keeps
-services decoupled and makes the long-running, multi-step top-up resilient to partial
-failure.
+## Synchronous interaction model
 
-## Messaging topology (broker-agnostic)
+Everything is **request/response**. There is no broker, outbox, or event bus.
 
-Each event is a Spring Cloud Stream **destination** (a topic/exchange). Every consuming
-service binds its own **consumer group**, so one event fans out to all interested services
-while each gets independent delivery, retries, and a dead-letter destination.
+| Interaction | Style |
+| --- | --- |
+| PVCB → Kong → `tc-cardload-service` (start a top-up) | sync HTTP (final result, or a 3DS `redirectUrl` + `/top-up-status` polling) |
+| `tc-cardload-service` → Cybersource / Visa Direct / PVCB Core Banking | sync HTTPS (mTLS + MLE to Visa) |
+| `tc-settlement-service` → `tc-cardload-service` (read auth/prefunding legs for reconciliation) | sync REST |
+| `tc-admin-service` → services (push limit config, read dashboards) | sync REST |
 
-```
-producer ──(transactional outbox → relay)──▶ destination: aft.completed
-                                                  ├──▶ group: ledger         ──▶ tc-ledger-service
-                                                  ├──▶ group: reconciliation ──▶ tc-settlement-reconciliation-service
-                                                  ├──▶ group: cardload       ──▶ tc-cardload-service
-                                                  └──▶ group: admin          ──▶ tc-admin-service
-                                                          each group has its own dead-letter destination
-```
+Conventions every call follows:
 
-- **Fan-out:** one destination → one **consumer group per service** (Kafka: one topic, many
-  groups; RabbitMQ: a topic exchange → one queue per group; the cloud brokers follow the same
-  shape).
-- **Ordering** for money events via a **partition / ordering key** = `transactionId` (or
-  `accountId` for ledger postings), so per-entity events are processed in order.
-- **De-duplication** is enforced by the **consumer** on `eventId` (see Idempotent consumers),
-  not relied upon from the broker — not every broker guarantees it.
-- **Dead-letter** destination per binding with a retry/backoff policy + an alarm on its depth.
-- Tune consumer concurrency and **max processing time**; set retention generously so money
-  events are never silently lost.
+- **`X-Correlation-Id`** is set by the gateway and propagated unchanged on every hop (it is
+  the OpenTelemetry trace id) — see [traceability](#transaction-traceability).
+- **`Idempotency-Key`** on every mutating call, so retries are safe.
+- **Resilience:** bounded timeouts, retry-with-backoff on idempotent operations, circuit
+  breakers, and **fail-closed** for money movement (reject when a control can't be evaluated).
 
-### Broker is a deployment choice
+What is **asynchronous but not message-driven**:
 
-The application code (functional `Consumer`/`Supplier`/`Function` beans + `StreamBridge`) is
-**identical regardless of broker** — only the binder dependency and config change. This is
-what avoids cloud lock-in: a customer who is not on AWS swaps the binder, not the code.
+- The **human 3DS challenge** — returns via the gateway's single public callback endpoint.
+- **Settlement reconciliation** — a **scheduled batch** (settlement lands T+n); it reads and
+  writes synchronously.
 
-| Concern | Kafka (recommended) | RabbitMQ | AWS | Azure | GCP |
-| --- | --- | --- | --- | --- | --- |
-| Binder | `...-binder-kafka` | `...-binder-rabbit` | SNS / Kinesis | Service Bus / Event Hubs | Pub/Sub |
-| Fan-out | topic + consumer groups | topic exchange + queues | SNS→SQS | topics + subscriptions | topic + subscriptions |
-| Ordering | partition key | consistent-hash exchange | SQS FIFO group id | session id | ordering key |
-| Replay | retained log ✅ | needs an event store | limited | limited | limited |
-| Runs on | anywhere (self-host, MSK, Confluent, Redpanda) | anywhere (self-host, Amazon MQ, CloudAMQP) | AWS | Azure | GCP |
+## The top-up flow (synchronous orchestration)
 
-**Recommended default: Apache Kafka** — its retained, ordered, replayable log is the best fit
-for the CQRS read-model rebuilds and reconciliation replay this platform relies on, and it
-runs on any cloud or on-prem. **RabbitMQ** is a lighter alternative when streaming/replay
-isn't needed. Either way the broker stays a deployment decision, not a code dependency.
+`tc-cardload-service` orchestrates with blocking calls — there is no saga/event choreography:
 
-## Mandatory patterns
+1. **Edge:** PVCB → Kong → `POST /v1/topups`, returns `202`.
+2. cardload: eligibility (Visa **PAAI FTAI**) → **Decision Manager** (Cybersource) → **Payer
+   Authentication** (Cybersource; a challenge returns a redirect URL to PVCB → client).
+3. On 3DS pass (via the public callback), cardload enforces **authorization limits**, **records
+   the Visa daily FX rate** (the settlement reference), then calls **Visa Direct AFT pull** —
+   now an **in-process** step.
+4. On approval, cardload calls **PVCB Core Banking** to prefund, then **records the prefunding
+   outcome locally** and completes the top-up — there is no ledger to post to.
+5. cardload returns the outcome in the response (or, for a 3DS challenge, a `redirectUrl`);
+   PVCB polls `/top-up-status` for anything not finished inline. No webhook.
+6. **T+n:** `tc-settlement-service` (scheduled batch) fetches the settlement file, reads the
+   authorization + prefunding legs from cardload, and **matches each line** (on the Visa
+   `transactionIdentifier`), reporting any break.
 
-1. **Transactional outbox.** A producer writes its state change **and** the event to an
-   `outbox` table in the **same DB transaction**; a relay (poller or CDC) publishes the
-   outbox rows to the broker. This removes the dual-write race ("DB committed but event lost").
-2. **Idempotent consumers.** Delivery is **at-least-once** — every consumer dedupes on `eventId`
-   (persist processed ids) so a redelivery is a no-op. This is what makes money movement
-   exactly-once *in effect*.
-3. **Saga with compensation.** The top-up spans several services; it is a saga (see below)
-   with **compensating actions** — e.g. if prefunding fails after the AFT, emit an AFT
-   reversal. `tc-cardload-service` is the **orchestrator**; downstream fan-out
-   (ledger / reconciliation / admin) is **choreography**.
-4. **CQRS read models.** `tc-admin-service` and `tc-settlement-reconciliation-service` build
-   local projections from events (for dashboards / matching) instead of querying owners.
-5. **Event envelope + versioning** (below).
+**Compensation:** if prefunding fails after the AFT, cardload **immediately reverses the AFT
+in-process** (a synchronous Visa reversal) — no cross-service coordination needed.
 
-## Event envelope
+## Reliability & correctness
 
-Every message uses one JSON envelope so consumers, tracing, and idempotency are uniform:
+- Within a service, a **DB transaction** is the unit of consistency.
+- Across services, **idempotency keys** plus the **exactly-once Visa pattern** (unique STAN,
+  GET-status-on-timeout, never blind-resend) prevent double money movement.
+- **Reconciliation is the end-of-day safety net** — it proves every settled transaction ties
+  back to a real authorized + prefunded top-up, catching anything the synchronous path missed.
+- **Fail closed** on money movement.
 
-```json
-{
-  "eventId": "<uuid>",            // idempotency key
-  "type": "aft.completed",
-  "version": 1,                    // schema version; evolve backward-compatibly
-  "occurredAt": "2026-06-09T10:00:00Z",
-  "correlationId": "<from gateway>",
-  "transactionId": "topup-<id>",  // partition / ordering key
-  "producer": "tc-card-network-service",
-  "payload": { }
-}
-```
-
-## Event catalog
-
-Ordered = per-entity ordering via partition key. Fan-out = one destination → multiple consumer groups.
-
-| Event | Producer | Consumers | Notes |
-| --- | --- | --- | --- |
-| `aft.requested` | cardload | card-network | ordered by transactionId |
-| `aft.completed` / `aft.declined` | card-network | cardload, ledger, reconciliation, admin | ordered, fan-out |
-| `aft.reversal.requested` | cardload | card-network | compensation |
-| `aft.reversed` | card-network | ledger, reconciliation, admin | ordered, fan-out |
-| `aft.adjusted` / `aft.refunded` | card-network | ledger, reconciliation, admin | fan-out |
-| `prefunding.requested` | cardload | core-banking adapter | |
-| `prefunding.completed` / `prefunding.failed` | core-banking adapter | cardload, ledger, reconciliation, admin | ordered, fan-out |
-| `settlement.matched` | reconciliation | ledger, admin | clears the receivable |
-| `settlement.break` | reconciliation | admin (ops) | exception |
-| `partner.notification.requested` | cardload | gateway webhook egress | drives the signed PVCB webhook |
-| `limits.updated` | admin | card-network, ledger (+ Kong via decK relay) | config propagation |
-
-## The top-up saga
-
-Happy path (events in **bold**):
-
-1. **Edge (sync):** PVCB → Kong → `tc-cardload-service` `POST /v1/topups`, returns `202`.
-2. cardload: eligibility (sync query to card-network/PAAI) → Decision Manager (sync) →
-   Payer Authentication (sync; challenge returned to PVCB as a webhook).
-3. On 3DS pass, cardload emits **`aft.requested`**.
-4. card-network calls Visa (sync) → emits **`aft.completed`** (or `aft.declined`).
-5. Fan-out: ledger books the receivable; reconciliation updates its read model; admin
-   updates dashboards; cardload emits **`partner.notification.requested`** (success) and
-   **`prefunding.requested`**.
-6. core-banking adapter funds the account → emits **`prefunding.completed`**; ledger books
-   the advance; cardload notifies PVCB of success.
-7. T+n: reconciliation matches the settlement file → **`settlement.matched`** → ledger
-   clears the receivable.
-
-Compensation: if **`prefunding.failed`** arrives, cardload emits **`aft.reversal.requested`**
-→ card-network reverses at Visa → **`aft.reversed`** → ledger books the reversal. No funds
-are left pulled from the cardholder.
-
-## Spring implementation
-
-```xml
-<dependency><groupId>org.springframework.cloud</groupId><artifactId>spring-cloud-stream</artifactId></dependency>
-<!-- pick ONE binder per deployment — the code below is unchanged either way -->
-<dependency><groupId>org.springframework.cloud</groupId><artifactId>spring-cloud-stream-binder-kafka</artifactId></dependency>
-<!-- or: spring-cloud-stream-binder-rabbit / a cloud-native binder (SNS, Service Bus, Pub/Sub) -->
-```
-
-```java
-// Consumer — idempotent; bound by config (spring.cloud.stream.bindings.onAftCompleted-in-0.*)
-@Bean
-public Consumer<EventEnvelope<AftCompleted>> onAftCompleted() {
-  return e -> {
-    if (!processed.firstSeen(e.eventId())) return; // idempotent: skip redelivery
-    ledger.bookReceivable(e.payload());            // own DB tx
-  };                                               // ack on return; throw → retry → dead-letter
-}
-
-// Producer — via transactional outbox
-@Transactional
-public void completeAft(Aft aft) {
-  aftRepo.save(aft);                               // state change
-  outbox.add(EventEnvelope.of("aft.completed", aft.txnId(), payload));  // same tx
-}                                                  // relay publishes outbox via StreamBridge later
-```
-
-- Consumers are functional `Consumer`/`Function` beans; producers use the outbox relay +
-  `StreamBridge` (or a `Supplier`). JSON via Jackson. Destinations, consumer groups, the
-  partition key, retries, and the dead-letter target are **configuration, not code** — and
-  swapping broker is a binder/config change only.
-- A handler that throws is retried per the binding's backoff policy, then lands in the
-  dead-letter destination — alarm on it. **Fail closed** for money movement: a consumer that
-  cannot safely process must not ack-and-drop.
-
-## Reliability & guarantees
-
-- **At-least-once** delivery + **idempotent consumers** ⇒ exactly-once *effect*.
-- **Ordering** per entity via the partition/ordering key (`transactionId` / `accountId`).
-- **No lost events** via the outbox; **no silent drops** via DLQ + alarms.
-- **Correlation:** the gateway's `correlationId` is carried in every envelope, so a top-up is
-  traceable end-to-end across services and queues (OpenTelemetry + structured logs).
+> **Trade-off of going synchronous.** A downstream outage now affects the in-flight call
+> (mitigated by timeouts, retries, and the reconciliation safety net) rather than being
+> absorbed by a queue. The win is far less moving machinery — no broker, outbox, inbox,
+> schema versioning, or eventual-consistency windows — which suits a small team and the
+> client's preference for a synchronous structure.
 
 ## Transaction traceability
 
-Every transaction must be reconstructable end-to-end — across services, events, databases,
-and external providers — for support, audit, and regulatory needs. Three identifiers carry
-the trace:
+Every transaction must be reconstructable end-to-end. Three identifiers carry the trace:
 
 | Identifier | Scope | Where it lives |
 | --- | --- | --- |
-| `correlation_id` | **One trace** for the whole top-up = the **OpenTelemetry trace id** | Stamped by `tc-api-gateway` on first contact; carried in **every event envelope**, HTTP hop, log line, and the PVCB webhook |
+| `correlation_id` | **One trace** for the whole top-up = the **OpenTelemetry trace id** | Stamped by the gateway; propagated via **`X-Correlation-Id`** on every REST hop and log line, and returned to PVCB on the response |
 | `transaction_ref` | **The business top-up** (`topup-<uuid>`) | The spine across **every service's database** |
 | Provider ids | The external leg | Cybersource `decisionId` / `authenticationTransactionId`; Visa `transactionIdentifier` / STAN / RRN / `statusIdentifier`; settlement `settlement_id` |
 
-Rules (normative):
+Rules:
 
 - The gateway **MUST** assign `correlation_id` once and propagate it unchanged; services
-  **MUST NOT** regenerate it. It is also returned to PVCB (webhook `Delivery-Id` +
-  correlation) so the partner can trace too.
+  **MUST NOT** regenerate it. It is also returned to PVCB so the partner can trace.
 - **Every transaction-scoped row MUST carry both `transaction_ref` and `correlation_id`**
-  (child rows may instead FK to an aggregate that carries them). This lets you pivot a query
-  on either the business id or the trace id in any service.
-- Each service **MUST** set `clientReferenceInformation.code` (Cybersource) and the Visa
-  trace fields to values derived from `transaction_ref`, so external systems are joinable
-  back to the transaction.
-- State changes are auditable: the per-service **state-transition tables**, the **append-only
-  ledger**, and the **hash-chained `activity_log`** record who/what/when, each tagged with
-  the triggering `event_id` (causation).
-
-**Reconstructing a transaction:** query each service DB by `transaction_ref`; pull logs and
-distributed traces by `correlation_id`; follow the external legs by the stored provider ids.
-The reconciliation service bridges the Visa `transaction_identifier` back to `transaction_ref`
-via its `auth_leg` read model.
+  (child rows may FK to an aggregate that carries them).
+- **Reconstruct** a transaction by querying each service DB by `transaction_ref`, pulling
+  logs/traces by `correlation_id`, and following provider ids to the external legs. The
+  reconciliation service bridges the Visa `transaction_identifier` back to `transaction_ref`
+  via its `auth_leg` read model.
 
 ## Data durability — primary + standby (HA/DR)
 
 Each service owns a **primary MySQL 8.4** database **and a standby replica — the "backup
-database"**. The standby is a true mirror maintained by **MySQL replication**, **not**
-application-level dual-write (which would risk divergence and break the single-writer model).
+database"** — maintained by **MySQL replication**, not application dual-write.
 
-- **Replication:** semi-synchronous for the money-movement services (RPO ≈ 0), or a managed
-  **Multi-AZ** primary/standby. Async read-replicas may additionally serve reporting.
-- **Backups + PITR:** automated daily snapshots plus **binlog point-in-time recovery**;
-  retained per the data-retention/PCI policy, with periodic **restore drills** (an untested
-  backup is not a backup).
-- **Failover:** promote the standby; target **RTO** of minutes. The **outbox** and
-  **append-only audit/ledger** tables replicate too, so undelivered events and the full
-  trace survive a failover — preserving exactly-once and traceability.
-- **Supporting stores:** Redis (sessions/counters/nonce) runs **HA (replica/Sentinel or
-  cluster)**; the broker has its own replication. These are recovery dependencies, not
-  systems of record — the durable truth is each service's MySQL + its standby.
+- **Replication:** semi-synchronous for the money services (RPO ≈ 0), or managed **Multi-AZ**.
+- **Backups + PITR:** automated snapshots + **binlog point-in-time recovery**, retained per
+  policy, with periodic **restore drills**.
+- **Failover:** promote the standby; **RTO** of minutes. The append-only audit and reconciliation
+  tables replicate too, preserving the full trace across a failover.
+- **Supporting stores:** Redis (sessions/counters) runs HA; these are recovery dependencies,
+  not systems of record — the durable truth is each service's MySQL + its standby.
 
-| Service | Primary (main DB) | Standby (backup DB) | Replication |
+| Service | Primary | Standby (backup) | Replication |
 | --- | --- | --- | --- |
 | tc-cardload-service | `cardload` | `cardload-standby` | semi-sync / Multi-AZ |
-| tc-card-network-service | `cardnet` | `cardnet-standby` | semi-sync / Multi-AZ |
-| tc-ledger-service | `ledger` | `ledger-standby` | **semi-sync** (system of record) |
-| tc-settlement-reconciliation-service | `recon` | `recon-standby` | semi-sync / Multi-AZ |
+| tc-settlement-service | `settlement` | `settlement-standby` | **semi-sync** (reconciliation results + as-is staging) |
 | tc-admin-service | `admin` | `admin-standby` | async acceptable |
 
 > Backups protect against corruption/deletion (PITR); the standby protects against instance
-> loss (failover). You need **both** — they cover different failures.
+> loss (failover). You need **both**.
 
 ## System-wide data map (DBML)
 
-A single-canvas view of **every service's tables on one diagram**. Each service owns its own
-database, so this is **schema-namespaced per service** (`cardload.*`, `cardnet.*`, `ledger.*`,
-`recon.*`, `admin.*`) and grouped with `TableGroup`. Columns are trimmed to keys and
-correlation fields — the **full column-level DBML lives in each service spec**.
+All service databases on one canvas, **schema-namespaced per service** (`cardload.*`,
+`settlement.*`, `admin.*`) and grouped with `TableGroup`. Columns are trimmed to keys
+and correlation fields — full column-level DBML is in each service spec. `tc-api-gateway`
+(Kong) and `tc-admin-portal` (Flutter) have no database.
 
 - **Solid relationships within a service** are real foreign keys.
-- **Cross-service links are logical** — there are **no cross-database FKs**. They are
-  correlations over the shared **`transaction_ref`** (business id) and Visa
-  **`transaction_identifier`**, resolved by **events** (eventual consistency), not joins.
-- Messaging (`outbox` → broker → `processed_event`) is the backbone but is omitted as
-  drawn refs to avoid a hairball; see the [event catalog](#event-catalog).
+- **Cross-service links are logical** — no cross-database FKs. They are synchronous
+  correlations over the shared **`transaction_ref`** and Visa **`transaction_identifier`**.
 
 Paste into [dbdiagram.io](https://dbdiagram.io):
 
 ```
-// Visa Direct top-up platform — system-wide data map
-// Each service = its own database (schema namespace). Cross-service = logical, via transaction_ref / transaction_identifier.
+// Visa Direct top-up platform — system-wide data map (synchronous; no messaging tables)
 
-//==================== tc-cardload-service ====================
+//==================== tc-cardload-service (merged) ====================
 Table cardload.topup {
   id bigint [pk, increment]
   transaction_ref varchar(48) [not null, unique, note: 'business id']
-  idempotency_key varchar(64) [not null, unique]
-  status varchar(40) [not null]
-  amount decimal(18,2) [not null]
-  currency char(3) [not null]
-  customer_ref varchar(64)
-  created_at datetime
-}
-Table cardload.fraud_screening {
-  id bigint [pk, increment]
-  topup_id bigint [not null]
-  decision varchar(20) [not null]
-  score smallint
-  created_at datetime
-}
-Table cardload.payer_authentication {
-  id bigint [pk, increment]
-  topup_id bigint [not null, unique]
-  status varchar(40)
-  cavv varchar(64)
-  eci varchar(4)
-  created_at datetime
-}
-Table cardload.aft_result {
-  id bigint [pk, increment]
-  topup_id bigint [not null]
-  result varchar(20) [not null]
-  visa_txn_id varchar(40)
-  created_at datetime
-}
-Table cardload.prefunding {
-  id bigint [pk, increment]
-  topup_id bigint [not null]
-  status varchar(20) [not null]
-  funded_amount decimal(20,2)
-  created_at datetime
-}
-Table cardload.topup_state_transition {
-  id bigint [pk, increment]
-  topup_id bigint [not null]
-  to_status varchar(40) [not null]
-  created_at datetime
-}
-Table cardload.outbox {
-  id bigint [pk, increment]
-  event_id char(36) [not null, unique]
-  event_type varchar(64) [not null]
-  status varchar(20) [not null]
-}
-Table cardload.processed_event {
-  event_id char(36) [pk]
-  event_type varchar(64) [not null]
-}
-
-//==================== tc-card-network-service ====================
-Table cardnet.aft_transaction {
-  id bigint [pk, increment]
-  transaction_ref varchar(48) [not null, unique, note: 'business id']
+  correlation_id varchar(64) [not null, note: 'trace id']
   idempotency_key varchar(64) [not null, unique]
   status varchar(40) [not null]
   amount decimal(18,2) [not null]
@@ -370,144 +173,106 @@ Table cardnet.aft_transaction {
   action_code varchar(4)
   created_at datetime
 }
-Table cardnet.aft_correction {
+Table cardload.fraud_screening {
   id bigint [pk, increment]
-  aft_transaction_id bigint [not null]
+  topup_id bigint [not null]
+  decision varchar(20) [not null]
+  score smallint
+}
+Table cardload.payer_authentication {
+  id bigint [pk, increment]
+  topup_id bigint [not null, unique]
+  status varchar(40)
+  cavv varchar(64)
+  eci varchar(4)
+}
+Table cardload.prefunding {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
+  status varchar(20) [not null]
+  funded_amount decimal(20,2)
+}
+Table cardload.aft_correction {
+  id bigint [pk, increment]
+  topup_id bigint [not null]
   type varchar(20) [not null]
   status varchar(20) [not null]
   amount decimal(18,2)
-  created_at datetime
 }
-Table cardnet.visa_call {
+Table cardload.visa_call {
   id bigint [pk, increment]
-  aft_transaction_id bigint
+  topup_id bigint
   operation varchar(30) [not null]
   action_code varchar(4)
-  created_at datetime
 }
-Table cardnet.limit_config {
+Table cardload.limit_config {
   id bigint [pk, increment]
   version int [not null, unique]
   source varchar(40) [not null]
-  effective_from datetime [not null]
 }
-Table cardnet.aft_state_transition {
+Table cardload.topup_state_transition {
   id bigint [pk, increment]
-  aft_transaction_id bigint [not null]
+  topup_id bigint [not null]
   to_status varchar(40) [not null]
   created_at datetime
 }
-Table cardnet.outbox {
+Table cardload.fx_rate_daily {
   id bigint [pk, increment]
-  event_id char(36) [not null, unique]
-  event_type varchar(64) [not null]
+  source_currency char(3) [not null]
+  destination_currency char(3) [not null]
+  conversion_rate decimal(18,8) [not null, note: 'Visa base + markup']
+  as_of_date date [not null]
+}
+Table cardload.fx_quote {
+  id bigint [pk, increment]
+  quote_id char(36) [not null, unique]
+  topup_id bigint [note: 'bound at authorization']
+  conversion_rate decimal(18,8) [not null, note: 'recorded settlement reference']
+  source_amount decimal(18,2) [not null]
+  destination_amount decimal(20,2) [not null]
   status varchar(20) [not null]
 }
-Table cardnet.processed_event {
-  event_id char(36) [pk]
-  event_type varchar(64) [not null]
-}
 
-//==================== tc-ledger-service ====================
-Table ledger.account {
-  id bigint [pk, increment]
-  code varchar(64) [not null, unique]
-  type varchar(20) [not null]
-  normal_side varchar(6) [not null]
-}
-Table ledger.journal_entry {
-  id bigint [pk, increment]
-  entry_ref char(36) [not null, unique]
-  idempotency_key varchar(96) [not null, unique]
-  event_type varchar(40) [not null]
-  transaction_ref varchar(48) [note: 'business id']
-  reverses_entry_id bigint
-  created_at datetime
-}
-Table ledger.posting {
-  id bigint [pk, increment]
-  journal_entry_id bigint [not null]
-  account_id bigint [not null]
-  direction varchar(6) [not null]
-  amount decimal(23,4) [not null]
-  currency char(3) [not null]
-}
-Table ledger.account_balance {
-  account_id bigint
-  currency char(3)
-  balance decimal(23,4) [not null]
-  indexes {
-    (account_id, currency) [pk]
-  }
-}
-Table ledger.exposure {
-  currency char(3) [pk]
-  outstanding_amount decimal(23,4) [not null]
-  ceiling_amount decimal(23,4)
-}
-Table ledger.outbox {
-  id bigint [pk, increment]
-  event_id char(36) [not null, unique]
-  event_type varchar(64) [not null]
-  status varchar(20) [not null]
-}
-Table ledger.processed_event {
-  event_id char(36) [pk]
-  event_type varchar(64) [not null]
-}
-
-//==================== tc-settlement-reconciliation-service ====================
-Table recon.settlement_file {
+//==================== tc-settlement-service (reconciliation only) ====================
+Table settlement.settlement_file {
   id bigint [pk, increment]
   file_hash char(64) [not null, unique]
   status varchar(20) [not null]
-  record_count int
 }
-Table recon.settlement_raw_record {
+Table settlement.settlement_raw_record {
   id bigint [pk, increment]
   settlement_file_id bigint [not null]
   line_number int [not null]
-  record_type varchar(10)
   raw_line text [not null, note: 'as-is verbatim']
 }
-Table recon.settlement_record {
+Table settlement.settlement_record {
   id bigint [pk, increment]
   settlement_file_id bigint [not null]
   raw_record_id bigint
   settlement_id varchar(64) [not null, unique]
   transaction_identifier varchar(40) [note: 'Visa txn id']
   settled_amount decimal(18,2)
-  settlement_currency char(3)
-  transaction_type varchar(20)
 }
-Table recon.auth_leg {
+Table settlement.auth_leg {
   transaction_ref varchar(48) [pk, note: 'business id']
+  correlation_id varchar(64)
   visa_transaction_identifier varchar(40)
   authorized_amount decimal(18,2)
-  auth_status varchar(20)
 }
-Table recon.prefunding_leg {
+Table settlement.prefunding_leg {
   transaction_ref varchar(48) [pk, note: 'business id']
+  correlation_id varchar(64)
   funded_amount decimal(20,2)
-  status varchar(20)
 }
-Table recon.reconciliation_result {
+Table settlement.reconciliation_result {
   id bigint [pk, increment]
-  settlement_record_id bigint
+  settlement_record_id bigint [unique]
   transaction_ref varchar(48)
+  correlation_id varchar(64)
   visa_transaction_identifier varchar(40)
   outcome varchar(30) [not null]
+  match_method varchar(20) [note: 'EXACT_TID / FALLBACK / MANUAL']
   status varchar(20) [not null]
-}
-Table recon.outbox {
-  id bigint [pk, increment]
-  event_id char(36) [not null, unique]
-  event_type varchar(64) [not null]
-  status varchar(20) [not null]
-}
-Table recon.processed_event {
-  event_id char(36) [pk]
-  event_type varchar(64) [not null]
 }
 
 //==================== tc-admin-service ====================
@@ -528,16 +293,12 @@ Table admin.permission {
 Table admin.role_permission {
   role_id bigint
   permission_id bigint
-  indexes {
-    (role_id, permission_id) [pk]
-  }
+  indexes { (role_id, permission_id) [pk] }
 }
 Table admin.user_role {
   user_id bigint
   role_id bigint
-  indexes {
-    (user_id, role_id) [pk]
-  }
+  indexes { (user_id, role_id) [pk] }
 }
 Table admin.tag {
   id bigint [pk, increment]
@@ -547,9 +308,7 @@ Table admin.tag {
 Table admin.user_tag {
   user_id bigint
   tag_id bigint
-  indexes {
-    (user_id, tag_id) [pk]
-  }
+  indexes { (user_id, tag_id) [pk] }
 }
 Table admin.totp_secret {
   user_id bigint [pk]
@@ -585,19 +344,8 @@ Table admin.activity_log {
   id bigint [pk, increment]
   actor_id bigint
   type varchar(20) [not null]
-  screen varchar(255)
   hash char(64) [not null]
   created_at datetime
-}
-Table admin.outbox {
-  id bigint [pk, increment]
-  event_id char(36) [not null, unique]
-  event_type varchar(64) [not null]
-  status varchar(20) [not null]
-}
-Table admin.processed_event {
-  event_id char(36) [pk]
-  event_type varchar(64) [not null]
 }
 
 //==================== visual grouping ====================
@@ -605,39 +353,21 @@ TableGroup "tc-cardload-service" {
   cardload.topup
   cardload.fraud_screening
   cardload.payer_authentication
-  cardload.aft_result
   cardload.prefunding
+  cardload.aft_correction
+  cardload.visa_call
+  cardload.limit_config
   cardload.topup_state_transition
-  cardload.outbox
-  cardload.processed_event
+  cardload.fx_rate_daily
+  cardload.fx_quote
 }
-TableGroup "tc-card-network-service" {
-  cardnet.aft_transaction
-  cardnet.aft_correction
-  cardnet.visa_call
-  cardnet.limit_config
-  cardnet.aft_state_transition
-  cardnet.outbox
-  cardnet.processed_event
-}
-TableGroup "tc-ledger-service" {
-  ledger.account
-  ledger.journal_entry
-  ledger.posting
-  ledger.account_balance
-  ledger.exposure
-  ledger.outbox
-  ledger.processed_event
-}
-TableGroup "tc-settlement-reconciliation-service" {
-  recon.settlement_file
-  recon.settlement_raw_record
-  recon.settlement_record
-  recon.auth_leg
-  recon.prefunding_leg
-  recon.reconciliation_result
-  recon.outbox
-  recon.processed_event
+TableGroup "tc-settlement-service" {
+  settlement.settlement_file
+  settlement.settlement_raw_record
+  settlement.settlement_record
+  settlement.auth_leg
+  settlement.prefunding_leg
+  settlement.reconciliation_result
 }
 TableGroup "tc-admin-service" {
   admin.admin_user
@@ -654,30 +384,21 @@ TableGroup "tc-admin-service" {
   admin.parameter_version
   admin.parameter_proposal
   admin.activity_log
-  admin.outbox
-  admin.processed_event
 }
 
 //==================== intra-service foreign keys ====================
 Ref: cardload.fraud_screening.topup_id > cardload.topup.id
 Ref: cardload.payer_authentication.topup_id - cardload.topup.id
-Ref: cardload.aft_result.topup_id > cardload.topup.id
 Ref: cardload.prefunding.topup_id > cardload.topup.id
+Ref: cardload.aft_correction.topup_id > cardload.topup.id
+Ref: cardload.visa_call.topup_id > cardload.topup.id
 Ref: cardload.topup_state_transition.topup_id > cardload.topup.id
+Ref: cardload.fx_quote.topup_id > cardload.topup.id
 
-Ref: cardnet.aft_correction.aft_transaction_id > cardnet.aft_transaction.id
-Ref: cardnet.visa_call.aft_transaction_id > cardnet.aft_transaction.id
-Ref: cardnet.aft_state_transition.aft_transaction_id > cardnet.aft_transaction.id
-
-Ref: ledger.posting.journal_entry_id > ledger.journal_entry.id
-Ref: ledger.posting.account_id > ledger.account.id
-Ref: ledger.account_balance.account_id > ledger.account.id
-Ref: ledger.journal_entry.reverses_entry_id > ledger.journal_entry.id
-
-Ref: recon.settlement_raw_record.settlement_file_id > recon.settlement_file.id
-Ref: recon.settlement_record.settlement_file_id > recon.settlement_file.id
-Ref: recon.settlement_record.raw_record_id > recon.settlement_raw_record.id
-Ref: recon.reconciliation_result.settlement_record_id > recon.settlement_record.id
+Ref: settlement.settlement_raw_record.settlement_file_id > settlement.settlement_file.id
+Ref: settlement.settlement_record.settlement_file_id > settlement.settlement_file.id
+Ref: settlement.settlement_record.raw_record_id > settlement.settlement_raw_record.id
+Ref: settlement.reconciliation_result.settlement_record_id > settlement.settlement_record.id
 
 Ref: admin.admin_user.approved_by > admin.admin_user.id
 Ref: admin.role_permission.role_id > admin.role.id
@@ -694,13 +415,8 @@ Ref: admin.parameter_proposal.proposed_by > admin.admin_user.id
 Ref: admin.parameter_proposal.approved_by > admin.admin_user.id
 Ref: admin.activity_log.actor_id > admin.admin_user.id
 
-//==================== cross-service correlations (LOGICAL — no DB FK) ====================
-// same business top-up id flows across services:
-Ref: cardnet.aft_transaction.transaction_ref - cardload.topup.transaction_ref
-Ref: ledger.journal_entry.transaction_ref > cardload.topup.transaction_ref
-Ref: recon.auth_leg.transaction_ref - cardload.topup.transaction_ref
-Ref: recon.prefunding_leg.transaction_ref - cardload.topup.transaction_ref
-// Visa transaction identifier joins settlement to the AFT:
-Ref: recon.settlement_record.transaction_identifier > cardnet.aft_transaction.transaction_identifier
-// config propagation: admin.parameter --(limits.updated event)--> cardnet.limit_config / ledger.exposure (not drawn)
+//==================== cross-service correlations (LOGICAL — synchronous, no DB FK) ====================
+Ref: settlement.auth_leg.transaction_ref - cardload.topup.transaction_ref
+Ref: settlement.prefunding_leg.transaction_ref - cardload.topup.transaction_ref
+Ref: settlement.settlement_record.transaction_identifier > cardload.topup.transaction_identifier
 ```

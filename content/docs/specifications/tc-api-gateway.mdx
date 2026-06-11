@@ -34,36 +34,32 @@ A traceability map from the design review to the sections that satisfy each poin
 > "Money-movement paths" means any route that can initiate or change a top-up
 > (`POST /v1/topups`, the 3DS callback). Those paths default to **fail-closed**.
 
-## Technical stack & event model
+## Technical stack & topology
 
 `tc-api-gateway` is **Kong** (Lua/declarative config) at the **synchronous HTTP edge** — it
 is the one component that is *not* a Spring Boot service. Everything behind it is a
-**JDK 25 / Spring Boot 4.0+ microservice**, and those services talk to each other
-**asynchronously over a message broker (Spring Cloud Stream)**, not through the gateway. See
+**JDK 25 / Spring Boot 4.0+ microservice**, and those services talk to each other over
+**synchronous REST** (there is no message broker). See
 [Architecture & service interaction](/docs/specifications/architecture).
 
-Two consequences for this spec:
+One consequence for this spec:
 
-- **Limits propagation.** The gateway consumes config, not events — Kong is not a
-  message-broker consumer. When `tc-admin-service` emits `limits.updated`, a small **decK relay** applies
-  the new edge limits to Kong (the Spring Boot services consume `limits.updated` directly).
-- **Webhook egress.** The signed PVCB webhook is best driven by the
-  `partner.notification.requested` event: a webhook-dispatcher consumes it and calls the
-  gateway egress, giving at-least-once delivery + DLQ (see [Outbound webhooks](#outbound-webhooks-to-pvcb)).
+- **Limits propagation.** When `tc-admin-service` updates the authorization limits, a small
+  **decK relay** applies the new edge limits to Kong, and the Spring Boot services receive
+  the new config via a synchronous push/pull.
 
 ## Where the gateway sits in the flow
 
 The gateway has exactly four interaction points in the sequence diagram. Everything else
-(`tc-card-network-service`, `tc-ledger-service`, `PVCB Core Banking`, settlement) is
-**downstream of `tc-cardload-service`** and never traverses the gateway directly.
+(`tc-settlement-service`, `PVCB Core Banking`, settlement) is **downstream of
+`tc-cardload-service`** and never traverses the gateway directly.
 
 | # | Counterparty | Direction | What crosses the gateway | Trust model |
 | --- | --- | --- | --- | --- |
-| 1 | PVCB Top up service | inbound | Top-up initiation (after PVCB's AML check), status queries | mTLS **+** signed payload **+** limits |
+| 1 | PVCB Top up service | inbound | Top-up initiation (after PVCB's AML check), status queries (polls `/top-up-status`) | mTLS **+** signed payload **+** limits |
 | 2 | Tourist client | inbound | "3DS challenge completed" notification | one-time signed callback token only |
 | 3 | tc-cardload-service | outbound (proxy) | Forwarded top-up / 3DS-completed requests | internal network |
-| 4 | PVCB Top up service | outbound (egress) | Webhook callbacks (responses, redirect URL, final status) | tc-signed payload + mTLS to PVCB |
-| 5 | tc-admin-service | outbound (proxy) | Internal admin traffic | forward-only, internal listener |
+| 4 | tc-admin-service | outbound (proxy) | Internal admin traffic | forward-only, internal listener |
 
 ```
                  INTERNET (untrusted)                 PARTNER LINK (mTLS/VPN)          INTERNAL (trusted)
@@ -74,10 +70,10 @@ The gateway has exactly four interaction points in the sequence diagram. Everyth
                     ┌───────────────────────── tc-api-gateway (Kong) ───────────────────┤
                     │  public listener :8443   partner listener :9443  admin listener   │
                     │  (1 route only)          (mTLS + JWS + limits)   :10443 (internal) ├─ tc-admin-service
-                    └───────────────────────────────────────────────────────────────────┤
-                                            │ signed webhook egress                       │
-                                            ▼                                             │
-                                     PVCB webhook endpoint                                └─ (forward only)
+                    └───────────────────────────────────────────────────────────────────┘
+                                                                                       (forward only)
+
+   No outbound webhook — PVCB polls GET /top-up-status (inbound, partner listener) for results.
 ```
 
 > The gateway is **stateless for business logic**. It authenticates, screens against
@@ -165,7 +161,7 @@ lifecycle, not a one-time setup.
 | --- | --- |
 | Generate | Each party generates its keypair **inside an HSM/KMS**; the private key **MUST NOT** leave it. Algorithm **ES256** (EC P-256) preferred; **RS256/PS256** (RSA-3072) fallback. No symmetric `HS*`. |
 | Exchange | Public keys are exchanged **out-of-band** over a secure channel; the recipient verifies the **fingerprint via a second channel** before trusting; record both keys (with `kid`) in a key registry. |
-| Store | PVCB's **public** key is stored as a Kong consumer JWT credential (tagged with its `kid`). tc's **private** key (used for webhook + callback-token signing) lives in KMS/Vault and is referenced via Kong's vault backend — **never** inlined in declarative config. |
+| Store | PVCB's **public** key is stored as a Kong consumer JWT credential (tagged with its `kid`). tc's **private** key (used for **callback-token signing**) lives in KMS/Vault and is referenced via Kong's vault backend — **never** inlined in declarative config. |
 | Rotate | Every JWS/JWT carries a `kid`. Publish the **new** key and accept both **before** retiring the old one (overlapping validity → zero-downtime). Rotate every **6–12 months**. |
 | Revoke | On suspected compromise, remove the `kid` from the accepted set immediately (config push), notify the partner out-of-band, and rotate. |
 
@@ -292,9 +288,7 @@ edge-only limits evaporate. Enforce caps at every layer that can move money:
 | Layer | Enforces | Why it's needed even with the edge |
 | --- | --- | --- |
 | `tc-api-gateway` (edge) | per-tx cap, currency, velocity, daily sums, global ceiling | bounds the blast radius of a PVCB breach at the boundary |
-| `tc-cardload-service` | re-validate per-tx + business rules | path-independent; not every internal caller goes through the edge |
-| `tc-card-network-service` | per-tx / currency / BAI / MCC / velocity / per-BIN / global ceiling | the authoritative gate — it submits the auth to Visa, so a cap here can't be bypassed |
-| `tc-ledger-service` | balance / exposure / prefunding limits | the system of record for funds — last app-level guard |
+| `tc-cardload-service` | per-tx / currency / BAI / MCC / velocity / per-BIN / global ceiling | the authoritative gate — it submits the auth to Visa, so a cap here can't be bypassed |
 | Visa Direct program config | scheme-level transaction & velocity limits | enforced by Visa itself; survives any tc-side bug |
 
 ## Requirement 3 — Exactly one public endpoint
@@ -353,7 +347,6 @@ no limit logic, just authenticated forwarding.
 | Public abuse control | public | `rate-limiting`, `bot-detection`, `cors` | OSS |
 | Admin network lock | admin | `ip-restriction` | OSS |
 | Admin identity | admin | `mtls-auth` / `openid-connect` | EE |
-| Outbound webhook signing | egress | custom `post-function` (JWS) + mTLS | OSS / custom |
 | Tracing & metrics | global | `correlation-id`, `prometheus`, `http-log` (SIEM) | OSS |
 
 ## Configuring Kong
@@ -455,7 +448,7 @@ correlation-id → mtls-auth → tc-jws-verify → request-size-limiting
 
 - **PVCB public key** — store in the vault and reference it from the consumer credential:
   `rsa_public_key: "{vault://hcv/pvcb/public-key}"`. Only the **public** key lives here.
-- **tc private key** (webhook + callback-token signing) — KMS/Vault only, referenced the
+- **tc private key** (callback-token signing) — KMS/Vault only, referenced the
   same way; never inlined.
 - **mTLS** — create a `ca_certificates` entity holding PVCB's client-cert CA and point the
   `mtls-auth` plugin at it (`config.ca_certificates`). On OSS, set the TLS-layer client
@@ -596,27 +589,6 @@ curl -sk https://admin:10443/admin/health -w '%{http_code}\n'                   
 
 Keep the repo as the single source of truth so config changes are reviewed like code.
 
-## Outbound webhooks to PVCB
-
-The diagram shows the gateway forwarding responses, the redirect URL, and the final
-status to PVCB "via webhook." That is **egress**, and it is the other half of the key
-exchange — it deserves the same rigor as the inbound leg.
-
-- **Sign every webhook body** with **tc's private key** (detached JWS, with `kid`); PVCB
-  verifies with **tc's public key**. This is the outbound counterpart to Requirement 1.
-- **mTLS to PVCB's endpoint** and **pin/verify their server certificate**; allowlist
-  PVCB's host/IP and do **not** follow redirects.
-- **Idempotent, at-least-once delivery.** Each webhook carries a unique `Delivery-Id` and
-  the originating transaction's `Idempotency-Key`; PVCB dedupes on these. Retry with
-  exponential backoff (e.g. 1s, 5s, 30s, 2m, …) up to a max attempt count, then route to a
-  **dead-letter queue and page on-call** — never drop a financial event silently.
-- **Ordering.** Include a monotonic `Sequence`/event timestamp so PVCB can apply a state
-  machine (or last-writer-wins) if events arrive out of order.
-- **Acknowledgement.** Treat only a `2xx` as delivered; optionally require a signed
-  receipt from PVCB. Any non-`2xx` triggers the retry path.
-- Implement via a Kong egress `service`/`route` that internal callers hit, with a
-  `post-function` that adds the JWS header before proxying out.
-
 ## Failure & degradation behavior
 
 Money-movement paths **MUST** fail closed: when a security dependency cannot be evaluated,
@@ -629,7 +601,6 @@ gracefully.
 | Signature verification (key fetch / JWS) | partner & callback auth | **Reject** with `401`; never bypass |
 | OPA (if used for policy) | limit policy | **Reject** with `503` |
 | `tc-cardload-service` upstream down | request processing | **Reject** with `503` + `Retry-After`; **never** auto-approve a top-up |
-| Webhook egress to PVCB down | outbound notification | Retry with backoff → **DLQ + alert**; never silently drop |
 | Cybersource (downstream of cardload) | fraud / 3DS result | Handled by `tc-cardload-service`; the transaction **MUST NOT** proceed on an unknown 3DS/fraud result |
 
 - **Status/read endpoints** (`GET /v1/topups/{id}`) **MAY** return a degraded/cached read
@@ -682,11 +653,10 @@ proxy.
 | 3 | "One public endpoint" must still be authenticated (one-time token + rate-limit + bot) | [The single public route](#the-single-public-route-post-v1public3dscallback) |
 | 4 | Don't rely on the edge as the only limit enforcement | [Layered enforcement](#layered-enforcement) |
 | 5 | One big cap isn't enough — velocity + cumulative + global ceiling | [Authorization limits](#requirement-2--authorization-limits-the-10m-auth-guard) |
-| 6 | Outbound webhooks need the same rigor (sign, mTLS, idempotent, DLQ) | [Outbound webhooks to PVCB](#outbound-webhooks-to-pvcb) |
-| 7 | Fail closed on money movement | [Failure & degradation behavior](#failure--degradation-behavior) |
-| 8 | AML at PVCB is bypassable — keep independent tc-side screening | [Trust model & assumptions](#trust-model--assumptions) |
-| 9 | Currency must be on an explicit allowlist | [Authorization limits](#requirement-2--authorization-limits-the-10m-auth-guard) (`allowed_currency`) |
-| 10 | Plan PCI scope and `kid`-based key rotation up front | [Key lifecycle management](#key-lifecycle-management), [Cross-cutting concerns](#cross-cutting-concerns) |
+| 6 | Fail closed on money movement | [Failure & degradation behavior](#failure--degradation-behavior) |
+| 7 | AML at PVCB is bypassable — keep independent tc-side screening | [Trust model & assumptions](#trust-model--assumptions) |
+| 8 | Currency must be on an explicit allowlist | [Authorization limits](#requirement-2--authorization-limits-the-10m-auth-guard) (`allowed_currency`) |
+| 9 | Plan PCI scope and `kid`-based key rotation up front | [Key lifecycle management](#key-lifecycle-management), [Cross-cutting concerns](#cross-cutting-concerns) |
 
 ### Edition / cost note
 
