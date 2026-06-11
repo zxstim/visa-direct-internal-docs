@@ -1,0 +1,151 @@
+---
+title: Engineering Ground Rules
+description: Day-to-day working agreement for the team — signed commits, right-sized PRs, review, CI gates, secrets/PCI hygiene, and extra care on money-movement code. Lightweight but enforced.
+permission: member
+---
+
+We're a small team building a **money-movement** system, so the bar is "disciplined but not
+bureaucratic." These are the rules we actually hold each other to. When a rule needs judgement,
+use it — and bias toward what keeps the money path safe and the history auditable.
+
+## The short version
+
+- **Every commit is SSH-signed with your own key and a matching, verified email.** No exceptions.
+- **`main` is protected** — all changes land via a reviewed PR; no direct pushes.
+- **PRs are right-sized** — one logical change, reviewable in one sitting.
+- **Testing must be green** before merge.
+- **Never commit secrets, keys, or card data** (PAN/CVV/track).
+- **Money-path changes get a second set of eyes and tests** — always.
+
+## 1. Git & commits
+
+### Signed commits (required)
+
+Every commit **must be signed with the author's own SSH key**, and the commit email **must match a
+verified email on that developer's account**. Branch protection on `main` **rejects unsigned or
+mismatched commits**. One-time setup:
+
+```bash
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/id_ed25519.pub   # your own key, never shared
+git config --global commit.gpgsign true
+git config --global tag.gpgsign true
+git config --global user.email "you@company.com"            # must be a verified email on your Git host
+```
+
+Then add the **same public key as a _Signing Key_** on your Git host (GitHub: *Settings → SSH and
+GPG keys → New SSH key → type "Signing Key"*). Commits should show **Verified**. Don't sign with a
+shared/CI key, and don't disable signing to "fix" a rebase — re-sign instead.
+
+### Commit messages
+
+- **Imperative, scoped, atomic** — one coherent change per commit. Prefer
+  [Conventional Commits](https://www.conventionalcommits.org/): `feat(cardload): add AFT reversal`,
+  `fix(settlement): correct TID normalization`, `chore`, `test`, `docs`, `refactor`.
+- **Reference the task ID** (`P0-4`) so commits trace back to the board.
+- No "wip", "fix typo x5", or "address review" noise on `main` — clean it up before merge
+  (squash handles most of this).
+
+## 2. Branches & merging
+
+- **Branch off `main`**, short-lived. Naming: `feat/P0-4-aft-reversal`, `fix/P0-9-3ds-callback`.
+- **`main` is protected:** no direct pushes, require a passing CI run + ≥1 approval + signed commits.
+- **Squash-merge** to keep `main` linear and each merge = one reviewable unit. Delete the branch
+  after merge.
+- **Rebase, don't merge-commit** your branch onto `main` to stay current.
+- Keep branches alive **days, not weeks** — long-lived branches rot and produce huge PRs.
+
+## 3. Pull requests — right-sized, your judgement
+
+The goal: **a reviewer can fully understand the change in one sitting** (~20–30 min). That's the
+real metric — line count is a proxy.
+
+- **One logical change per PR.** Don't mix a refactor, a feature, and a config bump.
+- **Rule of thumb:** a few hundred lines of *meaningful* diff (exclude lockfiles/generated). If a
+  reviewer has to scroll for ten minutes before forming an opinion, it's too big.
+- **Too big?** Split it — **stacked / incremental PRs** (scaffold → client → wiring → tests), each
+  green on its own. Landing the SDK and its tests before the orchestration that uses them is the
+  natural seam.
+- **Too small?** A one-line churn PR is fine for an urgent hotfix, but otherwise batch it with the
+  related change. Don't manufacture ceremony.
+- **Judgement call:** a 600-line *mechanical rename* is fine; a 150-line PR touching money logic +
+  auth + config is **not** — size follows risk, not just diff.
+- **PR description** says **what / why / how it was tested** and links the **task ID**. A
+  screenshot or test output beats a paragraph.
+
+## 4. Code review
+
+- **≥1 approval before merge**; no self-merging unreviewed code. We're small — **review within a
+  few hours**, don't let PRs sit overnight.
+- **Reviewers check:** correctness, **money-safety** (idempotency, fail-closed, exactly-once),
+  security/PCI, error handling, tests, and whether it matches the [specs](/docs/specifications).
+- **Author keeps PRs reviewable** — respond to comments, push fixups, re-request review. Disagree
+  in the thread, decide, move on.
+- **Money-path or auth changes:** the reviewer should be the *other* owner of that area, and the
+  PR must carry tests for the new path.
+
+## 5. CI & Definition of Done
+
+CI is the gate, not a suggestion — **a red build never merges.** Required to pass:
+
+- `bun run types:check`, **lint**, and the **test suite** (the P0/money-path tests block).
+- For backend money paths: the relevant [Testing-requirements](/docs/specifications/tc-cardload-service#testing-requirements)
+  checks, with the run summary committed to `reports/<suite>/summary.md`.
+
+**Definition of Done** for a task/card:
+
+1. Code + tests written, CI green.
+2. Reviewed and approved (signed commits, Verified).
+3. Behavior change → the relevant **spec/doc updated** in the same PR (or a linked follow-up).
+4. `reports/` summary updated where it applies.
+5. Task moved on the board with a link to the merged PR.
+
+## 6. Secrets, keys & PCI
+
+- **Never commit** secrets, private keys, certs, `.env`, or credentials. They come from a secrets
+  manager / env, never source. A leaked key = rotate immediately.
+- **Never commit, log, or paste card data** — no **PAN / CVV / track data**. Work with tokens
+  (Flex/TMS, network token) only; the PAN never enters `tc-*` (see
+  [tc-cardload-service](/docs/specifications/tc-cardload-service)).
+- **Secret scanning** runs in CI and ideally as a **pre-commit hook** (e.g. gitleaks); a hit blocks
+  the merge.
+- `.env.example` is committed (keys, no values); real `.env` is git-ignored.
+
+## 7. Money-movement code — extra care
+
+This is where bugs cost money, so a few non-negotiables on those paths:
+
+- **Tests are mandatory** for any change to authorization, AFT/reversal, idempotency, or
+  reconciliation — including the failure/timeout cases, not just happy path.
+- **Fail closed** by default: if a control can't be evaluated, reject — never "let it through."
+- **Idempotency keys** on every mutating call; **never blind-resend** to Visa — `GET`-status then
+  reverse.
+- **Persist-first:** commit state before the external call so a crash is recoverable.
+- Don't "temporarily" weaken a money-safety check to unblock yourself — raise it instead.
+
+## 8. Local dev hygiene
+
+- **Format + lint clean** before pushing — auto-format on save (Spotless / `dart format` /
+  Prettier / Biome per language). CI re-checks.
+- **Use `bun run …`** for repo scripts (not npm) — this repo's convention.
+- A committed **`.editorconfig`** keeps indentation/line-endings consistent across editors.
+- No commented-out code and no orphan `TODO`s on `main` — a TODO needs an owner and a task ID, or
+  it doesn't ship.
+- **Pin dependency versions**, commit the lockfile, and review new dependencies (supply-chain
+  hygiene) before adding them.
+
+## 9. Cadence & communication
+
+- **Ship daily.** Open PRs as work becomes reviewable — a week of work in one PR helps no one.
+- **Async standup** (what I did / what's next / blockers). Surface **blockers immediately** —
+  especially external dependencies (e.g. the Visa **provisioning** check that gates
+  [Phase 0](/docs/timeline)).
+- **The board is the source of truth** for who's doing what; keep card status honest.
+- **Decisions that change a spec** get written into the spec, not just chatted — future-you reads
+  the doc, not the thread.
+
+---
+
+> These are a **starting agreement**, intentionally opinionated (squash merge, ~one-sitting PR size,
+> few-hour review). Tune the dials that don't fit how we actually work — but the **signed commits**,
+> **green CI**, **no secrets/card data**, and **money-path tests** rules are the ones we don't bend.

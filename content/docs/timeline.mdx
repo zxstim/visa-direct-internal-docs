@@ -1,108 +1,108 @@
 ---
 title: Development Timeline
-description: Build plan for a 2 backend + 2 Flutter team — the synchronous money rails (gateway, cardload[+Visa Direct], settlement[reconciliation]) functional by Jul 15, tc-admin-service + portal integration by Jul 30, hardening after.
+description: Near-term plan (Phase 0) for a 2 backend + 2 Flutter team — build & test the Cybersource and Visa Direct integration SDKs first, start Visa Direct certification next week, with the orchestration built in parallel.
 permission: member
 ---
 
 ## Plan at a glance
 
-Team: **2 backend (BE-A, BE-B) + 2 Flutter (FE-A, FE-B)**, fully dedicated.
+Team: **2 backend (BE-A, BE-B) + 2 Flutter (FE-A, FE-B)**.
 
-> **Architecture update.** `tc-card-network-service` is **merged into `tc-cardload-service`**, the
-> **double-entry ledger is dropped** (PVCB is the book of record) so `tc-settlement-service` is now
-> purely the **Visa settlement reconciler**, and the **messaging layer is removed** — services talk
-> over **synchronous REST**. That cuts the broker/outbox/inbox plumbing *and* the ledger, so the
-> Jul 15 target is a little more comfortable than the event-driven plan.
+> **Focus is Phase 0 only — the next two weeks.** Build the **integration SDKs first**, test them
+> in isolation, then start **Visa Direct certification**, with the **orchestration built in
+> parallel**. Later phases (full rails, admin service, hardening) are deliberately out of view
+> until Phase 0 lands.
 
-- **Phase 1 — Jul 15:** `tc-api-gateway`, `tc-cardload-service` (orchestration **+ Visa
-  Direct**), and `tc-settlement-service` (**settlement reconciliation**) **functionally
-  complete (no hardening)** — the end-to-end top-up works synchronously in sandbox. Flutter
-  builds the full portal UI against mocks in parallel.
-- **Phase 2 — Jul 30:** `tc-admin-service` backend + **portal integration**.
-- **Phase 3 — after Jul 30:** hardening (security/PCI, perf, gateway custom plugins, full
-  reversal/adjustment/refund, production cert).
+Sequence — matches the
+[build order](/docs/specifications/tc-cardload-service#build-order-recommended) (clients first,
+test, then the flow):
 
-Track split: **BE-A** = gateway + the **Visa Direct module of cardload**, then **settlement
-reconciliation**; **BE-B** = the **orchestration module of cardload** (Cybersource — tokenization,
-DM, Payer Auth), then **joins reconciliation** (matching + reports) once orchestration lands.
-`tc-cardload-service` is built as two modules by the two devs; `tc-settlement-service` is
-**reconciliation-only**. Flutter works **contract-first** against mocks. Days 1–2 both backend
-devs pair on foundations, then split.
+1. **Integration SDKs + testing — this week (Jun 12–19).** A thin, independently-tested client
+   layer per provider: **BE-A → Visa Direct** (FTAI, AFT, reversal, FX), **BE-B → Cybersource**
+   (tokenization, Decision Manager, Payer Auth).
+2. **Visa Direct certification — next week (Jun 22–26).** BE-A runs Visa's cert test cases against
+   the already-tested Visa Direct SDK.
+3. **Orchestration — meanwhile.** Once the SDKs are green, BE-B stitches the flow
+   (FTAI → DM → 3DS → limits → fees → FX → AFT → prefund → record) on top — **in parallel** with
+   certification, on clients we already trust.
 
-## Phase 1 — Jun 9 → Jul 15 (synchronous money rails, no hardening)
+## Phase 0 — integration SDKs → certification (Jun 12 → Jun 26)
 
-| Component | Task | Start | End | PIC |
-| --- | --- | --- | --- | --- |
-| Platform | Repos, CI/CD, MySQL (+ standby) + Redis, shared libs (RestClient config, idempotency, error handling) | Jun 9 | Jun 13 | BE-A + BE-B |
-| tc-api-gateway | Kong deploy (DB-less, decK, TLS, routing, JWT auth, 3DS callback + forward) — minimal, no custom Lua | Jun 9 | Jun 13 | BE-A |
-| tc-cardload-service · orchestration | Scaffold + state machine + persistence (Flyway) | Jun 15 | Jun 18 | BE-B |
-| tc-cardload-service · orchestration | Cybersource client (HTTP signature/JWT, MLE, sandbox) | Jun 18 | Jun 20 | BE-B |
-| tc-cardload-service · orchestration | Fraud component — Decision Manager (`/risk/v1/decisions`) + toggle | Jun 22 | Jun 26 | BE-B |
-| tc-cardload-service · orchestration | Payer-auth component — setup/enroll/validate (3DS 2.x) | Jun 29 | Jul 3 | BE-B |
-| tc-cardload-service · orchestration | Synchronous orchestration (limits → FX snapshot → AFT → prefunding → record outcome) + idempotency | Jul 4 | Jul 9 | BE-B |
-| tc-cardload-service · Visa Direct | Visa VDP sandbox connectivity (mTLS, MLE, x-pay-token) | Jun 16 | Jun 19 | BE-A |
-| tc-cardload-service · Visa Direct | AFT pull (`pullfundstransactions`) + 3DS (cavv/eci) passthrough + actionCode | Jun 19 | Jun 24 | BE-A |
-| tc-cardload-service · Visa Direct | Authorization limits (config) + exactly-once (STAN, GET-on-timeout) + minimal reversal | Jun 24 | Jun 27 | BE-A |
-| tc-cardload-service · Foreign Exchange | Visa FX Rates client (`/forexrates/v2`) + daily-rate cache + per-txn snapshot (settlement ref) | Jun 27 | Jun 28 | BE-A |
-| tc-settlement-service · reconciliation | SFTP fetch + secure storage + file dedupe + as-is staging | Jun 29 | Jul 2 | BE-A |
-| tc-settlement-service · reconciliation | VSS/TC46 parser (pluggable) + control-total validation (sample files) | Jul 2 | Jul 7 | BE-A |
-| tc-settlement-service · reconciliation | Read auth+prefunding legs (sync from cardload) + **set-based 3-way match** (TID join + fallback) + outcomes | Jul 8 | Jul 13 | BE-A + BE-B |
-| tc-settlement-service · reconciliation | Break/exception queue + reconciliation reports | Jul 14 | Jul 15 | BE-A + BE-B |
-| Integration | E2E happy path (top-up → DM → 3DS → AFT sandbox → prefund → record) + reconciliation w/ sample file | Jul 14 | Jul 15 | BE-A + BE-B |
-| tc-admin-portal | Scaffold (Flutter web, Riverpod, GoRouter, Dio) + mock API + design system | Jun 9 | Jun 13 | FE-A + FE-B |
-| tc-admin-portal | Auth: login + session/CSRF + TOTP screens (vs mock) | Jun 15 | Jun 24 | FE-A |
-| tc-admin-portal | Sign-up + pending-approval + account-admin screens (vs mock) | Jun 15 | Jun 24 | FE-B |
-| tc-admin-portal | Limits maker-checker UI (propose/approve/diff/history) | Jun 25 | Jul 3 | FE-A |
-| tc-admin-portal | Dashboards (live auth / settlement / breaks, charts) | Jun 25 | Jul 3 | FE-B |
-| tc-admin-portal | Audit viewer + activity telemetry (route observer, tracked widgets) | Jul 6 | Jul 11 | FE-A |
-| tc-admin-portal | Passkey WebAuthn interop + RBAC/tag-aware rendering | Jul 6 | Jul 11 | FE-B |
-| tc-admin-portal | UI polish + integration-prep | Jul 13 | Jul 15 | FE-A + FE-B |
+**Why SDKs first:** the two providers are the hard, risky part (auth, mTLS, MLE, cryptograms,
+their latency) **and** the real throughput ceiling — proving them in isolation de-risks everything
+on top. Certification then runs against a client we already trust, and the orchestration becomes
+wiring rather than discovery.
 
-## Phase 2 — Jul 16 → Jul 30 (tc-admin-service + portal integration)
+> **Estimate.** Building + testing the **SDKs this week is comfortable** for two devs in parallel.
+> **Visa Direct certification next week is feasible** — the gating item is **Visa-side
+> provisioning** (cert-environment access, MLE keys, AFT-program BIN), which must be in hand
+> **now**, not the code. The **orchestration lands in parallel** because it sits on already-tested
+> clients. "Testing" here = isolated client tests + latency baselines, not the full
+> [Testing-requirements](/docs/specifications/tc-cardload-service#testing-requirements) suite.
 
-Both backend devs are free after Jul 15; the portal wires to the real backend.
+### Week 1 — integration SDKs + testing (Jun 12 → Jun 19)
 
 | Component | Task | Start | End | PIC |
 | --- | --- | --- | --- | --- |
-| tc-admin-service | Spring Security session + email/password + sign-up + super-admin approval + RBAC/tags | Jul 16 | Jul 22 | BE-A |
-| tc-admin-service | TOTP factor + passkeys (WebAuthn) + MFA authorization | Jul 23 | Jul 28 | BE-A |
-| tc-admin-service | Authorization-limits CRUD (maker-checker) + synchronous config push | Jul 16 | Jul 21 | BE-B |
-| tc-admin-service | Activity ingest API + audit trail (append-only, hash-chained) | Jul 22 | Jul 25 | BE-B |
-| tc-admin-service | Dashboard read APIs (sync aggregation) + `/api/auth/me` | Jul 26 | Jul 30 | BE-B |
-| tc-admin-portal | Integrate real `tc-admin-service` (auth/MFA/limits/dashboards/audit); finish passkeys; remove mocks | Jul 16 | Jul 30 | FE-A + FE-B |
+| Platform | **Blocker check (day 1):** VDP **cert creds + MLE keys + AFT BIN** live; **Cybersource sandbox keys** live | Jun 12 | Jun 12 | BE-A + BE-B |
+| Platform | Service scaffold + **persist-first** record (`topup` / `visa_call`) — pair, then split | Jun 12 | Jun 13 | BE-A + BE-B |
+| Visa Direct SDK | **VDP connectivity** — mTLS + `x-pay-token` + **MLE** (cert environment) | Jun 13 | Jun 16 | BE-A |
+| Visa Direct SDK | **AFT pull** + **reversal** + **exactly-once** (STAN, GET-status-on-timeout, never blind-resend) | Jun 16 | Jun 18 | BE-A |
+| Visa Direct SDK | **FTAI** eligibility + **FX Rates** client | Jun 18 | Jun 19 | BE-A |
+| Visa Direct SDK | **Tests** — happy path, declines, timeout→GET-status, latency baselines | Jun 17 | Jun 19 | BE-A |
+| Cybersource SDK | **Tokenization** — Flex/TMS + **network token (VTS)** | Jun 13 | Jun 15 | BE-B |
+| Cybersource SDK | **Decision Manager** (`/risk/v1/decisions`) + toggle | Jun 15 | Jun 17 | BE-B |
+| Cybersource SDK | **Payer Authentication** (setup/enroll/validate, 3DS 2.x) | Jun 17 | Jun 19 | BE-B |
+| Cybersource SDK | **Tests** — happy path, errors, timeouts, latency baselines | Jun 18 | Jun 19 | BE-B |
 
-## Phase 3 — after Jul 30 (hardening, dates TBD)
+### Week 2 — certification + orchestration in parallel (Jun 22 → Jun 26)
 
-| Component | Deferred hardening |
-| --- | --- |
-| tc-api-gateway | Custom Lua plugins (`tc-jws-verify`, `tc-auth-limit`), full edge limits |
-| tc-cardload-service | Full reversal + adjustment + OCT refund suite; PAAI eligibility |
-| tc-settlement-service | Full VSS report set, break-resolution workflow, real settlement files |
-| All services | Security + PCI review, perf/load testing, fail-closed edge cases, idempotency soak |
-| Platform | Production cert (Visa/Cybersource), pilot prep |
+| Component | Task | Start | End | PIC |
+| --- | --- | --- | --- | --- |
+| Visa Direct · certification | **Run Visa Direct cert test cases** (AFT / reversal / FTAI); fix; capture evidence | Jun 22 | Jun 26 | BE-A |
+| tc-cardload-service · orchestration | **Synchronous orchestration on the tested SDKs** — FTAI → DM → 3DS → limits → fees → FX → AFT → prefund → record + idempotency + state machine | Jun 22 | Jun 26 | BE-B |
+| Integration | **E2E happy path** in sandbox (top-up → … → record) on the orchestrated SDKs | Jun 26 | Jun 26 | BE-A + BE-B |
 
 ## Milestones
 
 | Milestone | Date | Exit criteria |
 | --- | --- | --- |
-| M1 — Foundations + skeletons | Jun 13 | Repos, CI, MySQL/Redis, shared libs, Kong up; portal scaffold + mocks |
-| M2 — AFT + DM in sandbox | Jun 27 | Card pulled in Visa sandbox; Decision Manager screening; config limits enforced |
-| M3 — 3DS + orchestration | Jul 9 | Payer-auth 3DS round-trip; cardload synchronously drives the flow |
-| M4 — Rails integrated | Jul 13 | Recon parser + **set-based 3-way matching** built (sample files); breaks surfaced |
-| **M5 — Rails functional** | **Jul 15** | E2E happy path + reconciliation (sample file) demonstrated in sandbox |
-| M6 — Admin + portal live | Jul 30 | `tc-admin-service` complete; portal integrated against the real backend |
+| **SDKs tested** | **Jun 19** | Cybersource + Visa Direct client SDKs pass isolated tests; latency baselines captured |
+| **★ Visa Direct cert-ready** | **Jun 19** | Visa Direct SDK (AFT + reversal + exactly-once) working against the cert environment |
+| Certification started | Jun 22 | Visa Direct cert test cases running |
+| Orchestration E2E | Jun 26 | Top-up flow runs end-to-end in sandbox on the tested SDKs |
 
 ## Assumptions & risks
 
-1. **"No hardening" is load-bearing.** Phase 1 fits only as *functional happy path* — minimal
-   error handling, config-driven limits, no custom gateway plugins, no security/perf pass.
-2. **External sandboxes on day 1 are the critical path.** Visa Developer (VDP) + test BIN and
-   Cybersource sandbox credentials must be live from Jun 9; the AFT/3DS work and the Jul 15
-   demo depend on them.
-3. **Reconciliation is the long pole.** It can only be fully tested once cardload exposes the
-   auth/prefunding read API (~Jul 9+); if upstream slips, recon is the
-   first item to slide past Jul 15.
-4. **One service, two devs.** `tc-cardload-service` is built by BE-A (Visa module) and BE-B
-   (orchestration module) together — agree the internal module boundary early.
-5. **Limits via config until Phase 2.** Authorization limits are seeded/config-managed until
-   the admin CRUD UI ships Jul 16–30.
+1. **Visa-side provisioning is the critical path.** VDP **cert-environment** access, **MLE keys**,
+   and a registered **AFT-program BIN** must be live **now** — they, not the code, decide whether
+   certification can start next week.
+2. **Cybersource sandbox creds needed now too** — BE-B starts the Cybersource SDK this week.
+3. **SDK-first is deliberate.** Each provider client is tested in isolation before any flow logic;
+   certification and orchestration then sit on clients we already trust.
+4. **Certification is one dev (BE-A) — thin buffer.** A smooth **VDP connectivity** bring-up is
+   what makes or breaks the cert date.
+5. **"Basic testing" only.** The full Testing-requirements suite (concurrency, soak, failover)
+   comes after Phase 0.
+
+## Task breakdown (for the project board)
+
+Board-ready cards — **ID, task, description, start, due, owner**. Dates are **2026** in ISO
+(`YYYY-MM-DD`); owners are **BE-A / BE-B** (backend). Tip: paste the table into a spreadsheet or
+your board's CSV import — columns line up to ID / Title / Description / Start / Due / Assignee.
+
+| ID | Task | Description | Start | Due | Owner |
+| --- | --- | --- | --- | --- | --- |
+| P0-1 | Provisioning blocker check | Confirm Visa **VDP cert-environment** access, **MLE keys**, a registered **AFT-program BIN**, and **Cybersource sandbox keys** are live. Day-1 go/no-go. | 2026-06-12 | 2026-06-12 | BE-A + BE-B |
+| P0-2 | Service scaffold + persist-first | Stand up the `tc-cardload-service` skeleton and the `topup`/`visa_call` tables; commit status **before** each external call so transactions are traceable. | 2026-06-12 | 2026-06-13 | BE-A + BE-B |
+| P0-3 | Visa Direct SDK — connectivity | mTLS (Two-Way SSL) + `x-pay-token` + **MLE** handshake working against the Visa **cert environment**. The make-or-break long pole. | 2026-06-13 | 2026-06-16 | BE-A |
+| P0-4 | Visa Direct SDK — AFT + reversal + exactly-once | `pullfundstransactions` + `reversefundstransactions`; unique **STAN** from the idempotency key; on timeout **GET-status** then reverse — never blind-resend. | 2026-06-16 | 2026-06-18 | BE-A |
+| P0-5 | Visa Direct SDK — FTAI + FX | Funds Transfer Attributes Inquiry (`/paai/fundstransfer/v5/attributesinquiry`) + Foreign Exchange Rates (`/forexrates/v2`) clients. | 2026-06-18 | 2026-06-19 | BE-A |
+| P0-6 | Visa Direct SDK — tests | Isolated client tests: happy path, declines, timeout→GET-status; capture **latency baselines** (p50/p95/p99). | 2026-06-17 | 2026-06-19 | BE-A |
+| P0-7 | Cybersource SDK — tokenization | Flex transient token → **TMS** instrument id + **network token (VTS)** provisioning; never store the PAN. | 2026-06-13 | 2026-06-15 | BE-B |
+| P0-8 | Cybersource SDK — Decision Manager | `POST /risk/v1/decisions` (ACCEPT/REJECT/REVIEW) + on/off toggle; record the decision. | 2026-06-15 | 2026-06-17 | BE-B |
+| P0-9 | Cybersource SDK — Payer Authentication | 3DS 2.x setup/enroll/validate; step-up redirect + `/3ds-complete` round-trip; produce `cavv`/`eci`. | 2026-06-17 | 2026-06-19 | BE-B |
+| P0-10 | Cybersource SDK — tests | Isolated client tests: happy path, errors, timeouts; capture **latency baselines**. | 2026-06-18 | 2026-06-19 | BE-B |
+| P0-11 | Visa Direct certification | Run Visa's cert test cases (AFT / reversal / FTAI) against the tested SDK; fix; capture evidence. | 2026-06-22 | 2026-06-26 | BE-A |
+| P0-12 | Synchronous orchestration | Stitch the flow on the tested SDKs: FTAI → DM → 3DS → limits → fees → FX → AFT → prefund → record; idempotency + state machine. | 2026-06-22 | 2026-06-26 | BE-B |
+| P0-13 | E2E happy path | Demonstrate top-up → FTAI → DM → 3DS → AFT (sandbox) → prefund → record end-to-end on the orchestrated SDKs. | 2026-06-26 | 2026-06-26 | BE-A + BE-B |
