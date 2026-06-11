@@ -1,6 +1,7 @@
 {
   "pages": [
     "index",
+    "code-style-guide",
     "specifications",
     "timeline"
   ],

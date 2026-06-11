@@ -1,0 +1,342 @@
+---
+title: Code Style Guide
+description: Engineering conventions for the Java 25 / Spring Boot backend services — structure, Spring standards, DTOs, logging, JPA, exceptions, and JDK 25 idioms.
+---
+
+This guide governs the **Java 25 / Spring Boot 4 backend services** (`tc-cardload-service`,
+`tc-card-network-service`, `tc-ledger-service`, `tc-settlement-reconciliation-service`,
+`tc-admin-service`). The Kong gateway (Lua) and the Flutter portal follow their own
+conventions in their respective specs.
+
+## 1. General principles
+
+- Code is read far more than it is written — **prefer clarity over cleverness**.
+- Keep methods small and focused; **one responsibility per class and per method**.
+- Follow **SOLID**.
+- **Favor immutability** wherever possible (records, `final`, unmodifiable collections).
+
+## 2. Project structure
+
+Organize **by responsibility**, not by generic buckets. No `misc`, `helpers`, or `temp`.
+
+```
+com.tc.<service>
+├── config        // @ConfigurationProperties, bean wiring
+├── controller    // thin REST controllers
+├── service       // business logic (rich)
+├── repository    // Spring Data JPA
+├── entity        // JPA @Entity (persistence model)
+├── dto           // records: request / response
+│   ├── request
+│   └── response
+├── mapper        // entity <-> dto
+├── client        // RestClient integrations (Cybersource, Visa)
+├── exception     // custom hierarchy + @RestControllerAdvice
+└── constant      // ApplicationConstant, enums
+```
+
+- **Idempotency is mandatory** for payment APIs — every mutating endpoint honours an
+  `Idempotency-Key` (deduped at the service/DB layer; see the service specs).
+- **No hardcoded config or credentials.** Environment-specific values and all secrets come
+  from configuration / a secrets manager (KMS/Vault), never from source.
+- Maintain a single `ApplicationConstant` class for shared constants.
+
+```java
+public final class ApplicationConstant {
+
+    private ApplicationConstant() {
+        // utility class — no instances
+    }
+
+    public static final String CORRELATION_ID_HEADER = "X-Correlation-Id";
+    public static final String IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
+    public static final String CURRENCY_USD = "USD";
+}
+```
+
+## 3. Spring Boot standards
+
+- Use **`@ConfigurationProperties`** (typed, validated) instead of scattered `@Value`.
+- **Thin controllers, rich services.**
+- **Centralized exception handling** with `@RestControllerAdvice`.
+- Use **`RestClient`**, not the legacy `RestTemplate`.
+- **Constructor injection** via `@RequiredArgsConstructor` — never field injection.
+
+```java
+@ConfigurationProperties(prefix = "cybersource")
+@Validated
+public record CybersourceProperties(
+        @NotBlank String merchantId,
+        @NotBlank String apiHost,
+        @NotNull Duration timeout,
+        @NotBlank String sharedSecretRef) {   // a vault reference, not the secret itself
+}
+```
+
+```java
+@Component
+@RequiredArgsConstructor
+public class CybersourceClient {
+
+    private final RestClient cybersourceRestClient;   // base URL/timeout from CybersourceProperties
+
+    public DecisionResult screen(DecisionRequest request) {
+        return cybersourceRestClient.post()
+                .uri("/risk/v1/decisions")
+                .body(request)
+                .retrieve()
+                .body(DecisionResult.class);
+    }
+}
+```
+
+## 4. Controller standards
+
+Controllers contain **no business logic**, stay thin, and return a **standardized response
+model**.
+
+```java
+@RestController
+@RequestMapping("/v1/topups")
+@RequiredArgsConstructor
+public class TopUpController {
+
+    private final TopUpService topUpService;
+
+    @PostMapping
+    public ResponseEntity<ApiResponse<TopUpResponse>> create(
+            @Valid @RequestBody TopUpRequest request,
+            @RequestHeader(ApplicationConstant.IDEMPOTENCY_KEY_HEADER) String idempotencyKey) {
+
+        TopUpResponse response = topUpService.createTopUp(request, idempotencyKey);
+        return ResponseEntity.accepted().body(ApiResponse.success(response));
+    }
+}
+```
+
+## 5. Service layer
+
+- Business logic lives **only** in services.
+- Methods should generally stay **under 40 lines** — extract private methods when they grow.
+- Prefer **domain-driven naming**.
+
+```java
+@Service
+@RequiredArgsConstructor
+public class CardLoadService implements TopUpService {
+
+    private final TopUpRepository topUpRepository;
+    private final FraudScreeningComponent fraudScreening;
+    private final TopUpMapper topUpMapper;
+
+    @Transactional
+    public TopUpResponse createTopUp(TopUpRequest request, String idempotencyKey) {
+        return topUpRepository.findByIdempotencyKey(idempotencyKey)
+                .map(topUpMapper::toResponse)
+                .orElseGet(() -> startNewTopUp(request, idempotencyKey));
+    }
+
+    private TopUpResponse startNewTopUp(TopUpRequest request, String idempotencyKey) {
+        TopUp topUp = topUpMapper.toEntity(request, idempotencyKey);
+        topUpRepository.save(topUp);
+        return topUpMapper.toResponse(topUp);
+    }
+}
+```
+
+## 6. Naming conventions
+
+| Element | Convention | Example |
+| --- | --- | --- |
+| Classes | nouns | `CardLoadService`, `VisaPayloadMapper` |
+| Methods | verbs | `createTransaction`, `validateRequest` |
+| Variables | descriptive, self-explanatory | `authorizedAmount`, not `amt` |
+| Constants | `UPPER_SNAKE_CASE` | `MAX_TOPUP_AMOUNT_USD` |
+| Packages | lowercase | `com.tc.cardload.service` |
+
+## 7. Formatting
+
+- **4-space** indentation.
+- Maximum line length **120** characters.
+- **Always use braces** for control structures, even single statements.
+
+```java
+if (amount.compareTo(maxPerTransaction) > 0) {
+    throw new AmountLimitExceededException("amount exceeds per-transaction cap");
+}
+```
+
+## 8. Lombok usage
+
+- Prefer **`@Getter`, `@Setter`, `@Builder`**, and `@RequiredArgsConstructor`.
+- **Never `@Data` on JPA entities** (it generates `equals`/`hashCode`/`toString` that break
+  lazy loading and can leak data).
+
+## 9. DTO design
+
+- Request/response DTOs are **immutable** — use **Java records**.
+- Use a **builder** for complex domain objects.
+- **Never expose entities directly** from APIs — always map to DTOs.
+
+```java
+public record TopUpRequest(
+        @NotNull @Positive BigDecimal amount,
+        @NotBlank String currency,
+        @NotBlank String cardToken,          // Cybersource Flex token, never a PAN
+        String customerRef) {
+}
+
+public record TopUpResponse(String transactionRef, TopUpStatus status) { }
+
+public record ApiResponse<T>(boolean success, T data, ApiError error) {
+
+    public static <T> ApiResponse<T> success(T data) {
+        return new ApiResponse<>(true, data, null);
+    }
+
+    public static <T> ApiResponse<T> failure(ApiError error) {
+        return new ApiResponse<>(false, null, error);
+    }
+}
+```
+
+## 10. Logging
+
+- Structured **SLF4J** logging only.
+- **Correlation ID is mandatory** on every log line (put it in the MDC via a request filter,
+  include it in the log pattern).
+- **Never log** PAN, CVV, PIN, expiry date, secrets, tokens, JWTs, or API secrets.
+
+```java
+// GOOD — correlation id from MDC, only masked/safe fields
+log.info("Top-up created transactionRef={} amount={} last4={}",
+        transactionRef, amount, maskedLast4);
+
+// FORBIDDEN
+// log.info("card={} cvv={} token={}", pan, cvv, flexToken);
+```
+
+## 11. JPA / database standards
+
+- **`LAZY`** loading by default; declare **explicit fetch strategies**.
+- **`snake_case`** table and column names.
+- Never `@Data` on entities.
+
+```java
+@Entity
+@Table(name = "topup")
+@Getter
+@Setter
+@NoArgsConstructor
+public class TopUp {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(name = "transaction_ref", nullable = false, unique = true)
+    private String transactionRef;
+
+    @Column(name = "correlation_id", nullable = false)
+    private String correlationId;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "status", nullable = false)
+    private TopUpStatus status;
+
+    @OneToMany(mappedBy = "topUp", fetch = FetchType.LAZY)
+    private List<FraudScreening> fraudScreenings = new ArrayList<>();
+}
+```
+
+## 12. Exception handling
+
+- Centralized via **`@RestControllerAdvice`**.
+- A **custom exception hierarchy** with meaningful **error codes** and messages.
+- **Avoid generic `RuntimeException`.**
+
+```java
+public abstract class TcException extends RuntimeException {
+
+    private final ErrorCode errorCode;
+
+    protected TcException(ErrorCode errorCode, String message) {
+        super(message);
+        this.errorCode = errorCode;
+    }
+
+    public ErrorCode errorCode() {
+        return errorCode;
+    }
+}
+
+public class AmountLimitExceededException extends TcException {
+    public AmountLimitExceededException(String message) {
+        super(ErrorCode.AMOUNT_OVER_LIMIT, message);
+    }
+}
+```
+
+```java
+@RestControllerAdvice
+@RequiredArgsConstructor
+public class GlobalExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    @ExceptionHandler(TcException.class)
+    public ResponseEntity<ApiResponse<Void>> handle(TcException ex) {
+        log.warn("Business error code={} message={}", ex.errorCode(), ex.getMessage());
+        return ResponseEntity.status(ex.errorCode().httpStatus())
+                .body(ApiResponse.failure(ApiError.of(ex.errorCode(), ex.getMessage())));
+    }
+}
+```
+
+## 13. Constants & enums
+
+- No **magic strings or numbers** — promote them to `ApplicationConstant` or an enum.
+- Use **enums** for statuses and business types.
+
+```java
+public enum TopUpStatus {
+    CREATED, FRAUD_SCREENING, AWAITING_CHALLENGE, AFT_APPROVED, COMPLETED,
+    REJECTED_FRAUD, REJECTED_3DS, FAILED_AFT
+}
+```
+
+## 14. Quality tools
+
+All wired into Maven and **enforced in CI** (the build fails on violations):
+
+| Tool | Purpose |
+| --- | --- |
+| **Spotless** | automatic code formatting |
+| **Checkstyle** | coding-standard enforcement |
+| **PMD** | static code-quality analysis |
+| **SpotBugs** | bug detection from bytecode |
+
+## 15. Modern JDK 25 features
+
+- **Records** for immutable DTOs and config properties.
+- **Switch expressions** and **pattern matching** for clear branching.
+- **`var`** for local variable type inference where it aids readability.
+- **Builders** for complex domain objects.
+
+```java
+// Switch expression + enum
+String outcome = switch (decision) {
+    case ACCEPT -> "passed";
+    case REJECT -> "fraud rejected";
+    case REVIEW -> "manual review";
+    case ERROR  -> throw new FraudScreeningException("decision manager error");
+};
+
+// Pattern matching for instanceof
+if (event instanceof AftCompleted completed) {
+    ledgerService.bookReceivable(completed.payload());
+}
+
+// var where the type is obvious
+var transactionRef = "topup-" + UUID.randomUUID();
+```
