@@ -1,0 +1,309 @@
+---
+title: Deployment (Docker)
+description: Containerized deployment for the platform — one Dockerfile per service plus a single Docker Compose file that stands up the whole stack (gateway, cardload, settlement, admin, portal, MySQL, Redis) in one command. For local/staging; production notes at the end.
+permission: member
+---
+
+Every service ships as its **own image with its own `Dockerfile`**, and a single
+**Docker Compose** file wires them together with the infrastructure (MySQL, Redis) so the
+**whole platform comes up in one command**. This is the local/staging runner; production runs
+the same images on an orchestrator (see [Production](#production-notes)).
+
+## What runs
+
+| Container | Image source | Port (host) | Notes |
+| --- | --- | --- | --- |
+| `mysql` | `mysql:8.4` | 3306 | one instance, three schemas (`cardload`, `settlement`, `admin`) |
+| `redis` | `redis:8-alpine` | 6379 | gateway/cardload counters, nonce + idempotency |
+| `tc-cardload-service` | `./tc-cardload-service/Dockerfile` | 8081 | Spring Boot; Flyway migrates on boot |
+| `tc-settlement-service` | `./tc-settlement-service/Dockerfile` | 8082 | Spring Boot; Flyway on boot |
+| `tc-admin-service` | `./tc-admin-service/Dockerfile` | 8083 | Spring Boot; Flyway on boot |
+| `tc-api-gateway` | `./tc-api-gateway/Dockerfile` | 8443 | Spring Cloud Gateway (dev: all surfaces on one node) |
+| `tc-admin-portal` | `./tc-admin-portal/Dockerfile` | 8080 | Flutter web built → served by nginx |
+
+> **Dev simplification.** In production the gateway runs as **three isolated instances**
+> (public / partner / admin) per its [spec](/docs/specifications/tc-api-gateway#listener--network-topology);
+> for local "run everything" we run **one** instance with all routes on plain HTTP. MySQL runs as
+> a single node here; production uses the **primary + standby** topology. External providers
+> (Cybersource, Visa) are reached at their **sandboxes** via env — not containerized (add a mock
+> container if you want offline runs).
+
+## Per-service Dockerfiles
+
+### Java services (one per service)
+
+All four Spring Boot services (`tc-cardload-service`, `tc-settlement-service`,
+`tc-admin-service`, `tc-api-gateway`) use the **same multi-stage template** — copy it into each
+repo. Build with Maven on JDK 25, run on a slim JRE as a non-root user. Virtual threads are
+enabled via `application.yml` (`spring.threads.virtual.enabled=true`), not the image.
+
+```dockerfile
+# tc-<service>/Dockerfile
+# syntax=docker/dockerfile:1
+
+# ---- build ----
+FROM maven:3.9-eclipse-temurin-25 AS build
+WORKDIR /app
+COPY pom.xml .
+RUN mvn -B -q dependency:go-offline          # cache deps as a layer
+COPY src ./src
+RUN mvn -B -q -DskipTests package
+
+# ---- run ----
+FROM eclipse-temurin:25-jre AS run
+RUN useradd -r -u 10001 app \
+ && apt-get update && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*              # curl for the healthcheck
+WORKDIR /app
+COPY --from=build /app/target/*.jar app.jar
+USER app
+EXPOSE 8080
+ENTRYPOINT ["java","-XX:MaxRAMPercentage=75","-jar","/app/app.jar"]
+```
+
+> Optimizations (optional): use Spring Boot **layered jars** for better caching, or skip the
+> Dockerfile entirely with **`mvn spring-boot:build-image`** (Cloud Native Buildpacks). The
+> Dockerfile above is the explicit, per-service form the team asked for.
+
+### Flutter portal
+
+`tc-admin-portal` builds the web bundle, then serves the static assets with nginx.
+
+```dockerfile
+# tc-admin-portal/Dockerfile
+# syntax=docker/dockerfile:1
+
+# ---- build ----
+FROM ghcr.io/cirruslabs/flutter:3.44.0 AS build
+WORKDIR /app
+COPY pubspec.yaml pubspec.lock ./
+RUN flutter pub get
+COPY . .
+RUN flutter build web --release
+
+# ---- run ----
+FROM nginx:1.27-alpine AS run
+COPY --from=build /app/build/web /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+```
+
+```nginx
+# tc-admin-portal/nginx.conf — SPA routing (client-side router)
+server {
+  listen 80;
+  root /usr/share/nginx/html;
+  location / { try_files $uri $uri/ /index.html; }
+}
+```
+
+## Orchestration — `docker-compose.yml`
+
+The single file that runs everything. Services start in dependency order via healthchecks; each
+Java service runs its **Flyway** migrations on boot, so no separate migration step.
+
+```yaml
+name: tc-platform
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./infra/mysql-init:/docker-entrypoint-initdb.d:ro   # creates the 3 schemas + user
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [tc]
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]   # ephemeral counters
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [tc]
+
+  tc-cardload-service:
+    build: ./tc-cardload-service
+    env_file: .env
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/cardload?useSSL=false
+      SPRING_DATASOURCE_USERNAME: ${DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      SPRING_DATA_REDIS_HOST: redis
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["8081:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [tc]
+
+  tc-settlement-service:
+    build: ./tc-settlement-service
+    env_file: .env
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/settlement?useSSL=false
+      SPRING_DATASOURCE_USERNAME: ${DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+    depends_on:
+      mysql: { condition: service_healthy }
+    ports: ["8082:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [tc]
+
+  tc-admin-service:
+    build: ./tc-admin-service
+    env_file: .env
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/admin?useSSL=false
+      SPRING_DATASOURCE_USERNAME: ${DB_USER}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      SPRING_DATA_REDIS_HOST: redis
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports: ["8083:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    networks: [tc]
+
+  tc-api-gateway:
+    build: ./tc-api-gateway
+    env_file: .env
+    environment:
+      SPRING_PROFILES_ACTIVE: docker,dev   # dev: all surfaces on one node, plain HTTP
+      SERVER_PORT: 8443
+      SPRING_DATA_REDIS_HOST: redis
+      CARDLOAD_URL: http://tc-cardload-service:8080
+      ADMIN_URL: http://tc-admin-service:8080
+    depends_on:
+      tc-cardload-service: { condition: service_healthy }
+      tc-admin-service: { condition: service_healthy }
+    ports: ["8443:8443"]
+    networks: [tc]
+
+  tc-admin-portal:
+    build: ./tc-admin-portal
+    depends_on: [tc-api-gateway]
+    ports: ["8080:80"]
+    networks: [tc]
+
+volumes:
+  mysql-data:
+
+networks:
+  tc:
+```
+
+## Config & secrets
+
+**`.env`** (copy from `.env.example`; never commit real secrets):
+
+```bash
+# infra
+MYSQL_ROOT_PASSWORD=rootpw
+DB_USER=tc
+DB_PASSWORD=tcpw
+
+# app
+PAN_HASH_SALT=dev-salt-change-me          # settlement PAN hashing
+
+# external sandboxes (fill in)
+CYBERSOURCE_MERCHANT_ID=
+CYBERSOURCE_API_KEY_REF=
+VISA_VDP_USER_ID=
+VISA_VDP_CERT_REF=
+```
+
+**`infra/mysql-init/01-databases.sql`** (runs once on first MySQL start):
+
+```sql
+CREATE DATABASE IF NOT EXISTS cardload   CHARACTER SET utf8mb4;
+CREATE DATABASE IF NOT EXISTS settlement CHARACTER SET utf8mb4;
+CREATE DATABASE IF NOT EXISTS admin      CHARACTER SET utf8mb4;
+CREATE USER IF NOT EXISTS 'tc'@'%' IDENTIFIED BY 'tcpw';
+GRANT ALL PRIVILEGES ON cardload.*   TO 'tc'@'%';
+GRANT ALL PRIVILEGES ON settlement.* TO 'tc'@'%';
+GRANT ALL PRIVILEGES ON admin.*      TO 'tc'@'%';
+```
+
+- **Spring profile `docker`** in each service holds the container-friendly settings (DB host =
+  `mysql`, Redis host = `redis`, actuator health exposed).
+- **TLS/mTLS** is off in the `dev` gateway profile for convenience; in staging/prod the gateway
+  enables `server.ssl` and mounts the keystore/truststore as a volume (or terminates mTLS at the
+  load balancer).
+- Real secrets come from a **secrets manager** in prod, not `.env`.
+
+## Bring it all up
+
+```bash
+cp .env.example .env            # then fill in the sandbox creds
+docker compose build            # build all images
+docker compose up -d            # start the whole stack
+docker compose ps               # watch health turn "healthy"
+docker compose logs -f tc-cardload-service
+```
+
+Startup order is handled by `depends_on` + healthchecks: **MySQL & Redis first → the three
+Spring services (each Flyway-migrates its schema on boot) → the gateway → the portal.**
+
+## Verify
+
+```bash
+curl -fsS localhost:8081/actuator/health    # cardload
+curl -fsS localhost:8082/actuator/health    # settlement
+curl -fsS localhost:8083/actuator/health    # admin
+curl -fsS localhost:8443/actuator/health    # gateway
+open http://localhost:8080                  # admin portal
+```
+
+All `UP` ⇒ the platform is running. Drive an end-to-end top-up through the gateway
+(`POST localhost:8443/v1/topups`) against the configured sandboxes.
+
+## Day-to-day
+
+```bash
+docker compose up -d --build tc-cardload-service   # rebuild + restart one service
+docker compose logs -f tc-api-gateway              # tail one service
+docker compose restart tc-settlement-service       # restart one
+docker compose down                                # stop (keep DB volume)
+docker compose down -v                             # stop + wipe DB/Redis (fresh migrations)
+```
+
+## Production notes
+
+This Compose file is the **local/staging** runner. For production, run the **same images** on an
+orchestrator and change the topology, not the build:
+
+- **Orchestrator:** Kubernetes / ECS — health/readiness probes (`/actuator/health/{liveness,readiness}`),
+  resource limits, rolling deploys, ≥2 replicas per service.
+- **Gateway:** deploy **three isolated instances** (public / partner / admin) behind their own
+  load balancers, **TLS/mTLS on**, per the gateway spec.
+- **Databases:** **primary + standby** MySQL (managed / Multi-AZ, semi-sync) — *not* the single
+  Compose node; each service keeps its own database.
+- **Secrets:** a secrets manager / Vault (DB creds, `PAN_HASH_SALT`, provider creds, keystores),
+  injected as env/mounted files — never baked into images or `.env`.
+- **Images:** built in CI, tagged by commit, pushed to a registry; deploys reference immutable tags.
+- **Observability:** scrape `/actuator/prometheus`, ship logs to the SIEM, OpenTelemetry traces.
+- **Redis:** HA (Sentinel/Cluster) — it's critical-path for limits, nonce, and idempotency.

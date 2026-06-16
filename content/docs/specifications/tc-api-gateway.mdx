@@ -1,6 +1,6 @@
 ---
 title: tc-api-gateway
-description: Kong API Gateway specification for the Visa Direct top-up platform — partner authentication, replay-safe authorization limits, public surface minimization, fail-closed degradation, and admin forwarding.
+description: API gateway spec for the Visa Direct top-up platform, built on Spring Cloud Gateway (your JDK 25 / Spring Boot stack) — partner JWS authentication, replay-safe authorization limits, a single public surface, fail-closed degradation, and admin forwarding. A thin proxy, not Kong.
 permission: member
 ---
 
@@ -13,8 +13,8 @@ services on the other. It is the trust boundary: nothing reaches `tc-cardload-se
 `tc-admin-service`, or any other internal service without first passing the gateway's
 controls.
 
-This document specifies how to build that gateway on **Kong Gateway 3.x** to satisfy
-four requirements:
+This document specifies how to build that gateway as a **thin Spring Cloud Gateway app on
+your existing JDK 25 / Spring Boot 4 stack** to satisfy four requirements:
 
 1. **Partner authenticity** — verify every inbound request from PVCB Top up service
    using asymmetric signatures (exchanged public keys), with replay and idempotency
@@ -36,17 +36,25 @@ A traceability map from the design review to the sections that satisfy each poin
 
 ## Technical stack & topology
 
-`tc-api-gateway` is **Kong** (Lua/declarative config) at the **synchronous HTTP edge** — it
-is the one component that is *not* a Spring Boot service. Everything behind it is a
-**JDK 25 / Spring Boot 4.0+ microservice**, and those services talk to each other over
-**synchronous REST** (there is no message broker). See
+The gateway is a **Spring Cloud Gateway** application — a thin Spring Boot service on the
+**same JDK 25 / Spring Boot 4.0+ stack** as everything else, behind it the `tc-*`
+microservices talking **synchronous REST** (no broker). See
 [Architecture & service interaction](/docs/specifications/architecture).
 
-One consequence for this spec:
+> **Why Spring Cloud Gateway, not Kong.** The hard parts here — verifying PVCB's JWS and
+> enforcing authorization limits — are **your business logic**; on Kong you'd write them as
+> custom Lua plugins anyway. Spring Cloud Gateway gives you **routing + a filter pipeline as
+> an ordinary Spring Boot app**: no separate product to operate, no Lua, no decK, and the
+> custom filters are plain Java sharing the platform's libraries, config, and observability.
 
-- **Limits propagation.** When `tc-admin-service` updates the authorization limits, a small
-  **decK relay** applies the new edge limits to Kong, and the Spring Boot services receive
-  the new config via a synchronous push/pull.
+- **Variant:** use **Spring Cloud Gateway Server MVC** (servlet) with
+  `spring.threads.virtual.enabled=true`, so the gateway uses the same blocking + virtual-thread
+  model as `tc-cardload-service`. The **reactive** variant (WebFlux/Netty) is the alternative —
+  more built-in filters (e.g. the Redis `RequestRateLimiter`), at the cost of the reactive
+  paradigm in custom filters. Either is fine; the gateway holds no business logic to speak of.
+- **Limits propagation.** When `tc-admin-service` updates the authorization limits, the gateway
+  picks them up from a shared config source (a short-TTL read of the admin config API, or a
+  Redis-published config) — no separate config tool.
 
 ## Where the gateway sits in the flow
 
@@ -67,13 +75,13 @@ The gateway has exactly four interaction points in the sequence diagram. Everyth
    tourist  ──3DS callback──┐                  PVCB Top up service ──┐                   ┌─ tc-cardload-service
    (browser/app)            │                  (after AML check)     │                   │
                             ▼                                        ▼                   │
-                    ┌───────────────────────── tc-api-gateway (Kong) ───────────────────┤
-                    │  public listener :8443   partner listener :9443  admin listener   │
-                    │  (1 route only)          (mTLS + JWS + limits)   :10443 (internal) ├─ tc-admin-service
+                    ┌──────────────────── tc-api-gateway (Spring Cloud Gateway) ─────────┤
+                    │  public :8443            partner :9443          admin :10443        │
+                    │  (1 route only)          (mTLS + JWS + limits)  (internal)          ├─ tc-admin-service
                     └───────────────────────────────────────────────────────────────────┘
                                                                                        (forward only)
 
-   No outbound webhook — PVCB polls GET /top-up-status (inbound, partner listener) for results.
+   No outbound webhook — PVCB polls GET /top-up-status (inbound, partner surface) for results.
 ```
 
 > The gateway is **stateless for business logic**. It authenticates, screens against
@@ -114,24 +122,26 @@ Normative principles:
 | Network MITM | intercept / alter in transit | mTLS (channel) + JWS (message integrity) |
 | Replay attacker | resend a captured signed request | timestamp skew window + nonce store + idempotency key |
 | Abusive client on the public endpoint | spam / enumerate the callback | one-time signed token + rate-limit + bot detection |
-| Lateral movement to admin | reach the admin surface internally | dedicated internal listener + IP allowlist + mTLS/OIDC + audit log |
+| Lateral movement to admin | reach the admin surface internally | dedicated internal surface + IP allowlist + mTLS/OIDC + audit log |
 
 ## Listener / network topology
 
 Run three logically separate entry surfaces so "public" cannot accidentally include a
-partner or admin route. In Kong these are distinct `proxy_listen` ports bound to
-different network interfaces/security groups.
+partner or admin route. The strongest isolation is to **run one gateway instance per
+surface** — a `public`, a `partner`, and an `admin` deployment of the same app, each
+activated by a Spring **profile** that registers **only that surface's routes**. (A single
+instance with three connectors is possible, but HTTP routes don't match on port, so the
+port split alone is not a security boundary — back it with network ACLs.)
 
-| Listener | Bind | Reachable from | Routes allowed |
+| Surface | Bind | Reachable from | Routes registered |
 | --- | --- | --- | --- |
 | Public | `0.0.0.0:8443` (behind WAF/CDN) | Internet | `3ds-callback-public` only |
 | Partner | private interface `:9443` | PVCB over VPN / VPC peering / private link | partner routes (`/v1/topups…`) |
 | Admin | private interface `:10443` | internal admin network only | `admin-proxy` only |
 
-- The Kong **Admin API** (`:8001`/`:8444`) must never be internet-exposed. Bind to
-  loopback or a management subnet, protect with mTLS + RBAC, and manage config through
-  CI/CD (decK), not ad-hoc calls.
-- Put a WAF / DDoS layer (Cloudflare, AWS WAF, etc.) in front of the **public** listener.
+- The Spring Boot **management/actuator port** must never be internet-exposed. Bind it to a
+  management interface, protect it, and keep `/actuator` off the public surface.
+- Put a WAF / DDoS layer (Cloudflare, AWS WAF, etc.) in front of the **public** surface.
 - Terminate TLS 1.2+ (prefer 1.3). Because payloads are independently signed (JWS),
   message integrity survives TLS termination at an upstream load balancer.
 
@@ -161,9 +171,9 @@ lifecycle, not a one-time setup.
 | --- | --- |
 | Generate | Each party generates its keypair **inside an HSM/KMS**; the private key **MUST NOT** leave it. Algorithm **ES256** (EC P-256) preferred; **RS256/PS256** (RSA-3072) fallback. No symmetric `HS*`. |
 | Exchange | Public keys are exchanged **out-of-band** over a secure channel; the recipient verifies the **fingerprint via a second channel** before trusting; record both keys (with `kid`) in a key registry. |
-| Store | PVCB's **public** key is stored as a Kong consumer JWT credential (tagged with its `kid`). tc's **private** key (used for **callback-token signing**) lives in KMS/Vault and is referenced via Kong's vault backend — **never** inlined in declarative config. |
+| Store | PVCB's **public** key is loaded into the gateway's **key registry, keyed by `kid`** (from config / a JWKS endpoint / Vault); the gateway selects it by the `kid` in the JWS header and verifies with **Nimbus JOSE+JWT**. tc's **private** key (used for **callback-token signing**) lives in **KMS/Vault** (e.g. Spring Cloud Vault) — **never** inlined in config. |
 | Rotate | Every JWS/JWT carries a `kid`. Publish the **new** key and accept both **before** retiring the old one (overlapping validity → zero-downtime). Rotate every **6–12 months**. |
-| Revoke | On suspected compromise, remove the `kid` from the accepted set immediately (config push), notify the partner out-of-band, and rotate. |
+| Revoke | On suspected compromise, remove the `kid` from the accepted set immediately (config push/refresh), notify the partner out-of-band, and rotate. |
 
 ### Signature envelope (what PVCB must send)
 
@@ -188,9 +198,8 @@ money movement — two distinct, both-required mechanisms close this:
 - **Nonce + timestamp (stops *malicious* replay).** The gateway **MUST** reject a request
   whose `X-Request-Timestamp` is outside ±60s (configurable) with `401 STALE_REQUEST`,
   and **MUST** reject a reused `X-Request-Nonce` with `409 REPLAY_DETECTED`. Nonces are
-  held in Redis with a TTL of **2× the skew window** (enough to cover the acceptance
-  window). Because both values are inside the signed string, an attacker cannot edit them
-  to dodge the check.
+  held in Redis with a TTL of **2× the skew window**. Because both values are inside the
+  signed string, an attacker cannot edit them to dodge the check.
 - **Idempotency key (enables *safe* retry).** `POST /v1/topups` **MUST** carry an
   `Idempotency-Key`. The gateway caches `key → response` for **24h** and returns the
   cached response on a retry **without re-forwarding**; `tc-cardload-service` **MUST** also
@@ -201,19 +210,55 @@ money movement — two distinct, both-required mechanisms close this:
 > the **idempotency key** says "if you retry the *same logical operation*, you get the
 > *same result*, not a second charge." Money movement needs both.
 
-### Implementing verification in Kong
+### Implementing verification (Java / Nimbus JOSE)
 
-Two viable paths — pick based on your edition:
+Verification is one **custom filter** on the partner routes — a `HandlerFilterFunction`
+(Server MVC) that runs **before** the proxy hands off to `tc-cardload-service`. It uses
+**Nimbus JOSE+JWT** for the signature and **Spring Data Redis** for nonce/idempotency. mTLS
+is configured on the server (or terminated at the LB), independent of this filter.
 
-| Approach | Plugin | Edition | Notes |
-| --- | --- | --- | --- |
-| **JWT wrapper** | `jwt` (RS256/ES256, public key as credential) | OSS | Simplest. PVCB sends a signed JWT whose claims include `bodyHash`, `iat`, `jti`. Kong verifies signature + `exp`; a `pre-function` checks `bodyHash == SHA256(body)`. |
-| **Detached JWS over body** (recommended) | custom Lua plugin `tc-jws-verify` (or Enterprise `jwt-signer`) | OSS (custom) / EE | Verifies `X-JWS-Signature` against the consumer's public key, recomputes body hash, enforces timestamp/nonce. Most robust message integrity. |
-| **Channel auth** | `mtls-auth` | Enterprise | Mutual TLS client-cert auth, layered under either of the above. |
+```java
+// JwsVerifyFilter — illustrative; not production code.
+@Component
+class JwsVerifyFilter implements HandlerFilterFunction<ServerResponse, ServerResponse> {
 
-mTLS in OSS can be done at the TLS layer (Kong `proxy_listen … ssl client_certificate`)
-with a `pre-function` asserting the verified client DN; `mtls-auth` (Enterprise) makes it
-first-class with consumer mapping.
+    private final PublicKeyRegistry keys;          // kid -> PVCB public key (config / JWKS / Vault)
+    private final StringRedisTemplate redis;
+    private final Duration skew = Duration.ofSeconds(60);
+
+    @Override
+    public ServerResponse filter(ServerRequest req, HandlerFunction<ServerResponse> next) throws Exception {
+        String sig   = header(req, "X-JWS-Signature");
+        String ts    = header(req, "X-Request-Timestamp");
+        String nonce = header(req, "X-Request-Nonce");
+        byte[] body  = req.servletRequest().getInputStream().readAllBytes();   // cached/buffered body
+
+        // 1. freshness
+        if (sig == null || ts == null || Duration.between(Instant.parse(ts), Instant.now()).abs().compareTo(skew) > 0)
+            return error(401, "STALE_REQUEST");
+
+        // 2. one-time nonce (atomic SET NX with TTL) — fail closed if Redis is down
+        Boolean fresh;
+        try { fresh = redis.opsForValue().setIfAbsent("nonce:" + nonce, "1", skew.multipliedBy(2)); }
+        catch (RuntimeException e) { return error(503, "LIMIT_BACKEND_DOWN"); }
+        if (!Boolean.TRUE.equals(fresh)) return error(409, "REPLAY_DETECTED");
+
+        // 3. detached-JWS verification over METHOD\nPATH\nSHA256(body)\nts\nnonce, key chosen by kid
+        String signingString = req.method().name() + "\n" + req.requestPath().value() + "\n"
+                + sha256Hex(body) + "\n" + ts + "\n" + nonce;
+        JWSObject jws = JWSObject.parse(sig, new Payload(signingString));      // detached payload
+        ECPublicKey pub = keys.byKid(jws.getHeader().getKeyID());             // throws/null -> reject
+        if (pub == null || !jws.verify(new ECDSAVerifier(pub))) return error(401, "BAD_SIGNATURE");
+
+        return next.handle(req);   // verified -> proxy to tc-cardload-service
+    }
+}
+```
+
+> **Detached JWS** keeps the body out of the signature blob (smaller header, body stays the
+> wire payload). Nimbus verifies it by reconstructing the payload (the signing string) and
+> checking the protected header + signature. Buffer the request body once (a
+> `ContentCachingRequestFilter` / wrapper) so both the verify filter and the proxy can read it.
 
 ## Requirement 2 — Authorization limits (the "$10M auth" guard)
 
@@ -234,49 +279,60 @@ caps to defeat *many* medium auths, plus a global circuit breaker.
 
 ### Implementation
 
-- **Velocity (count) caps:** `rate-limiting-advanced` (Enterprise, Redis-backed) or
-  `rate-limiting` (OSS) keyed by a custom identifier (card fingerprint / user id) rather
-  than IP.
-- **Amount caps (per-tx, currency, cumulative sums, global ceiling):** there is no
-  built-in amount plugin. Use a **custom Lua plugin `tc-auth-limit`** in the `access`
-  phase that parses the JSON body, reads `amount`/`currency`/card fingerprint, checks the
-  per-transaction and currency rules, then atomically increments and checks Redis counters
-  for the cumulative sums and global ceiling. Reject with a structured `403` and emit a
-  metric/alert on every breach. (An OPA policy via the `opa` plugin is a clean alternative
-  for the rule logic, still backed by Redis for counters.)
-- **Fail closed.** For money movement, if Redis/OPA is unavailable the limit cannot be
-  evaluated → **reject**, do not fail open.
+There is no built-in "amount limit" filter, so this is a second **custom filter**,
+`AuthLimitFilter`, on the partner money-movement routes. It parses the JSON body, checks
+the stateless rules (per-tx, currency, sanity), then atomically increments and checks Redis
+counters for velocity, cumulative sums, and the global ceiling. Velocity (count) caps can
+alternatively use the reactive gateway's built-in **Redis `RequestRateLimiter`**, or
+**Bucket4j-Redis** on Server MVC — but folding them into this one filter keeps all the
+money limits in one place.
 
-```lua
--- tc-auth-limit (handler.lua) — illustrative access-phase sketch, not production code
-function TcAuthLimit:access(conf)
-  local body = kong.request.get_body()           -- after request-size-limiting
-  local amount = tonumber(body and body.amount)
-  local currency = body and body.currency
+```java
+// AuthLimitFilter — illustrative; not production code.  Runs AFTER JwsVerifyFilter.
+@Component
+class AuthLimitFilter implements HandlerFilterFunction<ServerResponse, ServerResponse> {
 
-  if not amount or amount <= 0 then
-    return kong.response.exit(400, { code = "INVALID_AMOUNT" })
-  end
-  if currency ~= conf.allowed_currency then       -- e.g. "USD"
-    return kong.response.exit(403, { code = "CURRENCY_NOT_ALLOWED" })
-  end
-  if amount > conf.max_per_txn then               -- e.g. 5000 — defeats the single big auth
-    return kong.response.exit(403, { code = "AMOUNT_OVER_LIMIT" })
-  end
+    private final StringRedisTemplate redis;
+    private final LimitConfig cfg;                  // @ConfigurationProperties, refreshed from tc-admin-service
 
-  local card = body.cardFingerprint               -- never the raw PAN
-  local ok, daily = redis_incr_with_ttl("sum:card:"..card, amount, 86400)
-  if not ok then return kong.response.exit(503, { code = "LIMIT_BACKEND_DOWN" }) end -- fail closed
-  if daily > conf.max_card_daily then
-    return kong.response.exit(403, { code = "DAILY_CARD_LIMIT" })
-  end
+    @Override
+    public ServerResponse filter(ServerRequest req, HandlerFunction<ServerResponse> next) throws Exception {
+        TopUp body = req.body(TopUp.class);         // { amount, currency, cardFingerprint, ... }
 
-  local _, global = redis_incr_with_ttl("sum:global", amount, 86400)
-  if global > conf.global_daily_ceiling then
-    kong.log.alert("global ceiling tripped")      -- page on-call
-    return kong.response.exit(503, { code = "GLOBAL_CEILING_TRIPPED" })
-  end
-end
+        // --- stateless rules ---
+        if (body.amount() == null || body.amount().signum() <= 0 || body.amount().scale() > 2)
+            return error(400, "INVALID_AMOUNT");
+        if (!cfg.allowedCurrency().equals(body.currency()))
+            return error(403, "CURRENCY_NOT_ALLOWED");
+        if (body.amount().compareTo(cfg.maxPerTxn()) > 0)              // defeats the single big auth
+            return error(403, "AMOUNT_OVER_LIMIT");
+
+        // --- stateful counters (fail closed if Redis is unavailable) ---
+        try {
+            long cents = body.amount().movePointRight(2).longValueExact();
+            String card = body.cardFingerprint();                     // never the raw PAN
+
+            if (incrWithTtl("vel:card:" + card, 1, Duration.ofHours(1)) > cfg.maxCardPerHour())
+                return error(403, "VELOCITY_EXCEEDED");
+            if (incrWithTtl("sum:card:" + card, cents, Duration.ofDays(1)) > cfg.maxCardDailyCents())
+                return error(403, "DAILY_CARD_LIMIT");
+            long global = incrWithTtl("sum:global", cents, Duration.ofDays(1));
+            if (global > cfg.globalDailyCeilingCents()) {
+                log.error("global ceiling tripped");                   // page on-call
+                return error(503, "GLOBAL_CEILING_TRIPPED");
+            }
+        } catch (RuntimeException e) {
+            return error(503, "LIMIT_BACKEND_DOWN");                    // fail closed
+        }
+        return next.handle(req);
+    }
+
+    private long incrWithTtl(String key, long by, Duration ttl) {
+        Long v = redis.opsForValue().increment(key, by);
+        if (v != null && v == by) redis.expire(key, ttl);              // set TTL on first write
+        return v == null ? Long.MAX_VALUE : v;                          // null -> treat as over limit
+    }
+}
 ```
 
 ### Layered enforcement
@@ -294,7 +350,7 @@ edge-only limits evaporate. Enforce caps at every layer that can move money:
 ## Requirement 3 — Exactly one public endpoint
 
 Only the **client 3DS-completed callback** is reachable from the internet. Everything else
-lives on the partner or admin listener and requires mTLS + signature.
+lives on the partner or admin surface and requires mTLS + signature.
 
 ### The single public route: `POST /v1/public/3ds/callback`
 
@@ -304,267 +360,189 @@ signature. "Public" does **not** mean "unauthenticated":
 - When `tc-cardload-service` issues the 3DS redirect, it mints a **one-time, short-lived,
   tc-signed callback token** (a JWT signed with tc's private key, `exp` a few minutes,
   bound to the specific transaction id, single-use via `jti`).
-- The gateway verifies that token with **tc's public key** (`jwt` plugin), enforces
-  one-time use (Redis `jti` set), and only then forwards to `tc-cardload-service`.
+- The gateway verifies that token with **tc's public key** (a small token-verify filter,
+  Nimbus), enforces one-time use (Redis `jti` set), and only then forwards to
+  `tc-cardload-service`.
 - The callback is a **trigger, not a source of truth.** The authoritative 3DS result comes
   from `tc-cardload-service` re-querying Cybersource (as the diagram already shows). The
   gateway/services must never trust "3DS passed" because the client said so.
 
-Public route plugins: `jwt` (callback token) · `rate-limiting` (per-IP + per-token) ·
-`bot-detection` · `request-size-limiting` · `cors` (only the app origin) · `correlation-id`.
-**No** `mtls-auth`, **no** partner `acl`.
+Public route filters: callback-token verify (tc key + Redis `jti`) · rate-limit (per-IP +
+per-token) · bot detection (at the WAF) · request-size limit · CORS (only the app origin) ·
+correlation-id. **No** mTLS, **no** partner JWS.
 
-> Enforce the "one public route" rule structurally: bind the public listener to a route
-> matcher that only accepts `/v1/public/3ds/callback`, and add a default
-> `request-termination` (404) catch-all so no other path is ever served on `:8443`.
+> Enforce the "one public route" rule **structurally**: the **public instance** registers
+> *only* the `3ds-callback-public` route, and a default handler returns `404` for every
+> other path — so nothing else is ever served on `:8443`, regardless of config drift.
 
 ## Requirement 4 — Admin pass-through to tc-admin-service
 
 For internal admin the gateway is a **thin reverse proxy** — no business transformation,
 no limit logic, just authenticated forwarding.
 
-- Dedicated route `admin-proxy` (`/admin/*` → `tc-admin-service`) on the **admin listener
+- Dedicated route `admin-proxy` (`/admin/*` → `tc-admin-service`) on the **admin instance
   only**.
-- Lock down with `ip-restriction` (internal admin CIDRs) and either `mtls-auth` (internal
-  client certs) or, if admins are humans, `openid-connect`/`oidc` (Enterprise) for SSO.
-- Keep the plugin set minimal: auth + `correlation-id` + audit logging. No request
-  rewriting beyond path stripping.
+- Lock down with an **IP allowlist** (internal admin CIDRs) and either internal **mTLS**
+  (client certs) or, if admins are humans, **OIDC SSO** (Spring Security resource-server).
+- Keep the filter set minimal: auth + correlation-id + audit logging. No request rewriting
+  beyond path stripping.
 - Emit an immutable **audit log** (who, what, when) for every admin call to your SIEM.
 
-## Consolidated plugin map
+## Filter & component map
 
-| Requirement | Route(s) | Plugin(s) | Edition |
-| --- | --- | --- | --- |
-| Partner channel auth | partner | `mtls-auth` | Enterprise (OSS via TLS listener + `pre-function`) |
-| Partner message auth | partner | `jwt` or custom `tc-jws-verify` | OSS / custom |
-| Replay + idempotency | partner | `tc-jws-verify` (nonce/ts) + Redis | custom |
-| Amount limits | partner | custom `tc-auth-limit` (+ optional `opa`) | custom / EE |
-| Velocity limits | partner | `rate-limiting-advanced` / `rate-limiting` | EE / OSS |
-| Payload schema | partner | `request-validator` / `pre-function` | EE / OSS |
-| Payload size | all | `request-size-limiting` | OSS |
-| Consumer scoping | partner | `acl` | OSS |
-| Public callback token | public | `jwt` (tc key) + Redis `jti` | OSS |
-| Public abuse control | public | `rate-limiting`, `bot-detection`, `cors` | OSS |
-| Admin network lock | admin | `ip-restriction` | OSS |
-| Admin identity | admin | `mtls-auth` / `openid-connect` | EE |
-| Tracing & metrics | global | `correlation-id`, `prometheus`, `http-log` (SIEM) | OSS |
+| Requirement | Surface | Spring Cloud Gateway component |
+| --- | --- | --- |
+| Partner channel auth | partner | `server.ssl.client-auth=need` (mTLS) or LB-terminated mTLS + asserted client DN |
+| Partner message auth | partner | **custom** `JwsVerifyFilter` (Nimbus JOSE) |
+| Replay + idempotency | partner | `JwsVerifyFilter` (nonce/timestamp) + idempotency cache — Spring Data Redis |
+| Amount limits | partner | **custom** `AuthLimitFilter` |
+| Velocity limits | partner | `AuthLimitFilter`, or built-in `RequestRateLimiter` (reactive) / Bucket4j-Redis (MVC) |
+| Payload size | all | `BeforeFilterFunctions.requestSize(...)` |
+| Public callback token | public | **custom** token-verify filter (tc key) + Redis `jti` |
+| Public abuse control | public | rate-limit filter + WAF bot detection + CORS |
+| Admin network lock | admin | IP-allowlist filter (`ip-restriction`-style) |
+| Admin identity | admin | mTLS or Spring Security OIDC |
+| Tracing & metrics | global | a correlation-id filter + **Micrometer / Actuator** (Prometheus, OTel) |
 
-## Configuring Kong
+## Building the gateway (Spring Cloud Gateway)
 
-This section is the concrete build: how to stand the gateway up so the controls above are
-actually enforced. It covers deployment mode and listeners, the two custom plugins,
-plugin execution order, secrets/certs, Redis, the declarative config, and how to ship and
-verify it.
+The concrete build: dependencies, routes, the two custom filters, mTLS, Redis, config, and
+how to run and verify it. It's an ordinary Spring Boot app — `mvn package` → a jar/container,
+deployed like the other services.
 
-### Deployment mode & listeners (`kong.conf`)
+### Dependencies (Maven)
 
-Run **DB-less** (declarative) so config is GitOps-managed. The strongest way to guarantee
-"one public endpoint" is **physical separation: a separate Kong data plane per zone**
-(public / partner / admin), each loading only its own routes. If you instead run a single
-node with three listeners, you **MUST** enforce isolation with host-based routing **and**
-network ACLs so only callback traffic can reach the public interface — HTTP routes do not
-match on listener port, so the port split alone is not a security boundary.
-
-```ini
-# kong.conf  (DB-less)
-database           = off
-declarative_config = /etc/kong/kong.yaml
-
-# Three entry surfaces — bind each to its own interface / security group.
-# (For strict isolation, run one Kong data plane per surface instead.)
-proxy_listen = 10.0.1.10:8443 ssl http2, \
-               10.0.2.10:9443 ssl http2, \
-               10.0.3.10:10443 ssl http2
-
-# Admin API: never public — loopback + mTLS only, managed via decK.
-admin_listen = 127.0.0.1:8444 ssl
-
-# Register the custom plugins (plus the bundled ones).
-plugins          = bundled,tc-jws-verify,tc-auth-limit
-lua_package_path = /opt/kong/plugins/?.lua;;
-
-# Modern TLS only.
-ssl_cipher_suite = modern
-
-# Secrets backend (HashiCorp Vault shown; env / AWS-SM / GCP-SM also supported).
-vault_hcv_protocol = https
-vault_hcv_host     = vault.internal
-vault_hcv_mount    = kv
+```xml
+<!-- Pin the gateway artifact to your Spring Cloud release train.
+     Server MVC (servlet + virtual threads):  spring-cloud-starter-gateway-server-webmvc
+     Reactive (WebFlux/Netty):                 spring-cloud-starter-gateway-server-webflux -->
+<dependency>
+  <groupId>org.springframework.cloud</groupId>
+  <artifactId>spring-cloud-starter-gateway-server-webmvc</artifactId>
+</dependency>
+<dependency><groupId>com.nimbusds</groupId><artifactId>nimbus-jose-jwt</artifactId></dependency>
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-data-redis</artifactId></dependency>
+<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
+<dependency><groupId>io.micrometer</groupId><artifactId>micrometer-registry-prometheus</artifactId></dependency>
+<!-- optional: spring-cloud-starter-vault-config for key/secret material -->
 ```
 
-### Custom plugins
+### Routes (Java `RouterFunction`)
 
-Two controls have no built-in plugin and ship as small Lua plugins under
-`/opt/kong/plugins/kong/plugins/<name>/` (each needs `handler.lua` + `schema.lua`):
+Define routes per surface; a Spring **profile** activates only one surface's routes per
+instance. Each route attaches its filters, then proxies upstream with `http(...)`.
 
-- **`tc-jws-verify`** — verifies `X-JWS-Signature` against the consumer's public key,
-  recomputes the body hash, and enforces the timestamp window + nonce + idempotency key
-  (Requirement 1 / [Replay protection & idempotency](#replay-protection--idempotency)).
-- **`tc-auth-limit`** — amount / currency / cumulative-sum / global-ceiling checks
-  (Requirement 2; access-phase handler sketch in [Implementation](#implementation)).
+```java
+@Configuration
+class PartnerRoutes {                                   // @Profile("partner")
+    @Bean
+    RouterFunction<ServerResponse> partner(JwsVerifyFilter jws, AuthLimitFilter limits) {
+        return route("topup-create")
+            .POST("/v1/topups", http("http://tc-cardload-service.internal:8080"))
+            .before(BeforeFilterFunctions.requestSize(64L * 1024))   // 64 KB cap
+            .filter(jws).filter(limits)                              // verify -> limit -> proxy
+            .build()
+        .and(route("topup-status")
+            .GET("/v1/top-up-status/{ref}", http("http://tc-cardload-service.internal:8080"))
+            .filter(jws)
+            .build());
+    }
+}
 
-`schema.lua` for `tc-auth-limit`:
+@Configuration
+class PublicRoutes {                                    // @Profile("public") — ONLY this route
+    @Bean
+    RouterFunction<ServerResponse> publicRoute(CallbackTokenFilter token) {
+        return route("3ds-callback-public")
+            .POST("/v1/public/3ds/callback", http("http://tc-cardload-service.internal:8080"))
+            .before(BeforeFilterFunctions.requestSize(16L * 1024))
+            .filter(token)
+            .build();
+        // a default 404 handler covers every other path on the public instance
+    }
+}
 
-```lua
--- schema.lua
-return {
-  name = "tc-auth-limit",
-  fields = { { config = { type = "record", fields = {
-    { allowed_currency     = { type = "string", default = "USD" } },
-    { max_per_txn          = { type = "number", required = true } },
-    { max_card_daily       = { type = "number", required = true } },
-    { global_daily_ceiling = { type = "number", required = true } },
-    { redis_host           = { type = "string", required = true } },
-    { redis_port           = { type = "number", default = 6379 } },
-  } } } },
+@Configuration
+class AdminRoutes {                                     // @Profile("admin") — forward only
+    @Bean
+    RouterFunction<ServerResponse> admin(IpAllowlistFilter ip) {
+        return route("admin-proxy")
+            .route(RequestPredicates.path("/admin/**"), http("http://tc-admin-service.internal:8080"))
+            .filter(ip)
+            .build();
+    }
 }
 ```
 
-`handler.lua` header (the `:access` body is the sketch shown under Requirement 2):
+(`route`, `http`, `BeforeFilterFunctions` are the Server-MVC gateway helpers; the custom
+filters are the `HandlerFilterFunction` beans shown above. Confirm exact import paths against
+your Spring Cloud version.)
 
-```lua
--- handler.lua
-local TcAuthLimit = { PRIORITY = 905, VERSION = "1.0.0" }  -- runs in the limit stage
--- function TcAuthLimit:access(conf) ... end               -- see Requirement 2
-return TcAuthLimit
-```
-
-`tc-jws-verify` should set `PRIORITY = 1005` so it runs **after** channel auth
-(`mtls-auth`) and **before** `acl`/limits. Confirm the exact numbers against your Kong
-version's documented plugin priorities.
-
-### Plugin execution order (partner route)
-
-Higher `PRIORITY` runs first. Intended order on `topup-create`:
-
-```
-correlation-id → mtls-auth → tc-jws-verify → request-size-limiting
-   (tag)         (channel)   (message+replay)   (size guard)
-              → acl → tc-auth-limit / rate-limiting-advanced → [proxy → tc-cardload-service]
-                (scope)     (amount + velocity)
-```
-
-### Secrets & certificates
-
-- **PVCB public key** — store in the vault and reference it from the consumer credential:
-  `rsa_public_key: "{vault://hcv/pvcb/public-key}"`. Only the **public** key lives here.
-- **tc private key** (callback-token signing) — KMS/Vault only, referenced the
-  same way; never inlined.
-- **mTLS** — create a `ca_certificates` entity holding PVCB's client-cert CA and point the
-  `mtls-auth` plugin at it (`config.ca_certificates`). On OSS, set the TLS-layer client
-  certificate + verification on the partner listener instead.
-
-### Redis
-
-`tc-auth-limit`, `tc-jws-verify` (nonce + idempotency cache), and `rate-limiting-advanced`
-share one Redis. It is **critical-path**: run it HA (Sentinel or Cluster), and on outage
-the plugins **fail closed** for money movement (see [Failure & degradation
-behavior](#failure--degradation-behavior)).
-
-### Declarative config (`kong.yaml`)
-
-Manage the gateway as code with **decK**; never hand-edit production via the Admin API.
-Below is the config (abbreviated). Secrets are vault references, not inlined.
+### mTLS, TLS & virtual threads (`application.yml`)
 
 ```yaml
-_format_version: "3.0"
+spring:
+  threads:
+    virtual:
+      enabled: true                 # servlet on virtual threads — same model as cardload
+  data:
+    redis: { host: redis.internal, port: 6379 }
 
-services:
-  - name: tc-cardload-service
-    url: http://tc-cardload-service.internal:8080
-    routes:
-      # --- Partner: initiate top-up (signed + mTLS + limits) ---
-      - name: topup-create
-        paths: ["/v1/topups"]
-        methods: ["POST"]
-        plugins:
-          - name: mtls-auth                 # Enterprise; OSS: TLS listener + pre-function
-          - name: jwt                       # verifies PVCB signature (public key as credential)
-          - name: acl
-            config: { allow: ["partner"] }
-          - name: request-size-limiting
-            config: { allowed_payload_size: 64 }
-          - name: tc-auth-limit             # custom: amount + currency + cumulative + ceiling
-            config:
-              allowed_currency: "USD"
-              max_per_txn: 5000
-              max_card_daily: 10000
-              global_daily_ceiling: 2000000
-          - name: rate-limiting-advanced    # velocity by card fingerprint
-            config: { limit: [5], window_size: [3600], identifier: header, header_name: X-Card-Fingerprint }
-      # --- Partner: status query ---
-      - name: topup-status
-        paths: ["/v1/topups/(?<id>[^/]+)$"]
-        methods: ["GET"]
-        plugins:
-          - name: mtls-auth
-          - name: jwt
-          - name: acl
-            config: { allow: ["partner"] }
-      # --- Public: the ONLY internet-reachable route ---
-      - name: 3ds-callback-public
-        paths: ["/v1/public/3ds/callback"]
-        methods: ["POST"]
-        plugins:
-          - name: jwt                       # one-time tc-signed callback token
-          - name: rate-limiting
-            config: { minute: 60, policy: redis }
-          - name: bot-detection
-          - name: request-size-limiting
-            config: { allowed_payload_size: 16 }
-          - name: cors
-            config: { origins: ["https://app.pvcb.example"] }
+server:
+  port: 9443                        # per-surface (public 8443 / partner 9443 / admin 10443)
+  ssl:
+    enabled: true
+    protocol: TLS
+    enabled-protocols: [TLSv1.3, TLSv1.2]
+    key-store: "${TLS_KEYSTORE}"               # gateway server cert
+    client-auth: need                          # mTLS for the PARTNER surface (PVCB client cert)
+    trust-store: "${PVCB_CLIENT_CA_TRUSTSTORE}"# PVCB's client-cert CA
 
-  - name: tc-admin-service                  # forward-only
-    url: http://tc-admin-service.internal:8080
-    routes:
-      - name: admin-proxy
-        paths: ["/admin"]
-        plugins:
-          - name: ip-restriction
-            config: { allow: ["10.20.0.0/16"] }   # internal admin CIDR
-          - name: mtls-auth                        # or openid-connect for human SSO
+# authorization limits — seeded here, refreshed from tc-admin-service
+tc:
+  limits:
+    allowed-currency: USD
+    max-per-txn: 5000
+    max-card-per-hour: 5
+    max-card-daily-cents: 1000000
+    global-daily-ceiling-cents: 200000000
 
-consumers:
-  - username: pvcb-topup
-    acls:
-      - group: partner
-    jwt_secrets:
-      - algorithm: ES256
-        key: "pvcb-topup-kid-2026"          # kid PVCB puts in the JWS header
-        rsa_public_key: "{vault://hcv/pvcb/public-key}"  # PVCB's PUBLIC key only
-  - username: tc-callback-signer            # verifies the one-time 3DS callback token
-    jwt_secrets:
-      - algorithm: ES256
-        key: "tc-callback-kid-2026"          # kid tc-cardload-service stamps in the token
-        rsa_public_key: "{vault://hcv/tc/callback-public-key}"  # tc's PUBLIC key
-
-ca_certificates:                             # PVCB client-cert CA, referenced by mtls-auth
-  - cert: "{vault://hcv/pvcb/client-ca-pem}"
-    tags: ["pvcb-mtls"]
-
-plugins:                                     # global
-  - name: correlation-id
-  - name: prometheus
-  - name: http-log
-    config: { http_endpoint: "https://siem.internal/ingest" }
+management:
+  endpoints.web.exposure.include: [health, prometheus]   # keep OFF the public surface
 ```
 
-### Ship it with decK (CI)
+> Because payloads are JWS-signed, you **may** terminate mTLS at the load balancer instead
+> and have the gateway assert the verified client DN from a trusted header — message
+> integrity still holds end-to-end.
 
-Keep `kong.yaml` in the repo as the single source of truth and apply it through CI — never
-hand-edit production:
+### Config & secrets
+
+- **PVCB public key(s)** → the gateway's `PublicKeyRegistry`, keyed by `kid`, loaded from
+  config / a JWKS endpoint / Vault. Public keys only.
+- **tc private key** (callback-token signing) → **KMS/Vault** (Spring Cloud Vault), never in
+  the repo or `application.yml`.
+- **Limit config** → `@ConfigurationProperties` bean (`tc.limits.*`), refreshed when
+  `tc-admin-service` pushes a change (a `/internal/limits/refresh` endpoint with
+  `@RefreshScope`, or a short-TTL read of the admin config API).
+- **Redis** is critical-path (limits + nonce + idempotency); run it **HA** (Sentinel/Cluster)
+  and fail **closed** on outage (see [Failure & degradation](#failure--degradation-behavior)).
+
+### Run & deploy
+
+It's a normal Spring Boot service — no Kong, no decK, no Lua:
 
 ```bash
-deck file lint        kong.yaml   # static checks on the file
-deck gateway validate kong.yaml   # validate against the running Kong's schemas
-deck gateway diff     kong.yaml   # review the change set in the PR
-deck gateway sync     kong.yaml   # apply — only after approval
+mvn -q -DskipTests package
+SPRING_PROFILES_ACTIVE=partner java -jar target/tc-api-gateway.jar   # one instance per surface
+# build a container the same way you build the other tc-* services; deploy via CI.
 ```
+
+Routes and limit defaults live in `application.yml` in the repo (GitOps); secrets come from
+Vault/env. Three deployments — `public`, `partner`, `admin` — each behind its own LB.
 
 ### Verify the controls
 
-Smoke-test each requirement after a sync (commands illustrative):
+Smoke-test each requirement after deploy (commands illustrative):
 
 ```bash
 # 1. Unsigned partner request → rejected
@@ -584,10 +562,127 @@ curl -sk https://public:8443/v1/public/3ds/callback \
   -H "Authorization: Bearer $CALLBACK_JWT" -d '{}' -w '%{http_code}\n'           # → 200
 
 # 5. Admin from a non-allowlisted IP → rejected
-curl -sk https://admin:10443/admin/health -w '%{http_code}\n'                    # → 403 (allow: admin CIDR + mTLS)
+curl -sk https://admin:10443/admin/health -w '%{http_code}\n'                    # → 403
 ```
 
-Keep the repo as the single source of truth so config changes are reviewed like code.
+## Deployment
+
+The gateway is an ordinary Spring Boot service: **one image, run three ways.** It carries **no
+database** — its only stateful dependency is **Redis** (limits, nonce, idempotency) — so it scales
+horizontally as stateless replicas. For the whole-platform Docker setup see
+[Deployment (Docker)](/docs/deployment); this is the gateway-specific process.
+
+### Image
+
+Build the same multi-stage Java image as the other services (Maven/JDK 25 → slim JRE, non-root):
+
+```dockerfile
+# tc-api-gateway/Dockerfile
+# syntax=docker/dockerfile:1
+FROM maven:3.9-eclipse-temurin-25 AS build
+WORKDIR /app
+COPY pom.xml .
+RUN mvn -B -q dependency:go-offline
+COPY src ./src
+RUN mvn -B -q -DskipTests package
+
+FROM eclipse-temurin:25-jre AS run
+RUN useradd -r -u 10001 app \
+ && apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=build /app/target/*.jar app.jar
+USER app
+ENTRYPOINT ["java","-XX:MaxRAMPercentage=75","-jar","/app/app.jar"]
+```
+
+### Three instances from one image
+
+Production runs the image as **three independent deployments**, each activated by a Spring
+**profile** that registers **only that surface's routes** (this is the structural "one public
+route" guarantee), on its own port behind its own load balancer and network policy:
+
+| Instance | Profile | Port | Exposure | Routes | TLS |
+| --- | --- | --- | --- | --- | --- |
+| `gateway-public` | `public` | 8443 | Internet (behind WAF/CDN) | `3ds-callback-public` only | TLS |
+| `gateway-partner` | `partner` | 9443 | PVCB private link only | `/v1/topups…` | TLS + **mTLS** |
+| `gateway-admin` | `admin` | 10443 | internal admin network only | `admin-proxy` | TLS (+ mTLS/OIDC) |
+
+```yaml
+# docker-compose fragment (staging-like: all three surfaces, one build)
+  gateway-partner:
+    build: ./tc-api-gateway
+    env_file: .env
+    environment: { SPRING_PROFILES_ACTIVE: "partner", SERVER_PORT: "9443" }
+    ports: ["9443:9443"]
+    depends_on:
+      tc-cardload-service: { condition: service_healthy }
+      redis: { condition: service_healthy }
+  gateway-public:
+    build: ./tc-api-gateway
+    env_file: .env
+    environment: { SPRING_PROFILES_ACTIVE: "public", SERVER_PORT: "8443" }
+    ports: ["8443:8443"]
+  gateway-admin:
+    build: ./tc-api-gateway
+    env_file: .env
+    environment: { SPRING_PROFILES_ACTIVE: "admin", SERVER_PORT: "10443" }
+    ports: ["10443:10443"]
+    depends_on:
+      tc-admin-service: { condition: service_healthy }
+```
+
+(Local "run everything" collapses these into one node — see [Deployment (Docker)](/docs/deployment).)
+
+### Configuration & secrets
+
+- **Routes** are chosen by the active **profile** — never deploy the public instance with partner
+  routes registered.
+- **TLS / mTLS:** mount the server **keystore** and, on the partner surface, the **truststore**
+  (PVCB client-cert CA) with `server.ssl.client-auth=need`. Or terminate mTLS at the LB and pass
+  the verified client DN — message integrity still holds (the body is JWS-signed).
+- **Secrets** come from a **secrets manager / Vault**, injected as env/mounted files, never baked
+  into the image: **PVCB public keys** (the `kid` registry / JWKS), **tc's private callback-signing
+  key**, Redis credentials, keystore passwords. See [Key lifecycle](#key-lifecycle-management).
+- **Limit config** is seeded in `application.yml` and **refreshed from `tc-admin-service`** (a
+  refresh endpoint or short-TTL pull) — a limit change does **not** require a redeploy.
+- **Redis** is critical-path and shared; run it **HA** and fail **closed** on outage
+  (see [Failure & degradation](#failure--degradation-behavior)).
+
+### Kubernetes (production)
+
+Three `Deployment`s (one per surface), each its own `Service` + LB + `NetworkPolicy`, ≥2 replicas,
+liveness/readiness on the actuator probes:
+
+```yaml
+# gateway-partner Deployment (sketch)
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: tc-api-gateway
+          image: registry.internal/tc-api-gateway:<git-sha>
+          args: ["--spring.profiles.active=partner"]
+          ports: [{ containerPort: 9443 }]
+          readinessProbe: { httpGet: { path: /actuator/health/readiness, port: 9443, scheme: HTTPS } }
+          livenessProbe:  { httpGet: { path: /actuator/health/liveness,  port: 9443, scheme: HTTPS } }
+          envFrom: [{ secretRef: { name: tc-api-gateway-secrets } }]
+          resources: { requests: { cpu: 250m, memory: 512Mi }, limits: { memory: 1Gi } }
+```
+
+### Rollout & operations
+
+- **GitOps:** routes + limit defaults live in `application.yml` in the repo; deploys reference
+  **immutable image tags** (built in CI, tagged by commit). No hand-editing in prod.
+- **Zero-downtime:** rolling deploy **per surface** (keep N-1 replicas serving); the gateway is
+  stateless, so draining is just graceful connection shutdown.
+- **Key rotation:** publish the new `kid`, accept both, retire the old — a **config refresh, not a
+  redeploy** ([Key lifecycle](#key-lifecycle-management)).
+- **Scaling:** autoscale each surface on **in-flight requests / latency** (state is in Redis, not
+  the pod). The partner surface carries the money traffic; size it for the Visa/Cybersource TPS the
+  flow drives.
+- **Observability:** scrape `/actuator/prometheus`; alert on signature-failure spikes, limit
+  breaches, replay spikes, global-ceiling trips, and fail-closed counts.
 
 ## Failure & degradation behavior
 
@@ -599,12 +694,11 @@ gracefully.
 | --- | --- | --- |
 | Redis (limits / nonce / idempotency) | amount caps, replay, idempotency | **Reject** money-movement with `503 LIMIT_BACKEND_DOWN`; do not approve unscreened |
 | Signature verification (key fetch / JWS) | partner & callback auth | **Reject** with `401`; never bypass |
-| OPA (if used for policy) | limit policy | **Reject** with `503` |
 | `tc-cardload-service` upstream down | request processing | **Reject** with `503` + `Retry-After`; **never** auto-approve a top-up |
 | Cybersource (downstream of cardload) | fraud / 3DS result | Handled by `tc-cardload-service`; the transaction **MUST NOT** proceed on an unknown 3DS/fraud result |
 
-- **Status/read endpoints** (`GET /v1/topups/{id}`) **MAY** return a degraded/cached read
-  if a non-critical dependency is down, as long as they never imply a money movement.
+- **Status/read endpoints** (`GET /v1/top-up-status/{ref}`) **MAY** return a degraded/cached
+  read if a non-critical dependency is down, as long as they never imply a money movement.
 - Every fail-closed rejection emits a metric and, for global-ceiling/limit-backend
   failures, pages on-call.
 
@@ -614,17 +708,18 @@ gracefully.
   CDE scope. Tokenize/replace the PAN as early as possible, pass only a **card
   fingerprint** to limit logic, never log PAN/CVV/track data, and mask sensitive fields in
   all logs.
-- **Observability.** `correlation-id` end-to-end, Prometheus metrics (auth failures, limit
-  rejections, replay rejections, callback abuse, fail-closed counts), structured logs to
-  SIEM, OpenTelemetry traces. Alert on: signature-verification failure spikes, limit-breach
-  spikes, replay spikes, and global-ceiling trips.
+- **Observability.** Correlation-id end-to-end (a small filter sets/propagates
+  `X-Correlation-Id`), **Micrometer/Actuator** metrics (auth failures, limit rejections,
+  replay rejections, callback abuse, fail-closed counts) scraped by Prometheus,
+  structured logs to SIEM, OpenTelemetry traces. Alert on: signature-verification failure
+  spikes, limit-breach spikes, replay spikes, and global-ceiling trips.
 - **Consistent error contract.** Return structured JSON errors (`{ code, message,
   correlationId }`) with stable codes; never leak stack traces, upstream identities, or
   whether a card/user exists.
-- **Resilience.** Active/passive **upstream health checks**, circuit breaking, and the
+- **Resilience.** Upstream health checks + circuit breaking (Resilience4j) and the
   fail-closed posture above.
-- **High availability.** Deploy ≥2 Kong nodes behind an L4 LB; Redis in HA (the limit and
-  nonce/idempotency stores are critical-path).
+- **High availability.** Deploy ≥2 instances **per surface** behind an L4 LB; Redis in HA
+  (the limit and nonce/idempotency stores are critical-path).
 
 ## Design review & traceability
 
@@ -658,10 +753,13 @@ proxy.
 | 8 | Currency must be on an explicit allowlist | [Authorization limits](#requirement-2--authorization-limits-the-10m-auth-guard) (`allowed_currency`) |
 | 9 | Plan PCI scope and `kid`-based key rotation up front | [Key lifecycle management](#key-lifecycle-management), [Cross-cutting concerns](#cross-cutting-concerns) |
 
-### Edition / cost note
+### Why this is the right weight
 
-Several plugins above (`mtls-auth`, `rate-limiting-advanced`, `request-validator`,
-`opa`, `openid-connect`, `jwt-signer`) are **Kong Enterprise**. Everything can be built on
-**Kong OSS** using the `jwt` plugin plus custom Lua plugins (`tc-jws-verify`,
-`tc-auth-limit`) and `pre-/post-function`, at the cost of more in-house plugin code.
-Decide on edition early — it changes the build effort for Requirements 1 and 2.
+Spring Cloud Gateway is **Apache-2.0 OSS with no edition tiers** — every control above
+(mTLS, JWS verify, amount/velocity limits, single public route, admin forward) is built
+from the framework plus two small custom Java filters. You avoid Kong's separate runtime,
+Lua plugin SDK, decK, and admin API, and the gateway shares the platform's libraries,
+config, secrets, and observability. The only real choice is the variant — **Server MVC**
+(servlet + virtual threads, consistent with the rest of the backend) or **reactive**
+(more built-in filters such as the Redis `RequestRateLimiter`). For a 2-dev team on a Java
+stack, this is the right weight: a thin proxy you fully own, not a platform to operate.

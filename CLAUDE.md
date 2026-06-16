@@ -17,18 +17,25 @@ Java/Spring microservices to be built by a small team (2 backend + 2 Flutter).
 Use **`bun run`**, not npm (run `bun run types:check` after every content change to validate MDX).
 
 ```bash
-bun run dev          # Start development server (port 3000)
+bun run dev          # Start development server (port 3010)
 bun run build        # Production build
 bun run types:check  # Type checking (fumadocs-mdx + next typegen + TypeScript) — the validation gate
 bun run lint         # ESLint validation
+bun run db:generate  # Drizzle: generate SQL migration from db/schema.ts
+bun run db:migrate   # Drizzle: apply migrations (Neon Postgres — site auth/access store)
+bun run db:studio    # Drizzle Studio
 ```
 
 ## Documented system (keep specs consistent with this)
 
 Specs live in `/content/docs/specifications/`; nav order is in each `meta.json`. Current services:
 
-- **tc-api-gateway** — Kong edge: partner auth (mTLS + JWS), authorization limits, **one** public
-  endpoint (the 3DS callback), admin forward-only. **No outbound webhooks to PVCB.**
+- **tc-api-gateway** — thin **Spring Cloud Gateway** (Server MVC, same JDK 25 / Spring Boot 4
+  stack — **not Kong**): partner auth (mTLS + JWS verify), authorization limits, **one** public
+  endpoint (the 3DS callback), admin forward-only. Routes are Java `RouterFunction`s; controls are
+  custom `HandlerFilterFunction` filters (`JwsVerifyFilter`, `AuthLimitFilter`, `CallbackTokenFilter`,
+  `IpAllowlistFilter`). Three surfaces — public/partner/admin — from one image via Spring profiles.
+  **No outbound webhooks to PVCB.**
 - **tc-cardload-service** — synchronous top-up orchestrator. Five modules — **Tokenization**
   (Cybersource Flex/TMS **+ VTS network token**), **Decision Manager**, **Payer Authentication**,
   **Visa Direct** (AFT), **Foreign Exchange** (Visa daily FX rate, cached + per-txn snapshot) —
@@ -42,8 +49,12 @@ Specs live in `/content/docs/specifications/`; nav order is in each `meta.json`.
   tags, audit trail, limits config, dashboards).
 - **tc-admin-portal** — Flutter web front-end for tc-admin-service.
 
-Supporting docs: `architecture.mdx` (system-wide design + combined DBML data map), `index.mdx`
-(overview), `code-style-guide.mdx` (Java conventions), `timeline.mdx` (build plan).
+Inside `specifications/` (nav order in `specifications/meta.json`): `index.mdx` (specs overview)
+and `architecture.mdx` (system-wide design + combined DBML data map) come before the five service
+specs. Top-level docs (`content/docs/`, nav order in `content/docs/meta.json`): `index.mdx`
+(program overview), `code-style-guide.mdx` (Java conventions), `engineering-ground-rules.mdx`
+(team working agreement — signed commits, PRs, CI gates, PCI hygiene), `timeline.mdx` (build plan),
+`deployment.mdx` (Docker/Compose for the documented platform).
 
 ## Key design principles (these are settled — keep edits consistent)
 
@@ -85,11 +96,30 @@ Supporting docs: `architecture.mdx` (system-wide design + combined DBML data map
 - `/app/api/search/` - Full-text search API using Orama
 - `/app/llms.txt/` and `/app/llms-full.txt/` - LLM-friendly text exports of documentation
 
+### Access control & data (the site is auth-gated)
+- The whole portal sits behind auth. `proxy.ts` (matches `/docs/*`, `/llms*.txt`, sign-in/up)
+  redirects unauthenticated users to `/sign-in` and unverified users to `/not-verified`.
+- Auth is **better-auth** (email/password **+ passkey**) on **Drizzle ORM + Neon Postgres**:
+  config in `lib/auth.ts` / `lib/auth-client.ts`, schema in `db/schema.ts`, migrations in
+  `db/migrations/`, `drizzle.config.ts` (needs `DATABASE_URL`). This is separate from the
+  documented Visa platform's own MySQL.
+- Page-level gating: `permission` frontmatter (`member|admin`, single value or array, defaults
+  to `member`) is validated in `source.config.ts`.
+
+### Scripts & data hygiene
+- `scripts/parse-ep705.ts` parses Visa **EP705** settlement files into JSON (used while writing
+  the settlement spec). Run with `bun run scripts/parse-ep705.ts`.
+- **`/data` is git-ignored** (so are `*.pem` and `.env*`) — raw EP705 files contain **clear
+  PANs**. Never commit `data/`, and never paste PAN/CVV/track data into chat, logs, or examples.
+
 ### Key Files
 - `lib/source.ts` - Core content loading logic and Fumadocs source configuration
 - `lib/layout.shared.tsx` - Shared navigation configuration via `baseOptions()`
-- `source.config.ts` - MDX content schema definitions (Zod validation)
+- `source.config.ts` - MDX content schema definitions (Zod validation, incl. `permission`)
 - `mdx-components.tsx` - Custom MDX component overrides
+- `proxy.ts` - Auth middleware (session check, sign-in / email-verification redirects)
+- `lib/auth.ts` / `lib/db.ts` - better-auth server config and Drizzle/Neon client
+- `db/schema.ts` + `db/migrations/` - Auth/access database schema and migrations
 
 ### Path Aliases
 - `@/*` - Points to project root

@@ -46,7 +46,7 @@ tourist → PVCB Top up → tc-api-gateway → tc-cardload-service ──fraud(D
 | Spec | What it is | Key responsibilities |
 | --- | --- | --- |
 | [Architecture & service interaction](/docs/specifications/architecture) | Platform contract | Tech stack, microservices, **synchronous REST** interaction, the top-up flow, the system-wide data map |
-| [tc-api-gateway](/docs/specifications/tc-api-gateway) | Kong edge | Partner auth (mTLS + JWS), authorization limits, single public 3DS callback, admin forwarding |
+| [tc-api-gateway](/docs/specifications/tc-api-gateway) | Spring Cloud Gateway edge | Partner auth (mTLS + JWS), authorization limits, single public 3DS callback, admin forwarding |
 | [tc-cardload-service](/docs/specifications/tc-cardload-service) | Orchestrator (+ Visa Direct) | Cybersource **Decision Manager** (toggleable fraud) + **Payer Authentication** (3DS) + **Visa Direct AFT/reversal/adjustment** + **Visa FX rate capture** + authorization limits |
 | [tc-settlement-service](/docs/specifications/tc-settlement-service) | Settlement reconciler | Ingest the Visa settlement file (VSS/TC46), parse it, and **match each line to the authorization + prefunding legs** on the Visa `transactionIdentifier`; report breaks. **No ledger — PVCB is the book of record.** |
 | [tc-admin-service](/docs/specifications/tc-admin-service) | Admin backend | Spring Security (session, password, TOTP, passkeys), RBAC/tags, audit trail, limits config, dashboards |
@@ -54,7 +54,7 @@ tourist → PVCB Top up → tc-api-gateway → tc-cardload-service ──fraud(D
 
 ## Platform & cross-cutting principles
 
-- **Stack:** Java/Spring Boot microservices on MySQL, behind a Kong edge, with a Flutter
+- **Stack:** Java/Spring Boot microservices on MySQL, behind a Spring Cloud Gateway edge, with a Flutter
   admin portal. Exact versions and rationale are in
   [Architecture](/docs/specifications/architecture).
 - **Synchronous:** services communicate over **synchronous REST** (`RestClient`); there is

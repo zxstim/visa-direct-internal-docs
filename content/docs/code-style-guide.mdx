@@ -4,9 +4,10 @@ description: Engineering conventions for the Java 25 / Spring Boot backend servi
 permission: member
 ---
 
-This guide governs the **Java 25 / Spring Boot 4 backend services** (`tc-cardload-service`,
-`tc-settlement-service`, `tc-admin-service`). The Kong
-gateway (Lua) and the Flutter portal follow their own conventions in their respective specs.
+This guide governs the **Java 25 / Spring Boot 4 backend services** (`tc-api-gateway`,
+`tc-cardload-service`, `tc-settlement-service`, `tc-admin-service`) — the gateway is now a thin
+**Spring Cloud Gateway** app, so it follows these conventions too. The Flutter portal follows its
+own conventions in its spec.
 
 ## 1. General principles
 

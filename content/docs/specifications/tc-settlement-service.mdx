@@ -150,6 +150,11 @@ resolution) closes a result.
   control records. **Validate control totals + sequence**; a file failing validation is
   **rejected whole**, never partially applied. The parser is **pluggable** (the exact VSS report
   set/layout is config — confirm with Visa).
+- The concrete file PVCB receives is the **VisaNet Edit Package (VEP)** report set; the detail we
+  parse is report **EP705 "SALES DRAFTS"**, checksummed against the **EP110F** control totals. The
+  full step-by-step parsing contract — page-strip, segmentation, the two-column label→value
+  windows, amount/PCI rules — is in [Settlement file parsing (EP705)](#settlement-file-parsing-ep705)
+  below, with a working reference parser at `scripts/parse-ep705.ts`.
 
 ## Stage-then-process (the as-is table)
 
@@ -165,6 +170,286 @@ authorization + prefunding legs (sync from cardload) ─▶ MATCH ─▶ reconci
 - **`settlement_record` is the transformed output** — clean, typed, queryable rows derived from
   the raw lines (linking back to `raw_record_id`), with the **canonical TID** and the fallback
   keys (RRN, ARN, auth code) populated. This is the "ugly file → easy DB rows" step.
+
+## Settlement file parsing (EP705)
+
+This section specifies **how the parser turns the raw Visa file into the staged rows above** —
+file → `settlement_raw_record` (as-is) → `settlement_record` (typed). A working reference parser
+already exists at **`scripts/parse-ep705.ts`** (`bun run scripts/parse-ep705.ts`); it parses the
+production sample, masks PANs, and **validates its output against the EP110F control totals**. This
+is its written form — the contract the Java module must reproduce.
+
+The file is the **VisaNet Edit Package (VEP)** report set; the detail we parse is report
+**EP705 "SALES DRAFTS"** — a *human-readable, fixed-width, two-column "form" layout*, not a machine
+record format. PCI rules from the [engineering ground rules](/docs/engineering-ground-rules) apply
+throughout: **a clear PAN never lands in a `tc-*` store, log, or example.**
+
+### The delivered report set
+
+A cycle arrives as a folder of fixed-width text reports (the VisaNet Edit Package). The package
+index (`REPORTS.INDEX.TXT`) lists every report; the ones that matter for reconciliation:
+
+| Report | Title | Role in parsing/recon |
+| --- | --- | --- |
+| **EP705** | SALES DRAFTS | **The detail we parse** — one block per cleared AFT (sales draft) |
+| EP715 | SALES DRAFT CHARGEBACKS | Chargeback detail (future: feeds `ADJUSTMENT`/break outcomes) |
+| EP725 | SALES DRAFT REVERSALS | Reversal detail (future: feeds the `REVERSAL` outcome / netting) |
+| **EP110F** | OUTGOING INTERCHANGE SUMMARY | **Control totals** — the `RUN` line is the parse's checksum |
+| EP110B/C/E | Interchange batch/file/run summaries | Secondary control totals (per batch/file) |
+| EP111C/E | File / run summary by currency code | Per-currency control totals |
+| EP100A/B/C | Validation exception reports | Rejected items (not settled — out of scope for the match) |
+| EP199 / EP999 | Processing log / index of reports | Provenance / manifest |
+
+The prototype parses **EP705** and checksums against **EP110F**. EP715/EP725 are the same layout
+family and become additional parser plug-ins when reversals/chargebacks are wired into the
+[reconciliation outcomes](#outcomes--breaks).
+
+### EP705 file anatomy
+
+Understand the shape before the algorithm:
+
+- **Encoding:** read as **`latin1`** (ISO-8859-1), *not* UTF-8 — the report contains 8-bit
+  characters that corrupt under UTF-8. Split into lines on `\r?\n`.
+- **Fixed width:** each line is ~**134 columns**; fields live at fixed 1-based column windows.
+- **Paginated:** every printed page starts with a **3-line page header** that must be stripped:
+
+  ```
+  REPORT EP-705   OUTGOING INTERCHANGE                    VISANET EDIT PACKAGE                 PAGE      1
+   SYSTEM DATE 25/12/28    RELEASE  4.00               SALES DRAFTS                  E/P PROC. DATE   25/12/28
+   PVCOMBANK                                                  CENTER 486033                     RUN NO    001
+  ```
+
+- **Two-column "form" layout:** each content line carries **two** label→value pairs — one in the
+  left half, one in the right half — so a single physical line yields up to two logical fields.
+- **One transaction = several sub-sections.** Each sales draft begins at a
+  `Sales Draft - Original ---- Required Data` marker and continues through up to four sub-sections,
+  each introduced by its own `Sales Draft - Original ----` banner:
+
+  | Sub-section banner | Holds |
+  | --- | --- |
+  | `Sales Draft - Original ---- Required Data` | **Starts a new transaction.** Core fields: TID, ARN, amounts, currency, dates |
+  | `Sales Draft - Original ---- Additional Data` | Fees, FX rates, merchant data, processing flags |
+  | `Sales Draft - Original ---- Payment Service Data` | Token / payment-service fields |
+  | `Sales Draft - Original ---- Chip Card Transaction Data` | EMV / chip fields |
+
+  The fields from **all** sub-sections accumulate into the **same** transaction record until the
+  next `Required Data` marker starts the next one.
+
+In the production sample the file holds **1,897** `Required Data` markers — exactly the **`RUN`
+count in EP110F** (`1,897`), which is what makes the parse verifiable.
+
+### Step-by-step parsing algorithm
+
+This mirrors `scripts/parse-ep705.ts` exactly. Reproduce each step.
+
+#### Step 0 — Read & split
+Read the file as **`latin1`**. Split on `\r?\n` into an ordered array of lines. Do not trim lines
+yet — column positions are significant.
+
+#### Step 1 — Strip pagination
+Walk the lines. When a line **starts with `REPORT EP-`**, it is the first line of a page header:
+**skip it and the next two lines** (the `SYSTEM DATE …` and `PVCOMBANK … RUN NO` lines). This
+removes every repeated page header without disturbing field columns. (Page headers can fall
+**mid-transaction**, so this strip must happen during the same pass as segmentation, not as a naive
+pre-filter that could swallow data lines.)
+
+#### Step 2 — Segment into transaction records
+Maintain a "current record" accumulator (a label→value map).
+
+- A line matching `Sales Draft - Original\s+----\s+Required Data` **closes the current record
+  (emit it) and opens a fresh one**.
+- A line matching any other `Sales Draft - Original\s+----` banner (Additional / Payment Service /
+  Chip Card Data) is a **sub-section header — skip it** (it is not a field) but **keep accumulating
+  into the current record**.
+- Any other line, while a record is open, is a **content line** → go to Step 3.
+- At end of file, **emit the final open record**.
+
+#### Step 3 — Extract the two column windows, key by label
+For each content line, read **two** fixed windows and store each as `label → value`:
+
+| Half | Label columns (1-based) | Value columns (1-based) |
+| --- | --- | --- |
+| Left | **2 – 26** | **28 – 66** |
+| Right | **68 – 92** | **94 – 133** |
+
+(Implementation: split the line at column 66; in each half the label is `chars[1..26]` and the
+value is `chars[27..]`, both `.trim()`-ed. One column between label and value is a separator and is
+dropped.)
+
+Rules:
+- **Key by the label text, never by position or order.** Field order and the AFT/usage codes shift
+  between records; keying on the human label (`"Transaction Identifier"`, `"Source Amount"`, …)
+  makes the parse robust to that.
+- **First occurrence wins.** If the same label appears twice in a record, keep the first value
+  (`if (label && !map.has(label)) map.set(label, value)`). This makes the parse deterministic.
+- Skip empty labels.
+
+#### Step 4 — Project to typed fields
+From the accumulated label→value map, build the typed output row. Look up each value by its label
+(see the [field dictionary](#field-dictionary)) and apply the
+[amount/currency conventions](#amount--currency-conventions) and date parsing. Missing labels yield
+`null`/empty, never an error — the layout is sparse by design.
+
+#### Step 5 — PCI handling of the PAN (mandatory)
+The `Acct Number & Extension` field carries a **clear PAN** (optionally a 3-digit extension).
+**It must never be stored, logged, or emitted in the clear.**
+
+1. Strip non-digits. If the result is **19 digits**, the trailing **3 are the extension** — drop
+   them to recover the **16-digit PAN**.
+2. Emit **only** `acct_last4` (last 4 of the PAN) and `acct_hash = HMAC-SHA256(salt, PAN)` (a
+   one-way token for grouping/dedupe). The salt comes from secret config (`PAN_HASH_SALT`); never a
+   hard-coded default in production.
+3. Where Visa requires the PAN downstream, it is handled under **MLE / tokenization**, not in these
+   rows. See [PCI / tokenization principles](/docs/specifications/architecture).
+
+#### Step 6 — Emit rows
+Emit **one record per transaction**. In the prototype this is **NDJSON** to stdout. In this service
+the same data lands as one **`settlement_raw_record`** per transaction (the **as-is** verbatim
+capture — `raw_line` plus the untyped label→value map in `raw_fields`), then one transformed
+**`settlement_record`** (typed, with the **canonical/normalized TID** and the fallback keys
+populated) — the [stage-then-process](#stage-then-process-the-as-is-table) step above.
+
+#### Step 7 — Validate against control totals (fail-closed)
+After parsing, **prove the parse** against **EP110F** (same folder). Parse the `RUN` summary line:
+
+```
+ RUN         1         1,897          2,846,046,717.00 …
+             └ run no   └ count         └ amount (2dp)
+```
+
+Regex used by the prototype: `^\s*RUN\s+\d+\s+([\d,]+)\s+([\d,]+\.\d{2})` (strip the thousands
+commas before comparing). Then assert:
+
+- **record count** parsed == EP110F `RUN` count, and
+- **Σ(Source Amount)** (each `Source Amount ÷ 100`, rounded to 2dp) == EP110F `RUN` amount.
+
+A mismatch is a **hard failure** (the prototype exits non-zero). In the service, a file that fails
+control-total validation is **rejected whole — never partially applied** (the money-safety
+*fail-closed* rule). Record the failure on `settlement_file.validation_error` and stop.
+
+#### Algorithm in brief
+
+```
+lines = read(file, "latin1").split(/\r?\n/)
+record = null
+for i in 0..lines:
+  if lines[i].startsWith("REPORT EP-"): i += 2; continue        // Step 1: drop 3-line page header
+  if /Sales Draft - Original ---- Required Data/:               // Step 2: new transaction
+      if record: emit(record)
+      record = {}; continue
+  if record == null or /Sales Draft - Original ----/: continue   //        skip sub-section banners
+  for half in [line[0..66], line[66..]]:                         // Step 3: two column windows
+      label = half[1..26].trim(); value = half[27..].trim()
+      if label and label not in record: record[label] = value   //        first occurrence wins
+if record: emit(record)                                          //        flush last
+// Steps 4–6 inside emit(); Step 7 after the loop against EP110F
+```
+
+### Column window reference
+
+For a line of width ~134 (1-based, inclusive):
+
+```
+col: 1  2 ───────────── 26 27 28 ──────────── 66 67 68 ───────────── 92 93 94 ───────────── 133 134
+     │  │  LEFT label    │  │  │   LEFT value   │  │  │  RIGHT label   │  │  │  RIGHT value    │
+     │  └── 2–26 ────────┘  ↑  └── 28–66 ───────┘  ↑  └── 68–92 ───────┘  ↑  └── 94–133 ───────┘
+     │                      └ sep (27)             └ split point (66)     └ sep (93)
+```
+
+### Field dictionary
+
+The labels the prototype reads and the output field each maps to. Labels are the join key — match
+on the **exact label string**. (`†` = amount, see conventions below; `‡` = PCI-sensitive.)
+
+| EP705 label | Output field | Notes |
+| --- | --- | --- |
+| `Transaction Identifier` | `transaction_identifier` | **Visa TID** — the primary match key; normalize (strip leading zeros, trim) before storing |
+| `Acquirer Reference Nbr` | `acquirer_reference_number` | ARN — fallback match key |
+| `Acquirer's Business ID` | `acquirer_business_id` | |
+| `Authorization Code` | `authorization_code` | Fallback match key |
+| `Authorization Response Cd` | `authorization_response` | |
+| `Usage Code` | `usage_code` | |
+| `Settlement Flag` | `settlement_flag` | |
+| `Reimbursement Attribute` | `reimbursement_attribute` | |
+| `Source Amount` †| `source_amount` | **clearing amount ÷ 100** — also the control-total checksum field |
+| `Source Currency Code` | `source_currency` | ISO 4217 numeric |
+| `Destination Amount` †| `destination_amount` | clearing amount ÷ 100 |
+| `Destination Currency Code` | `destination_currency` | |
+| `Authorized Amount` †| `authorized_amount` | **÷ 10^ISO-exponent** of `Auth Currency Cd` |
+| `Auth Currency Cd` | `auth_currency` | drives the authorized-amount exponent |
+| `Interchange Fee Amount` †| `interchange_fee` | ÷ 10^ISO-exponent of `Source Currency Code` |
+| `Interchange Fee Sign` | `interchange_fee_sign` | credit/debit sign |
+| `Src to Base Curr Ex Rate` | `src_to_base_fx` | FX leg 1 (kept as string) |
+| `Base to Dest Curr Ex Rate` | `base_to_dest_fx` | FX leg 2 (kept as string) |
+| `Merchant Category Code` | `mcc` | |
+| `Merchant Name` / `Merchant City` / `Merchant Country Code` | `merchant_*` | |
+| `Card Acceptor ID` / `Terminal ID` | `card_acceptor_id` / `terminal_id` | |
+| `Purchase Date` / `Central Processing Date` | `purchase_date` / `central_processing_date` | report date format |
+| `Multiple Clearing Seq Nbr` / `Multiple Clearing Seq Cnt` | `multiple_clearing_seq` / `multiple_clearing_cnt` | a draft may clear in multiple parts |
+| `Account Funding Source` | `account_funding_source` | |
+| `PAN Token` | `pan_token` | network/payment-service token (safe to store) |
+| `Acct Number & Extension` ‡| `acct_last4`, `acct_hash` | **clear PAN — never store/emit; mask per Step 5** |
+
+> Confirm the exact label set and any added fields against the live EP705 your processing center
+> emits — accuracy over memory. Unknown labels are harmless (they're simply carried in the raw
+> map); **missing expected labels** are what to alert on.
+
+### Amount & currency conventions
+
+This is the easiest place to introduce a silent error. Two distinct rules, verified against the
+EP110F control totals:
+
+| Field class | Examples | Rule |
+| --- | --- | --- |
+| **Clearing amounts** | `Source Amount`, `Destination Amount` | **Always ÷ 100** (2 implied decimals, regardless of currency) |
+| **Currency-scaled amounts** | `Authorized Amount`, `Interchange Fee Amount` | **÷ 10^(ISO 4217 minor units)** of the relevant currency |
+
+ISO 4217 minor-unit (exponent) table — extend as new currencies appear:
+
+| Currency | ISO numeric | Minor units | Divisor |
+| --- | --- | --- | --- |
+| VND | 704 | **0** | 1 |
+| JPY | 392 | 0 | 1 |
+| USD | 840 | 2 | 100 |
+| EUR | 978 | 2 | 100 |
+| GBP | 826 | 2 | 100 |
+
+Because the platform's destination currency is **VND (704, exponent 0)**, a VND authorized amount
+is **not** divided, while its clearing amount still is. Getting these two rules crossed is the
+classic settlement parsing bug. Persist money as `DECIMAL`, never binary float. Normalize the TID
+at this transform step so the downstream [set-based match](#matching-method--set-based-deterministic-then-fallback)
+join is exact — mismatched zero-padding is the silent killer there.
+
+### Edge cases & gotchas
+
+- **Encoding:** UTF-8 will corrupt the file — use `latin1`. Don't `trim()` whole lines before
+  slicing columns.
+- **Page headers mid-record:** a `REPORT EP-` header can interrupt a transaction; strip it inline
+  (Step 1) within the same pass so the surrounding fields still accumulate into one record.
+- **Sub-section banners are not fields:** only `Required Data` starts a record; the other three
+  `Sales Draft - Original ----` banners are skipped but their following lines still belong to the
+  open record.
+- **First-occurrence-wins** keeps the parse deterministic when a label repeats across sub-sections.
+- **Multiple clearing:** one draft may split across `Multiple Clearing Seq` parts; the reconciler
+  groups by TID and nets — the parser just records the seq number/count faithfully.
+- **Reversals & chargebacks** live in **EP725 / EP715** (same layout family), not EP705; they're a
+  later plug-in feeding the `REVERSAL`/`ADJUSTMENT` outcomes.
+- **Control-total drift:** if the parsed count/Σ doesn't tie to EP110F, **reject the whole file** —
+  never reconcile a partially-parsed cycle.
+
+### Parsing module (Java) — coming soon
+
+> The Java implementation is **not built yet.** A `tc-settlement-service` parser module
+> (Java 25 / Spring Boot 4) will be added to reproduce the contract above — same segmentation, the
+> same two-column windows, the same amount/PCI/control-total rules — landing rows in
+> `settlement_raw_record` → `settlement_record`. The parser is **pluggable** (one implementation
+> per report: EP705 first, then EP715/EP725).
+>
+> Until then, **`scripts/parse-ep705.ts` is the reference oracle**: the Java module must produce
+> the same typed rows and pass the same **EP110F control-total check** on the production sample. Use
+> the script's output as the golden fixture for the parser's tests. This section will be replaced
+> with the module's design (class layout, streaming reader, error handling, test strategy) when
+> implementation starts.
 
 ## The leg read-model (from cardload)
 
@@ -446,6 +731,9 @@ Ref: auth_leg.transaction_ref - prefunding_leg.transaction_ref
 
 ## References
 
+- `scripts/parse-ep705.ts` — the working reference parser for the [EP705 settlement file](#settlement-file-parsing-ep705).
+- VisaNet Edit Package / Outgoing Interchange reports (EP-7xx detail, EP-1xx summaries) — via your
+  Visa rep / processing center; confirm the exact EP705 label set and column map.
 - VisaNet Settlement Service (VSS) User's Guide, Vols 1 & 2 (TC46/TC47) — via your Visa rep.
 - [Visa Settlement Reports & Reconciliation (Visa Business School)](https://www.visabusinessschool.com/en/course/6bb8872b-3de8-4879-8d6d-aea6fef1934b)
 - [Matching AFTs and OCTs — Visa Developer Community](https://community.developer.visa.com/t5/Implementation-API-Sample-Code/Matching-AFTs-and-OCTs/td-p/6777)

@@ -324,7 +324,7 @@ These are the limits enforced across the platform — they map to the gateway an
   `LIMITS_WRITE`) approves it. Both steps require step-up re-auth and are audited with
   before/after.
 - **Propagation:** on approval, the admin service **pushes the new config synchronously**
-  (`RestClient`) to each enforcement service (gateway via decK, cardload), or they
+  (`RestClient`) to each enforcement service (gateway, cardload), or they
   pull it from a config API with a short TTL. A change is only "live" once all layers have
   it; show propagation status in the UI.
 - **Validation & guardrails:** sane bounds (e.g. per-txn ≤ per-card-daily ≤ ceiling),
@@ -762,7 +762,7 @@ There is no messaging layer. The admin service interacts over **synchronous REST
 | --- | --- | --- |
 | reads | live authorizations, fraud/3DS | `tc-cardload-service` |
 | reads | settlement summary + breaks | `tc-settlement-service` |
-| pushes | approved limit config | gateway (decK), `tc-cardload-service` |
+| pushes | approved limit config | gateway, `tc-cardload-service` |
 
 Dashboards read live (with short-TTL caching); see [section 4](#4-operational-dashboards).
 

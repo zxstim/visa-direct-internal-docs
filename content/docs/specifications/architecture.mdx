@@ -1,6 +1,6 @@
 ---
 title: Architecture & service interaction
-description: Platform architecture — Java/Spring Boot microservices communicating synchronously over REST (no messaging layer), behind a Kong edge, with a Flutter admin portal. Tech stack, the synchronous top-up flow, traceability, durability, and the system-wide data map.
+description: Platform architecture — Java/Spring Boot microservices communicating synchronously over REST (no messaging layer), behind a Spring Cloud Gateway edge, with a Flutter admin portal. Tech stack, the synchronous top-up flow, traceability, durability, and the system-wide data map.
 permission: member
 ---
 
@@ -15,7 +15,7 @@ database and communicating **synchronously over REST**. This page is the contrac
 | Language / framework | **JDK 25 LTS, Spring Boot 4.0+** (Spring Security 7, Spring Data JPA) |
 | Service model | microservices — one bounded context per service, private datastore, no shared DB |
 | Inter-service comms | **synchronous REST** via `RestClient` — no broker, no message bus |
-| Edge | **Kong** API gateway (`tc-api-gateway`) |
+| Edge | **Spring Cloud Gateway** (`tc-api-gateway`) — a thin Spring Boot proxy |
 | External providers | Cybersource, Visa Direct, PVCB — synchronous HTTPS / SFTP |
 | Build & tooling | **Maven**, IntelliJ IDEA, MySQL Workbench, Flyway (migrations), Insomnia, Testcontainers |
 | Datastore | per-service **MySQL 8.4 LTS** (+ standby — see [durability](#data-durability--primary--standby-hadr)); Redis for sessions/counters |
@@ -33,7 +33,7 @@ database and communicating **synchronously over REST**. This page is the contrac
 
 | Service | Role | DB |
 | --- | --- | --- |
-| `tc-api-gateway` | Kong edge — partner auth, edge limits, single public 3DS callback, admin forwarding | — |
+| `tc-api-gateway` | Spring Cloud Gateway edge — partner auth, edge limits, single public 3DS callback, admin forwarding | — |
 | `tc-cardload-service` | **Orchestrator** — fraud (Cybersource DM) + 3DS (Payer Auth) + **Visa Direct AFT/reversal/adjustment** + authorization limits. *(Merged from the former cardload + card-network.)* | `cardload` |
 | `tc-settlement-service` | **Visa settlement reconciler** — ingest the file, parse it, and match each line to the authorization + prefunding legs; report breaks (scheduled batch). **No ledger — PVCB is the book of record.** | `settlement` |
 | `tc-admin-service` | Admin backend — Spring Security, RBAC, limits config, audit, dashboards | `admin` |
@@ -45,7 +45,7 @@ Everything is **request/response**. There is no broker, outbox, or event bus.
 
 | Interaction | Style |
 | --- | --- |
-| PVCB → Kong → `tc-cardload-service` (start a top-up) | sync HTTP (final result, or a 3DS `redirectUrl` + `/top-up-status` polling) |
+| PVCB → gateway → `tc-cardload-service` (start a top-up) | sync HTTP (final result, or a 3DS `redirectUrl` + `/top-up-status` polling) |
 | `tc-cardload-service` → Cybersource / Visa Direct / PVCB Core Banking | sync HTTPS (mTLS + MLE to Visa) |
 | `tc-settlement-service` → `tc-cardload-service` (read auth/prefunding legs for reconciliation) | sync REST |
 | `tc-admin-service` → services (push limit config, read dashboards) | sync REST |
@@ -68,7 +68,7 @@ What is **asynchronous but not message-driven**:
 
 `tc-cardload-service` orchestrates with blocking calls — there is no saga/event choreography:
 
-1. **Edge:** PVCB → Kong → `POST /v1/topups`, returns `202`.
+1. **Edge:** PVCB → gateway → `POST /v1/topups`, returns `202`.
 2. cardload: eligibility (Visa **PAAI FTAI**) → **Decision Manager** (Cybersource) → **Payer
    Authentication** (Cybersource; a challenge returns a redirect URL to PVCB → client).
 3. On 3DS pass (via the public callback), cardload enforces **authorization limits**, **records
@@ -148,7 +148,7 @@ database"** — maintained by **MySQL replication**, not application dual-write.
 All service databases on one canvas, **schema-namespaced per service** (`cardload.*`,
 `settlement.*`, `admin.*`) and grouped with `TableGroup`. Columns are trimmed to keys
 and correlation fields — full column-level DBML is in each service spec. `tc-api-gateway`
-(Kong) and `tc-admin-portal` (Flutter) have no database.
+(Spring Cloud Gateway) and `tc-admin-portal` (Flutter) have no database.
 
 - **Solid relationships within a service** are real foreign keys.
 - **Cross-service links are logical** — no cross-database FKs. They are synchronous
