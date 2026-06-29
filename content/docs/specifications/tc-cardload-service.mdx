@@ -577,6 +577,37 @@ Requires an `Idempotency-Key` header; optional `fxQuoteId`.
   `FAILED`), or, on a challenge, `{ status: "CHALLENGE_REQUIRED", redirectUrl, expiresAt }`.
   Re-delivery with the same `Idempotency-Key` returns the **current state**, never a second top-up.
 
+### Absolute maximum — a hardcoded transaction ceiling
+
+Before anything else, `POST /v1/topups` enforces a **hardcoded absolute maximum** on the
+transaction `amount` — a **compile-time constant baked into the service**, deliberately **not**
+sourced from `limit_config`, Redis, or `tc-admin-service`. Its single job: make an absurd
+transaction — a **USD 1,000,000 top-up** — *structurally impossible*, no matter how the dynamic
+limits are configured. It is a last-resort backstop, **not** the business limit.
+
+**Why a constant, not just another config value.** The configurable per-transaction limit
+([`limits.perTxnMax`](#configuration-model)) is the *business* cap (e.g. USD 5,000) — and it can be
+changed by admin maker-checker, a `limit_config` row, or a cache push, **any of which can be
+misconfigured, corrupted, or maliciously raised.** The hardcoded ceiling can only move with a
+**code change → review → deploy**: an auditable, multi-person act. No config push, bad DB row,
+compromised admin account, or Redis flush can touch it. So even if **every** dynamic control is
+disabled or wrong, no single transaction can exceed it — it is the floor of trust that bounds the
+blast radius of any failure in the limit system.
+
+| Property | Detail |
+| --- | --- |
+| **Position** | The **first gate**, at request intake — *before* persist-first, tokenization, and the (pending) Visa Direct `LIMIT_CHECK`. A constant comparison; no external call, no DB read. |
+| **Per-currency** | A constant map — one ceiling per supported currency (a ceiling in USD and one in VND are wildly different magnitudes). An `amount` in a currency with **no** entry is **rejected** (fail closed). |
+| **Above the business cap** | Sits well above `perTxnMax` (e.g. ceiling USD 50,000 vs business USD 5,000). **Startup invariant:** the service refuses to boot if any configured `perTxnMax` exceeds the hardcoded ceiling — config can never out-grow the constant. |
+| **On breach** | **Reject immediately, fail closed** — `HTTP 422` with `{ "errorCode": "ABSOLUTE_MAX_EXCEEDED", "retryable": false }`. **No `topup` row is written** (a pre-persist validation reject, so an over-ceiling flood can't amplify into DB writes); emit an **abuse-monitoring** metric/log, since an over-ceiling request is a strong tamper signal. |
+| **Scope** | Gates Flow 2 and Flow 3 identically — it bounds the `amount`, independent of the `paymentSource`. |
+
+> **Distinct from the dynamic limits.** This is **not** the configurable
+> [authorization limits](#configuration-model) the Visa Direct module enforces at `LIMIT_CHECK`
+> (owned by the [pending Visa Direct workstream](#visa-direct-part--pending)). The hardcoded ceiling
+> is a **front-door input guard this endpoint owns directly** — it can be built and tested **now**,
+> independent of that work.
+
 ### `POST /v1/topups/{ref}/3ds-complete` — resume after the challenge
 
 The tc-hosted 3DS page calls this once the customer authenticates. Steps: **validate** the result
