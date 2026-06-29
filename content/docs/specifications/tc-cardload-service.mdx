@@ -661,7 +661,7 @@ cardload:
 
 | Method & path | Style | Purpose |
 | --- | --- | --- |
-| `POST /v1/payment-instruments` | sync | **Add card / tokenize-only** (Flow 1) — exchange full card details or a Flex transient token for a durable TMS instrument id + network token; optional FTAI eligibility and a `$0` account verification. Returns the token for reuse; **no money movement**. See [Endpoint design](#endpoint-design--orchestration) |
+| `POST /v1/payment-instruments` | sync | **Add card / tokenize-only** (Flow 1) — exchange full card details or a Flex transient token for a durable TMS instrument id + network token; optional FTAI eligibility. Returns the token for reuse; **no money movement**. See [Endpoint design](#endpoint-design--orchestration) |
 | `POST /v1/fx-quotes` | sync | **Fetch a Visa FX quote** for a currency pair + source amount (from the cached daily rate). Returns `quoteId`, conversion rate, converted amount, and `expiresAt`; PVCB shows the tourist and passes `fxQuoteId` on `POST /v1/topups` |
 | `POST /v1/topups` | **sync, blocking** | Start a top-up (requires `Idempotency-Key`; optional `fxQuoteId`). Returns the **final result**, or `CHALLENGE_REQUIRED` + `redirectUrl` if 3DS challenge is needed |
 | `POST /v1/topups/{ref}/3ds-complete` | **sync, blocking** | Resume after the customer 3DS challenge — validate, then limits → fees → FX snapshot → AFT → prefund → record; returns the final result. Target of the gateway's **public** callback |
