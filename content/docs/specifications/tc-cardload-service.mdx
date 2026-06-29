@@ -481,6 +481,133 @@ challenge:     POST /v1/topups → tokenize → FTAI → DM → 3DS(enroll=chall
 
 With `fraudScreening.enabled = false`, the DM step is simply absent.
 
+## Endpoint design & orchestration
+
+The product has **three interaction flows**; they map onto a deliberately small set of endpoints.
+The guiding rule is **one endpoint per lifecycle, not one per flow.** Adding a card and running a
+top-up are different lifecycles (one moves no money and has no `topup` row) — so they are separate
+endpoints. But a top-up with a freshly entered card and a top-up with a saved token are the *same*
+lifecycle that merely **starts from a different credential** — so they share one endpoint.
+
+### The three flows
+
+| # | Flow | Endpoint | Moves money? |
+| --- | --- | --- | --- |
+| 1 | **Add card only** — tokenize a card for later use | `POST /v1/payment-instruments` | no |
+| 2 | **Top up with full card** (optional *save card*) | `POST /v1/topups` | yes |
+| 3 | **Top up with a saved card** (tokenized) | `POST /v1/topups` | yes |
+
+Flows 2 and 3 are **one endpoint**, differentiated by a `paymentSource` discriminator in the body:
+tokenization normalises both to a TMS / network token in the **first step**, after which the
+orchestration is byte-for-byte identical. Splitting them into two routes would duplicate the entire
+money state machine for no benefit.
+
+### How many endpoints — recommendation
+
+**Four endpoints carry the three flows end-to-end** — the two above, plus two that the
+synchronous-response + polling + 3DS interaction model *forces* (a challenge top-up cannot complete
+without them):
+
+| Endpoint | Why it's needed | Status |
+| --- | --- | --- |
+| `POST /v1/payment-instruments` | Flow 1 — tokenize-only. New vs the Flex-only baseline (see PCI note) | **new** |
+| `POST /v1/topups` | Flows 2 & 3 — the top-up | exists |
+| `POST /v1/topups/{ref}/3ds-complete` | resume the challenge path after the customer authenticates | exists |
+| `GET /v1/top-up-status/{ref}` | the poll endpoint — the whole "no webhook" contract hinges on it | exists |
+
+The remaining endpoints in [Service API](#service-api) — `POST /v1/fx-quotes`,
+`POST /v1/topups/{ref}/prefunding-callback`, and the corrective
+`/reversal · /adjustment · /refund` — are **supporting**, delivered with their respective modules
+(FX, prefunding, Visa Direct corrections).
+
+> **PCI scope note.** Flow 2 (and optionally Flow 1) accept **full card details** on the wire, so
+> the raw PAN now enters `tc-cardload-service`. This **widens PCI scope** — the service is in the
+> **CDE / SAQ-D** — versus the Flex-only baseline in
+> [Card data handling & PCI](#card-data-handling--pci), which still holds for the transient-token
+> path. Accepted deliberately. Regardless of entry mode, the PAN is exchanged for a token at
+> **step 1** and **never persisted** (only TMS id + network-token ref + masked fields + fingerprint
+> are stored), and is **never logged**.
+
+### `POST /v1/payment-instruments` — add card / tokenize-only (Flow 1)
+
+Turn a card into a reusable, AFT-eligible token. **No money movement, no `topup` row, no reaper** —
+a different lifecycle from the top-up, which is why it is its own resource (it has no state in the
+`topup_status` machine).
+
+- **Request** — a `paymentSource`, one of:
+  - `{ "type": "CARD", "number", "expMonth", "expYear", "cvv"? }` — full card (PCI path), or
+  - `{ "type": "TRANSIENT_TOKEN", "transientTokenJwt" }` — Flex-captured (PCI-minimised path);
+  - plus `customerRef`, and optional `verify` (boolean).
+- **Steps:**
+  1. **Tokenize** → exchange for a **durable TMS instrument identifier** and provision a
+     **network token (VTS)**; derive `last4` / `brand` / `exp` + card fingerprint.
+  2. **FTAI eligibility** *(recommended)* → record whether the card can take an AFT pull and its
+     attributes (card type, issuer country, billing currency). This is the **AFT-relevant** validity
+     signal and moves no money — far more meaningful here than a purchase auth.
+  3. **`verify: true`** *(optional)* → a **`$0` account verification** (AVS/CVV) via Cybersource —
+     **never a real charge**, never the legacy `$1`-and-void. Use only when the product wants an
+     active-card guarantee at save time.
+- **Response** — `{ instrumentId, networkTokenRef, last4, brand, expMonth, expYear, eligibility?, verification? }`.
+  Persist the instrument (no PAN). The returned token is what Flow 3 sends back.
+
+### `POST /v1/topups` — the top-up (Flows 2 & 3)
+
+Requires an `Idempotency-Key` header; optional `fxQuoteId`.
+
+- **Request** — `amount`, `currency`, `customerRef`, `deviceFingerprintSessionId`, optional
+  `fxQuoteId`, and a discriminated `paymentSource`:
+  - `{ "type": "CARD", "number", "expMonth", "expYear", "cvv"?, "saveCard"?: boolean }` — Flow 2, or
+  - `{ "type": "TOKEN", "instrumentId", "networkTokenRef" }` — Flow 3
+    (also accepts `{ "type": "TRANSIENT_TOKEN", … }` for a Flex-captured fresh card).
+- **Orchestration** (persist-first; each in-progress stage committed **before** its external call):
+  1. **Persist `CREATED`** — write the `topup` row first (idempotency key, correlation id, amount,
+     masked card). A `/top-up-status` poll already returns `PROCESSING`.
+  2. **Tokenize** — normalise the `paymentSource` to a TMS + network token. `saveCard: true` ⇒
+     create a **durable** instrument (reusable later, exactly like Flow 1's output) and echo the
+     token ref in the response; otherwise a transaction-scoped token suffices.
+  3. **FTAI** → `AFT_ELIGIBILITY`; ineligible → `REJECTED_INELIGIBLE`.
+  4. **Decision Manager** *(if enabled)* → `FRAUD_SCREENING`; `REJECT` → `REJECTED_FRAUD`,
+     `REVIEW` → `IN_REVIEW`.
+  5. **Payer Authentication** → `AUTH_SETUP` → `AUTH_ENROLLMENT`:
+     - **frictionless** → continue inline;
+     - **challenge** → persist `AWAITING_CHALLENGE` and **return `CHALLENGE_REQUIRED` + `redirectUrl`**
+       (PVCB polls; the flow resumes at `/3ds-complete`).
+  6. **Visa Direct part — limits → fees → FX snapshot → AFT pull → prefunding.**
+     *(See [Visa Direct part — pending](#visa-direct-part--pending).)*
+  7. **Record outcome** and return the final result.
+- **Responses** — either the **final result** (`APPROVED` / a terminal `REJECTED_*` / `DECLINED` /
+  `FAILED`), or, on a challenge, `{ status: "CHALLENGE_REQUIRED", redirectUrl, expiresAt }`.
+  Re-delivery with the same `Idempotency-Key` returns the **current state**, never a second top-up.
+
+### `POST /v1/topups/{ref}/3ds-complete` — resume after the challenge
+
+The tc-hosted 3DS page calls this once the customer authenticates. Steps: **validate** the result
+(`/risk/v1/authentication-results`) → `AUTH_VALIDATION` (fail → `REJECTED_3DS`) → **Visa Direct part**
+*(see [pending](#visa-direct-part--pending))* → record. Returns the final result; PVCB also learns
+it by polling. It is the target of the gateway's **public** callback and is **DB-backed**, so it may
+land on any instance.
+
+### `GET /v1/top-up-status/{ref}` — the poll
+
+A **pure read** of `topup.status` mapped to the PVCB-facing value (see
+[the poll endpoint](#v1top-up-status-the-poll-endpoint)) — a cheap single-row indexed read that
+supports `ETag` / `304`. Always returns a definitive state; never blocks; never moves the state
+machine itself (the reaper does that).
+
+### Visa Direct part — pending
+
+> **Placeholder — owned by the Visa Direct workstream, not yet complete.** The money-movement
+> portion shared by `POST /v1/topups` and `POST /v1/topups/{ref}/3ds-complete` (step 6 above) —
+> **authorization limits**, **fee application**, the **FX snapshot**, the **AFT pull**, and
+> **prefunding** — together with the corrective endpoints
+> (`POST /v1/topups/{ref}/reversal · /adjustment · /refund`) is being finalised by the colleague
+> building the Visa Direct module. The flow, request/response shapes, and exactly-once AFT mechanics
+> are already sketched in [Module 4 — Visa Direct](#module-4--visa-direct-aft-limits-corrections),
+> [Orchestration & lifecycle](#orchestration--lifecycle), and
+> [Error handling & recovery](#error-handling--recovery-money-movement-safe); **this
+> endpoint-design section will be completed to match once that work lands.** Until then, treat the
+> Visa Direct step and the corrective endpoints as **to be defined here**.
+
 ## Configuration model
 
 ```yaml
@@ -536,6 +663,7 @@ cardload:
 
 | Method & path | Style | Purpose |
 | --- | --- | --- |
+| `POST /v1/payment-instruments` | sync | **Add card / tokenize-only** (Flow 1) — exchange full card details or a Flex transient token for a durable TMS instrument id + network token; optional FTAI eligibility and a `$0` account verification. Returns the token for reuse; **no money movement**. See [Endpoint design](#endpoint-design--orchestration) |
 | `POST /v1/fx-quotes` | sync | **Fetch a Visa FX quote** for a currency pair + source amount (from the cached daily rate). Returns `quoteId`, conversion rate, converted amount, and `expiresAt`; PVCB shows the tourist and passes `fxQuoteId` on `POST /v1/topups` |
 | `POST /v1/topups` | **sync, blocking** | Start a top-up (requires `Idempotency-Key`; optional `fxQuoteId`). Returns the **final result**, or `CHALLENGE_REQUIRED` + `redirectUrl` if 3DS challenge is needed |
 | `POST /v1/topups/{ref}/3ds-complete` | **sync, blocking** | Resume after the customer 3DS challenge — validate, then limits → fees → FX snapshot → AFT → prefund → record; returns the final result. Target of the gateway's **public** callback |
@@ -554,6 +682,14 @@ PAN captured client-side via **Flex Microform** → transient token → exchange
 instrument id** + a **network token** (VTS); this service never sees or stores the PAN. Only a
 **card fingerprint** is shared with limits. Never log PAN/CVV/track data. The **Visa legs carry the
 network token + cryptogram** (MLE to Visa); the **raw PAN never leaves Cybersource / VTS**.
+
+> **Update — full-card entry paths widen this scope.** The
+> [endpoint design](#endpoint-design--orchestration) adds flows that accept **full card details**
+> directly (`POST /v1/payment-instruments` and the `CARD` `paymentSource` on `POST /v1/topups`). On
+> those paths the raw PAN **does** enter this service, placing it in **PCI DSS CDE / SAQ-D scope** —
+> accepted deliberately. The Flex transient-token path above remains available and PCI-minimised. In
+> **both** cases the PAN is tokenised at the first step and **never persisted** (TMS id +
+> network-token ref + masked fields + fingerprint only) and **never logged**.
 
 ## Cybersource & Visa connectivity
 
