@@ -493,7 +493,7 @@ lifecycle that merely **starts from a different credential** — so they share o
 
 | # | Flow | Endpoint | Moves money? |
 | --- | --- | --- | --- |
-| 1 | **Add card only** — tokenize a card for later use | `POST /v1/payment-instruments` | no |
+| 1 | **Add card only** — tokenize a card for later use | `POST /v1/tokenize` | no |
 | 2 | **Top up with full card** (optional *save card*) | `POST /v1/topups` | yes |
 | 3 | **Top up with a saved card** (tokenized) | `POST /v1/topups` | yes |
 
@@ -510,7 +510,7 @@ without them):
 
 | Endpoint | Why it's needed | Status |
 | --- | --- | --- |
-| `POST /v1/payment-instruments` | Flow 1 — tokenize-only. New vs the Flex-only baseline (see PCI note) | **new** |
+| `POST /v1/tokenize` | Flow 1 — tokenize-only. New vs the Flex-only baseline (see PCI note) | **new** |
 | `POST /v1/topups` | Flows 2 & 3 — the top-up | exists |
 | `POST /v1/topups/{ref}/3ds-complete` | resume the challenge path after the customer authenticates | exists |
 | `GET /v1/top-up-status/{ref}` | the poll endpoint — the whole "no webhook" contract hinges on it | exists |
@@ -528,7 +528,7 @@ The remaining endpoints in [Service API](#service-api) — `POST /v1/fx-quotes`,
 > **step 1** and **never persisted** (only TMS id + network-token ref + masked fields + fingerprint
 > are stored), and is **never logged**.
 
-### `POST /v1/payment-instruments` — add card / tokenize-only (Flow 1)
+### `POST /v1/tokenize` — add card / tokenize-only (Flow 1)
 
 Turn a card into a reusable, AFT-eligible token. **No money movement, no `topup` row, no reaper** —
 a different lifecycle from the top-up, which is why it is its own resource (it has no state in the
@@ -692,7 +692,7 @@ cardload:
 
 | Method & path | Style | Purpose |
 | --- | --- | --- |
-| `POST /v1/payment-instruments` | sync | **Add card / tokenize-only** (Flow 1) — exchange full card details or a Flex transient token for a durable TMS instrument id + network token; optional FTAI eligibility. Returns the token for reuse; **no money movement**. See [Endpoint design](#endpoint-design--orchestration) |
+| `POST /v1/tokenize` | sync | **Add card / tokenize-only** (Flow 1) — exchange full card details or a Flex transient token for a durable TMS instrument id + network token; optional FTAI eligibility. Returns the token for reuse; **no money movement**. See [Endpoint design](#endpoint-design--orchestration) |
 | `POST /v1/fx-quotes` | sync | **Fetch a Visa FX quote** for a currency pair + source amount (from the cached daily rate). Returns `quoteId`, conversion rate, converted amount, and `expiresAt`; PVCB shows the tourist and passes `fxQuoteId` on `POST /v1/topups` |
 | `POST /v1/topups` | **sync, blocking** | Start a top-up (requires `Idempotency-Key`; optional `fxQuoteId`). Returns the **final result**, or `CHALLENGE_REQUIRED` + `redirectUrl` if 3DS challenge is needed |
 | `POST /v1/topups/{ref}/3ds-complete` | **sync, blocking** | Resume after the customer 3DS challenge — validate, then limits → fees → FX snapshot → AFT → prefund → record; returns the final result. Target of the gateway's **public** callback |
@@ -714,7 +714,7 @@ network token + cryptogram** (MLE to Visa); the **raw PAN never leaves Cybersour
 
 > **Update — full-card entry paths widen this scope.** The
 > [endpoint design](#endpoint-design--orchestration) adds flows that accept **full card details**
-> directly (`POST /v1/payment-instruments` and the `CARD` `paymentSource` on `POST /v1/topups`). On
+> directly (`POST /v1/tokenize` and the `CARD` `paymentSource` on `POST /v1/topups`). On
 > those paths the raw PAN **does** enter this service, placing it in **PCI DSS CDE / SAQ-D scope** —
 > accepted deliberately. The Flex transient-token path above remains available and PCI-minimised. In
 > **both** cases the PAN is tokenised at the first step and **never persisted** (TMS id +
