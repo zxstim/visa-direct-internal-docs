@@ -537,17 +537,15 @@ a different lifecycle from the top-up, which is why it is its own resource (it h
 - **Request** — a `paymentSource`, one of:
   - `{ "type": "CARD", "number", "expMonth", "expYear", "cvv"? }` — full card (PCI path), or
   - `{ "type": "TRANSIENT_TOKEN", "transientTokenJwt" }` — Flex-captured (PCI-minimised path);
-  - plus `customerRef`, and optional `verify` (boolean).
+  - plus `customerRef`.
 - **Steps:**
   1. **Tokenize** → exchange for a **durable TMS instrument identifier** and provision a
      **network token (VTS)**; derive `last4` / `brand` / `exp` + card fingerprint.
   2. **FTAI eligibility** *(recommended)* → record whether the card can take an AFT pull and its
      attributes (card type, issuer country, billing currency). This is the **AFT-relevant** validity
-     signal and moves no money — far more meaningful here than a purchase auth.
-  3. **`verify: true`** *(optional)* → a **`$0` account verification** (AVS/CVV) via Cybersource —
-     **never a real charge**, never the legacy `$1`-and-void. Use only when the product wants an
-     active-card guarantee at save time.
-- **Response** — `{ instrumentId, networkTokenRef, last4, brand, expMonth, expYear, eligibility?, verification? }`.
+     signal and moves no money — and the only pre-money check worth running here (a purchase-rail
+     auth would only validate a rail this product never uses).
+- **Response** — `{ instrumentId, networkTokenRef, last4, brand, expMonth, expYear, eligibility? }`.
   Persist the instrument (no PAN). The returned token is what Flow 3 sends back.
 
 ### `POST /v1/topups` — the top-up (Flows 2 & 3)
