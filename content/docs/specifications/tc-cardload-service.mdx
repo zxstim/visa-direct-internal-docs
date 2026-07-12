@@ -524,9 +524,8 @@ The remaining endpoints in [Service API](#service-api) — `POST /v1/fx-quotes`,
 > the raw PAN now enters `tc-cardload-service`. This **widens PCI scope** — the service is in the
 > **CDE / SAQ-D** — versus the Flex-only baseline in
 > [Card data handling & PCI](#card-data-handling--pci), which still holds for the transient-token
-> path. Accepted deliberately. Regardless of entry mode, the PAN is exchanged for a token at
-> **step 1** and **never persisted** (only TMS id + network-token ref + masked fields + fingerprint
-> are stored), and is **never logged**.
+> path. Accepted deliberately; that section covers how, in either entry mode, the PAN is exchanged
+> for a token at **step 1** and **never persisted or logged**.
 
 ### `POST /v1/tokenize` — add card / tokenize-only (Flow 1)
 
